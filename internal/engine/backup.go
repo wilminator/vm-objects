@@ -290,7 +290,6 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 		return nil, err
 	}
 	put.LockUntil = lk.newObject()
-	reusedPacks := map[string]bool{}
 	pw := r.NewPackWriter(st.Chain, put)
 	extSize := int64(r.Config.ExtentSize)
 	current := make([]extent.Ref, 0, len(st.Base))
@@ -309,10 +308,7 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 			if ref.Zero {
 				continue // zeros are recorded, never stored
 			}
-			if pack, ok := known[ref.Hash]; ok {
-				if pack != "" {
-					reusedPacks[pack] = true
-				}
+			if _, ok := known[ref.Hash]; ok {
 				stats.ExtentsReused++
 				continue
 			}
@@ -339,8 +335,30 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 		lk.wrote(repo.TOCForPack(loc.Pack))
 	}
 
+	// Resolve every changed extent the way a restore will, from a fresh
+	// index: each must be found, and the pack a restore would read (which
+	// may be an older pack holding the same extent) is what must outlast
+	// this backup.
+	readPacks := map[string]bool{}
+	if len(overlay) > 0 {
+		idx, err := r.ChainIndex(ctx, st.Chain)
+		if err != nil {
+			return nil, err
+		}
+		for _, ov := range overlay {
+			if ov.Ref.Zero {
+				continue
+			}
+			loc, ok := idx[ov.Ref.Hash]
+			if !ok {
+				return nil, fmt.Errorf("extent %d (%s) is in no pack of chain %s after writing; run vmobj verify", ov.Index, ov.Ref.Hash, st.Chain)
+			}
+			readPacks[loc.Pack] = true
+		}
+	}
+
 	// Everything the manifest points at must outlast it: the full's base
-	// blocks, packs reused from earlier runs (with their TOCs) and the
+	// blocks, the packs a restore reads (with their TOCs) and the
 	// repository config. This host's cache usually answers without asking
 	// the storage; the next full re-checks everything.
 	if lk.enabled {
@@ -352,7 +370,7 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 				need = append(need, k)
 			}
 		}
-		for p := range reusedPacks {
+		for p := range readPacks {
 			need = append(need, p, repo.TOCForPack(p))
 		}
 		if err := lk.ensureAll(ctx, need, false); err != nil {

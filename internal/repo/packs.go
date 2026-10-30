@@ -125,9 +125,19 @@ func (r *Repo) ChainIndex(ctx context.Context, chain string) (map[extent.Hash]Lo
 	if err != nil {
 		return nil, err
 	}
+	// A TOC whose pack is missing (an interrupted prune, or a deletion
+	// outside vmobj) is ignored, so nothing is ever reused from a pack
+	// that isn't there. The pack check needs no extra requests: both come
+	// from the same listing.
+	packs := map[string]bool{}
+	for _, k := range keys {
+		if strings.HasSuffix(k, ".pack") {
+			packs[k] = true
+		}
+	}
 	idx := map[extent.Hash]Location{}
 	for _, k := range keys {
-		if !strings.HasSuffix(k, ".toc") {
+		if !strings.HasSuffix(k, ".toc") || !packs[strings.TrimSuffix(k, ".toc")+".pack"] {
 			continue
 		}
 		sealed, err := r.Backend.Get(ctx, k)
