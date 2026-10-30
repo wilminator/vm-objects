@@ -20,6 +20,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/repo"
+	"github.com/wilminator/vm-objects/internal/store"
 )
 
 // RestoreOptions describe one restore.
@@ -65,6 +66,14 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 	}
 	if len(vs.Missing) > 0 {
 		return nil, fmt.Errorf("%w: %d pieces missing, first: %s", ErrIncomplete, len(vs.Missing), vs.Missing[0])
+	}
+	// Archived objects can't be read yet; say so before touching Output.
+	rd, err := CheckReady(ctx, r, o.VM, o.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	if !rd.AllReady() {
+		return nil, &NotReadyError{Readiness: rd}
 	}
 
 	t, err := openTarget(o.Output, m.DiskSize, o.Force)
@@ -242,6 +251,9 @@ type VerifyStats struct {
 	Blocks, Extents int
 	Missing         []string
 	Deep            bool
+	// Archived counts pieces a deep check skipped because they are in an
+	// archive class and not restored; reading them would fail.
+	Archived int
 }
 
 // Verify checks that everything a manifest needs is present. With deep,
@@ -272,7 +284,9 @@ func Verify(ctx context.Context, r *repo.Repo, vm, name string, deep bool) (*Ver
 			continue
 		}
 		if deep && !checked[ref.Hash] {
-			if _, err := r.GetBlock(ctx, ref.Hash); err != nil {
+			if _, err := r.GetBlock(ctx, ref.Hash); errors.Is(err, store.ErrArchived) {
+				vs.Archived++
+			} else if err != nil {
 				vs.Missing = append(vs.Missing, fmt.Sprintf("block %d: %v", i, err))
 			}
 			checked[ref.Hash] = true

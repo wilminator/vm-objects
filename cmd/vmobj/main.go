@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/keys"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/measure"
+	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/scan"
 	"github.com/wilminator/vm-objects/internal/source"
@@ -41,8 +43,11 @@ Usage:
   vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB]
   vmobj measure     --source DISK [--name NAME] [--state-dir DIR]
   vmobj backup      --repo REPO --key-file PATH --source DISK --vm NAME --type full|incremental|differential
-  vmobj list        --repo REPO --key-file PATH [--vm NAME]
+                    [--profile NAME] [--class CLASS]
+  vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
+                    [--request-restore [--tier bulk|standard|expedited] [--days N]]
+  vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
   vmobj version
 
@@ -53,6 +58,10 @@ REPO is a folder path, or an S3 bucket:
   (choose a section with profile=), never from the address.
 
 DISK is a raw image file or a block device (for example a zvol snapshot).
+
+Profiles pick a storage class and retention for each kind of backup (see
+"vmobj profiles"). The default is disaster-recovery. Self-hosted S3 services
+usually support only Standard storage: use --profile standard with them.
 `
 
 func main() {
@@ -81,6 +90,8 @@ func main() {
 		err = cmdRestore(ctx, args)
 	case "verify":
 		err = cmdVerify(ctx, args)
+	case "profiles":
+		err = cmdProfiles()
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
@@ -306,6 +317,8 @@ func cmdBackup(ctx context.Context, args []string) error {
 	kind := fs.String("type", "", "full, incremental or differential")
 	stateDir := fs.String("state-dir", "", "where this host keeps per-VM state")
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
+	profileName := fs.String("profile", policy.DefaultProfile, "storage profile (see vmobj profiles)")
+	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file", "source", "vm", "type"); err != nil {
 		return err
@@ -313,6 +326,16 @@ func cmdBackup(ctx context.Context, args []string) error {
 	k, err := manifest.ParseKind(*kind)
 	if err != nil {
 		return err
+	}
+	prof, err := policy.Lookup(*profileName)
+	if err != nil {
+		return err
+	}
+	var class policy.Class
+	if *classFlag != "" {
+		if class, err = policy.ParseClass(*classFlag); err != nil {
+			return err
+		}
 	}
 	r, err := openRepo(ctx, *dir, *keyFile)
 	if err != nil {
@@ -332,12 +355,16 @@ func cmdBackup(ctx context.Context, args []string) error {
 	st, err := engine.Backup(ctx, engine.BackupOptions{
 		Repo: r, Source: p, VM: *vm, Kind: k, Workers: *workers,
 		StatePath: filepath.Join(*stateDir, *vm+".state"),
+		Profile:   &prof, Class: class,
 	})
 	stopProgress()
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Manifest:  %s\n", st.Manifest)
+	if m, err := r.GetManifest(ctx, *vm, st.Manifest); err == nil {
+		fmt.Printf("Storage:   %s (profile %s), keep until %s\n", className(m.DataClass), m.Profile, m.RetainUntil.Local().Format("2006-01-02"))
+	}
 	fmt.Printf("Took:      %s\n", time.Since(start).Round(time.Second))
 	if k == manifest.Full {
 		fmt.Printf("Blocks:    %d stored, %d reused, %d all zeros\n", st.BlocksStored, st.BlocksReused, st.ZeroBlocks)
@@ -354,6 +381,7 @@ func cmdList(ctx context.Context, args []string) error {
 	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	vm := fs.String("vm", "", "only this VM")
+	long := fs.Bool("long", false, "also show each backup's storage class and retention")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file"); err != nil {
 		return err
@@ -375,7 +403,19 @@ func cmdList(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("%s:\n", v)
 		for _, n := range names {
-			fmt.Printf("  %s\n", n)
+			if !*long {
+				fmt.Printf("  %s\n", n)
+				continue
+			}
+			m, err := r.GetManifest(ctx, v, n)
+			if err != nil {
+				return err
+			}
+			keep := "-"
+			if !m.RetainUntil.IsZero() {
+				keep = m.RetainUntil.Local().Format("2006-01-02")
+			}
+			fmt.Printf("  %-40s %-14s keep until %s  %s\n", n, className(m.DataClass), keep, units.Format(m.DiskSize))
 		}
 	}
 	return nil
@@ -389,8 +429,15 @@ func cmdRestore(ctx context.Context, args []string) error {
 	name := fs.String("manifest", "", "manifest to restore (see vmobj list)")
 	out := fs.String("output", "", "raw image file or block device to write")
 	force := fs.Bool("force", false, "replace an existing output file")
+	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
+	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
+	days := fs.Int("days", 7, "days the restored copies stay readable")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file", "vm", "manifest", "output"); err != nil {
+		return err
+	}
+	tier, err := policy.ParseTier(*tierFlag)
+	if err != nil {
 		return err
 	}
 	r, err := openRepo(ctx, *dir, *keyFile)
@@ -399,6 +446,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	start := time.Now()
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force})
+	var nr *engine.NotReadyError
+	if errors.As(err, &nr) {
+		return explainNotReady(ctx, r, nr.Readiness, *request, tier, *days)
+	}
 	if err != nil {
 		return err
 	}
@@ -430,6 +481,9 @@ func cmdVerify(ctx context.Context, args []string) error {
 	if vs.Deep {
 		how = "present and intact"
 	}
+	if vs.Archived > 0 {
+		fmt.Printf("Note: %d pieces are archived and were checked for presence only; restore them to check contents.\n", vs.Archived)
+	}
 	if len(vs.Missing) == 0 {
 		fmt.Printf("OK: %d blocks and %d extents are %s.\n", vs.Blocks, vs.Extents, how)
 		return nil
@@ -438,4 +492,64 @@ func cmdVerify(ctx context.Context, args []string) error {
 		fmt.Println("  problem:", m)
 	}
 	return fmt.Errorf("%d problems found", len(vs.Missing))
+}
+
+// className shows a storage class in friendly form.
+func className(c string) string {
+	if c == "" {
+		return "default class"
+	}
+	if ci, ok := policy.Info(policy.Class(c)); ok {
+		return ci.Name
+	}
+	return c
+}
+
+// explainNotReady reports what a restore is waiting for and, if asked,
+// requests the restores. Nothing has been written to the output.
+func explainNotReady(ctx context.Context, r *repo.Repo, rd *engine.Readiness, request bool, tier policy.Tier, days int) error {
+	fmt.Printf("This backup is in archive storage. Nothing was written.\n")
+	fmt.Printf("  objects needed:        %d\n", rd.Objects)
+	fmt.Printf("  readable now:          %d\n", rd.Ready)
+	fmt.Printf("  restore in progress:   %d\n", rd.Restoring)
+	fmt.Printf("  not yet requested:     %d (%s)\n", len(rd.Pending), units.Format(rd.PendingBytes))
+	for _, t := range []policy.Tier{policy.Bulk, policy.StandardT, policy.Expedited} {
+		fmt.Printf("  wait at %-10s     %s\n", strings.ToLower(string(t))+":", rd.Wait(t))
+	}
+	if len(rd.Pending) == 0 {
+		fmt.Println("All needed restores are requested; run this command again once they finish.")
+		return errors.New("waiting for archive restores")
+	}
+	if !request {
+		fmt.Println("Run again with --request-restore (and optionally --tier, --days) to start the restores.")
+		fmt.Println("Restores are billed per GB and per request; bulk is the cheapest tier.")
+		return errors.New("archived objects need a restore request")
+	}
+	n, err := engine.RequestRestores(ctx, r, rd, days, tier)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Requested %d restores at %s tier, readable for %d days once done (%s).\n",
+		n, strings.ToLower(string(tier)), days, rd.Wait(tier))
+	fmt.Println("Run the same restore command again later; it starts as soon as everything is readable.")
+	return nil
+}
+
+func cmdProfiles() error {
+	for _, name := range policy.Names() {
+		p, _ := policy.Lookup(name)
+		def := ""
+		if name == policy.DefaultProfile {
+			def = " (default)"
+		}
+		fmt.Printf("%s%s\n  %s\n", name, def, p.Description)
+		for _, k := range []manifest.Kind{manifest.Full, manifest.Differential, manifest.Incremental} {
+			rule := p.Rule(k)
+			ci, _ := policy.Info(rule.Class)
+			fmt.Printf("  %-13s %-32s keep %3d days, about every %d days\n",
+				k, ci.Name, int(rule.Retain/policy.Day), int(rule.Every/policy.Day))
+		}
+		fmt.Println()
+	}
+	return nil
 }

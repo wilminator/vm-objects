@@ -17,10 +17,12 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
 
@@ -37,6 +39,7 @@ type S3API interface {
 	HeadObject(ctx context.Context, in *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	RestoreObject(ctx context.Context, in *s3.RestoreObjectInput, opts ...func(*s3.Options)) (*s3.RestoreObjectOutput, error)
 }
 
 // S3 keeps objects in an S3 bucket (AWS, or a compatible service such as
@@ -80,20 +83,104 @@ func (s *S3) key(k string) (*string, error) {
 // required by S3 for uploads to buckets with Object Lock, and unlike the
 // newer checksum headers every S3-compatible service understands it.
 func (s *S3) Put(ctx context.Context, key string, data []byte) error {
+	return s.PutWith(ctx, key, data, PutOptions{})
+}
+
+// PutWith uploads an object with a storage class.
+func (s *S3) PutWith(ctx context.Context, key string, data []byte, opts PutOptions) error {
 	k, err := s.key(key)
 	if err != nil {
 		return err
 	}
 	sum := md5.Sum(data)
-	_, err = s.api.PutObject(ctx, &s3.PutObjectInput{
+	in := &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           k,
 		Body:          bytes.NewReader(data),
 		ContentLength: aws.Int64(int64(len(data))),
 		ContentMD5:    aws.String(base64.StdEncoding.EncodeToString(sum[:])),
-	})
-	if err != nil {
+	}
+	// Standard is S3's default; leaving the header off keeps uploads working
+	// on services that only know Standard.
+	if opts.Class != "" && opts.Class != string(types.StorageClassStandard) {
+		in.StorageClass = types.StorageClass(opts.Class)
+	}
+	if _, err := s.api.PutObject(ctx, in); err != nil {
+		if apiCode(err) == "InvalidStorageClass" {
+			return fmt.Errorf("s3 put %s: this service does not support storage class %s "+
+				"(self-hosted services usually support only Standard; try --profile standard): %w", key, opts.Class, err)
+		}
 		return fmt.Errorf("s3 put %s: %w", key, err)
+	}
+	return nil
+}
+
+// Stat reads an object's headers: size, storage class and restore status.
+func (s *S3) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	k, err := s.key(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	out, err := s.api.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: k})
+	if err != nil {
+		if isNotFound(err) {
+			return ObjectInfo{}, ErrNotFound
+		}
+		return ObjectInfo{}, fmt.Errorf("s3 head %s: %w", key, err)
+	}
+	info := ObjectInfo{
+		Size:     aws.ToInt64(out.ContentLength),
+		Modified: aws.ToTime(out.LastModified),
+		Class:    string(out.StorageClass),
+	}
+	switch out.StorageClass {
+	case types.StorageClassGlacier, types.StorageClassDeepArchive:
+		info.Archived = true
+	case types.StorageClassIntelligentTiering:
+		// Only Intelligent-Tiering's opt-in archive tiers need a restore.
+		info.Archived = out.ArchiveStatus != ""
+	}
+	info.Restoring, info.RestoredUntil = parseRestore(aws.ToString(out.Restore))
+	return info, nil
+}
+
+// parseRestore reads S3's x-amz-restore header, which looks like
+//
+//	ongoing-request="true"
+//	ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT"
+func parseRestore(h string) (ongoing bool, until time.Time) {
+	if h == "" {
+		return false, time.Time{}
+	}
+	ongoing = strings.Contains(h, `ongoing-request="true"`)
+	if _, rest, ok := strings.Cut(h, `expiry-date="`); ok {
+		if date, _, ok := strings.Cut(rest, `"`); ok {
+			until, _ = time.Parse(http.TimeFormat, date)
+		}
+	}
+	return ongoing, until
+}
+
+// RequestRestore asks S3 to make a temporary readable copy of an archived
+// object. The copy is billed as Standard storage for the days it exists.
+func (s *S3) RequestRestore(ctx context.Context, key string, days int, tier string) error {
+	k, err := s.key(key)
+	if err != nil {
+		return err
+	}
+	if days < 1 {
+		return fmt.Errorf("s3 restore %s: days must be at least 1", key)
+	}
+	_, err = s.api.RestoreObject(ctx, &s3.RestoreObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    k,
+		RestoreRequest: &types.RestoreRequest{
+			Days:                 aws.Int32(int32(days)),
+			GlacierJobParameters: &types.GlacierJobParameters{Tier: types.Tier(tier)},
+		},
+	})
+	if err != nil && apiCode(err) != "RestoreAlreadyInProgress" {
+		return fmt.Errorf("s3 restore %s: %w", key, err)
 	}
 	return nil
 }
@@ -106,8 +193,11 @@ func (s *S3) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 	out, err := s.api.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: k})
 	if err != nil {
-		if isNotFound(err) {
+		switch {
+		case isNotFound(err):
 			return nil, ErrNotFound
+		case apiCode(err) == "InvalidObjectState":
+			return nil, fmt.Errorf("s3 get %s: %w", key, ErrArchived)
 		}
 		return nil, fmt.Errorf("s3 get %s: %w", key, err)
 	}
@@ -138,6 +228,8 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) ([]
 		switch {
 		case isNotFound(err):
 			return nil, ErrNotFound
+		case apiCode(err) == "InvalidObjectState":
+			return nil, fmt.Errorf("s3 get %s: %w", key, ErrArchived)
 		case apiCode(err) == "InvalidRange", httpStatus(err) == http.StatusRequestedRangeNotSatisfiable:
 			return nil, io.ErrUnexpectedEOF
 		}

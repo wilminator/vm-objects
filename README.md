@@ -6,8 +6,9 @@ extents that changed. Everything is compressed and encrypted on the host
 before it is stored, and every restore point can be restored on its own.
 
 **Status: early development (0.1.0-dev).** It backs up raw disks to a local
-folder or an S3 bucket and restores them. Storage classes, Object Lock, host
-plugins (ZFS, QEMU/libvirt) and VM definitions/TPM state come next. Don't
+folder or an S3 bucket and restores them, with per-kind storage classes.
+Object Lock, host plugins (ZFS, QEMU/libvirt) and VM definitions/TPM state
+come next. Don't
 rely on it as your only backup yet.
 
 ## What works today
@@ -20,6 +21,7 @@ rely on it as your only backup yet.
 | `vmobj backup` | `--type full`, `incremental` or `differential`. |
 | `vmobj list` | Lists restore points. |
 | `vmobj restore` | Writes a restore point to a raw image file (sparse) or a block device. |
+| `vmobj profiles` | Lists the storage profiles. |
 | `vmobj verify` | Checks a restore point's pieces are present; `--deep` also decrypts and hash-checks each one. |
 
 Sources are raw image files or block devices, for example a ZFS zvol
@@ -83,6 +85,25 @@ s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|fals
 ```bash
 vmobj init --repo 's3://my-backups/nas1?region=us-west-2' --key-file /root/vmobj.key
 ```
+
+### Storage classes and profiles
+
+A profile picks a storage class and a retention period for each kind of
+backup. `vmobj profiles` lists them:
+
+| Profile | Fulls and differentials | Incrementals |
+| --- | --- | --- |
+| `disaster-recovery` (default) | Deep Archive, 180 days | Standard-IA, 30 days |
+| `fast-restore` | Glacier Instant Retrieval, 90 days | Standard-IA, 30 days |
+| `standard` | Standard | Standard |
+
+Use `--profile standard` with self-hosted services, which usually have only
+Standard storage. `--class` overrides the class for a single run.
+Manifests and indexes always stay in Standard, so listing and planning a
+restore never wait on the archive. Restoring from Glacier Flexible Retrieval
+or Deep Archive is two steps: `vmobj restore ... --request-restore` starts
+the retrieval and reports the expected wait, and the same restore command
+run later does the restore.
 
 ## How it stores data
 

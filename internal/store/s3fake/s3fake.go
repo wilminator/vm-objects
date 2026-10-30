@@ -20,6 +20,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +38,29 @@ import (
 type Object struct {
 	Data     []byte
 	Modified time.Time
+	Class    types.StorageClass // "" means Standard, as in S3
+	// Restore state for archived classes.
+	Restoring     bool
+	RestoreDays   int
+	RestoreTier   types.Tier
+	RestoredUntil time.Time
+}
+
+func (o *Object) archived() bool {
+	return o.Class == types.StorageClassGlacier || o.Class == types.StorageClassDeepArchive
+}
+
+// readable applies S3's rule: archived objects can be read only while a
+// finished restore's copy exists.
+func (o *Object) readable(now time.Time) bool {
+	return !o.archived() || (!o.Restoring && now.Before(o.RestoredUntil))
+}
+
+// knownClasses are the classes the fake accepts. Set Server.Classes to
+// imitate a service that knows fewer (MinIO and QuObjects know Standard).
+var knownClasses = []types.StorageClass{
+	"", types.StorageClassStandard, types.StorageClassIntelligentTiering, types.StorageClassStandardIa,
+	types.StorageClassOnezoneIa, types.StorageClassGlacierIr, types.StorageClassGlacier, types.StorageClassDeepArchive,
 }
 
 // Server holds the buckets. The zero value is not usable; call New.
@@ -54,6 +79,8 @@ type Server struct {
 	// Calls counts requests by operation name, for tests that check
 	// efficiency (for example that a ranged read was used).
 	Calls map[string]int
+	// Classes, when set, limits which storage classes PutObject accepts.
+	Classes []types.StorageClass
 }
 
 // New returns a server with the named buckets already created.
@@ -111,7 +138,18 @@ func (s *Server) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func
 	if err != nil {
 		return nil, err
 	}
-	b[aws.ToString(in.Key)] = &Object{Data: data, Modified: s.Now()}
+	allowed := s.Classes
+	if allowed == nil {
+		allowed = knownClasses
+	}
+	if !slices.Contains(allowed, in.StorageClass) {
+		return nil, apiErr("InvalidStorageClass", "The storage class you specified is not valid")
+	}
+	class := in.StorageClass
+	if class == types.StorageClassStandard {
+		class = ""
+	}
+	b[aws.ToString(in.Key)] = &Object{Data: data, Modified: s.Now(), Class: class}
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -130,6 +168,9 @@ func (s *Server) GetObject(ctx context.Context, in *s3.GetObjectInput, _ ...func
 	o, ok := b[aws.ToString(in.Key)]
 	if !ok {
 		return nil, apiErr("NoSuchKey", "The specified key does not exist.")
+	}
+	if !o.readable(s.Now()) {
+		return nil, apiErr("InvalidObjectState", "The operation is not valid for the object's storage class")
 	}
 	data := o.Data
 	if in.Range != nil {
@@ -183,7 +224,71 @@ func (s *Server) HeadObject(ctx context.Context, in *s3.HeadObjectInput, _ ...fu
 	if !ok {
 		return nil, apiErr("NotFound", "Not Found")
 	}
-	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(o.Data))), LastModified: aws.Time(o.Modified)}, nil
+	out := &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(o.Data))), LastModified: aws.Time(o.Modified),
+		StorageClass: o.Class}
+	switch {
+	case o.Restoring:
+		out.Restore = aws.String(`ongoing-request="true"`)
+	case !o.RestoredUntil.IsZero() && s.Now().Before(o.RestoredUntil):
+		out.Restore = aws.String(fmt.Sprintf(`ongoing-request="false", expiry-date="%s"`,
+			o.RestoredUntil.UTC().Format(http.TimeFormat)))
+	}
+	return out, nil
+}
+
+// RestoreObject starts a restore of an archived object. Call
+// CompleteRestores to finish the running ones, as S3 would hours later.
+func (s *Server) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput, _ ...func(*s3.Options)) (*s3.RestoreObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Calls["RestoreObject"]++
+	b, err := s.bucket(in.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	o, ok := b[aws.ToString(in.Key)]
+	if !ok {
+		return nil, apiErr("NoSuchKey", "The specified key does not exist.")
+	}
+	if !o.archived() {
+		return nil, apiErr("InvalidObjectState", "Restore is not allowed for the object's current storage class")
+	}
+	if o.Restoring {
+		return nil, apiErr("RestoreAlreadyInProgress", "Object restore is already in progress")
+	}
+	r := in.RestoreRequest
+	if r == nil || aws.ToInt32(r.Days) < 1 {
+		return nil, apiErr("MalformedXML", "restore request needs Days")
+	}
+	tier := types.TierStandard
+	if r.GlacierJobParameters != nil && r.GlacierJobParameters.Tier != "" {
+		tier = r.GlacierJobParameters.Tier
+	}
+	if o.Class == types.StorageClassDeepArchive && tier == types.TierExpedited {
+		return nil, apiErr("InvalidArgument", "Expedited retrieval is not available for Deep Archive")
+	}
+	o.Restoring, o.RestoreDays, o.RestoreTier = true, int(aws.ToInt32(r.Days)), tier
+	return &s3.RestoreObjectOutput{}, nil
+}
+
+// CompleteRestores finishes every running restore, returning how many.
+func (s *Server) CompleteRestores() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, b := range s.buckets {
+		for _, o := range b {
+			if o.Restoring {
+				o.Restoring = false
+				o.RestoredUntil = s.Now().Add(time.Duration(o.RestoreDays) * 24 * time.Hour)
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // ListObjectsV2 lists keys in order, PageSize at a time.
@@ -227,10 +332,15 @@ func (s *Server) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, _
 		out.IsTruncated = aws.Bool(false)
 	}
 	for _, k := range keys {
+		class := types.ObjectStorageClass(b[k].Class)
+		if class == "" {
+			class = types.ObjectStorageClassStandard
+		}
 		out.Contents = append(out.Contents, types.Object{
 			Key:          aws.String(k),
 			Size:         aws.Int64(int64(len(b[k].Data))),
 			LastModified: aws.Time(b[k].Modified),
+			StorageClass: class,
 		})
 	}
 	out.KeyCount = aws.Int32(int32(len(out.Contents)))
