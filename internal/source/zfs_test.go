@@ -160,3 +160,31 @@ func TestZFSNeverDestroysACloneItDidNotMake(t *testing.T) {
 		t.Fatal("destroyed a dataset vmobj didn't create")
 	}
 }
+
+func TestSnapshotZvolsAtomically(t *testing.T) {
+	f := newFakeZFS(t)
+	f.datasets["tank/vms/win11-d"] = "volume"
+	now := time.Date(2026, 11, 3, 2, 0, 0, 0, time.UTC)
+	snaps, err := SnapshotZvols(context.Background(), f, now, "tank/vms/win11", "tank/vms/win11-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 1 || f.calls[0] != "snapshot tank/vms/win11@vmobj-20261103T020000Z tank/vms/win11-d@vmobj-20261103T020000Z" {
+		t.Fatalf("calls %v; both zvols must be snapshotted in one command", f.calls)
+	}
+	o := opts(f)
+	o.Snapshot = snaps["tank/vms/win11"]
+	z, err := OpenZFS(context.Background(), "tank/vms/win11", o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z.Close()
+	if _, ok := f.datasets[snaps["tank/vms/win11"]]; ok {
+		t.Fatal("the adopted snapshot was not destroyed on Close")
+	}
+	// Someone else's snapshot can't be adopted (and so can't be destroyed).
+	o.Snapshot = "tank/vms/win11@nightly"
+	if _, err := OpenZFS(context.Background(), "tank/vms/win11", o); err == nil {
+		t.Fatal("adopted a snapshot vmobj didn't take")
+	}
+}

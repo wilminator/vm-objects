@@ -52,6 +52,8 @@ jobs:
         run: |
           make build
           scripts/e2e.sh "$RUNNER_TEMP/e2e-repo" bin/vmobj
+      - name: Whole-VM end-to-end (stand-in virsh)
+        run: scripts/vm-e2e.sh bin/vmobj
 
   docker:
     runs-on: ubuntu-latest

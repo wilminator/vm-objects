@@ -8,8 +8,8 @@ before it is stored, and every restore point can be restored on its own.
 **Status: early development (0.1.0-dev).** It backs up raw disks to a local
 folder or an S3 bucket and restores them, with per-kind storage classes,
 Object Lock and pruning. It reads raw disks, qcow2 images (with backing
-chains) and ZFS zvols through snapshots. VM definitions and TPM state come
-next. Don't
+chains) and ZFS zvols through snapshots, and backs up whole libvirt VMs
+(disks, definition, UEFI NVRAM and TPM state). Don't
 rely on it as your only backup yet.
 
 ## What works today
@@ -22,6 +22,9 @@ rely on it as your only backup yet.
 | `vmobj backup` | `--type full`, `incremental` or `differential`. |
 | `vmobj list` | Lists restore points. |
 | `vmobj restore` | Writes a restore point to a raw image file (sparse) or a block device. |
+| `vmobj backup-vm` | Backs up a whole libvirt VM: every disk, the definition, UEFI NVRAM and TPM state. |
+| `vmobj vms` | Lists whole-VM backups. |
+| `vmobj restore-vm` | Writes a VM's disks, adjusted definition, NVRAM and TPM state into a folder, with instructions. Never changes libvirt. |
 | `vmobj profiles` | Lists the storage profiles. |
 | `vmobj prune` | Removes backups past their keep-until date and data nothing else uses. Reports only, unless `--apply`. |
 | `vmobj verify` | Checks a restore point's pieces are present; `--deep` also decrypts and hash-checks each one. |
@@ -79,6 +82,29 @@ Measure how much a disk changes per day (run it daily):
 ```bash
 vmobj measure --source /mnt/scratch/win11.raw --name win11
 ```
+
+## Whole VMs
+
+```bash
+vmobj backup-vm --repo /mnt/backup/vmobj --key-file /root/vmobj.key --domain win11 --type full
+```
+
+- A **shut-off** VM is read directly.
+- A **running** VM's zvol disks are snapshotted together, atomically.
+  `--quiesce` first freezes the guest's filesystems through the QEMU guest
+  agent, and the thaw always runs.
+- A running VM with disk *image files* is refused: snapshotting those live
+  means changing the VM's disk chain, which vmobj won't do. Shut it down
+  for the backup.
+- The TPM state comes from `/var/lib/libvirt/swtpm/<uuid>`. Use
+  `--swtpm-dir` elsewhere; on QNAP it's `/QVS/var/lib/libvirt/swtpm`, with
+  `--virsh /QVS/usr/bin/virsh`.
+
+`restore-vm --to DIR` writes everything into a folder and explains the next
+steps in `RESTORE.txt`. It never registers the VM with libvirt.
+`--new-name` renames the VM and drops its UUID, so the copy can run next to
+the original. Restoring the TPM state is what keeps BitLocker and Windows
+Hello PINs working.
 
 ## Repositories in S3
 

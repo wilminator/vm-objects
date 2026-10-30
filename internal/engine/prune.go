@@ -70,7 +70,50 @@ func Prune(ctx context.Context, o PruneOptions) (*PruneReport, error) {
 	}
 	rep := &PruneReport{Applied: o.Apply, Locked: map[string]time.Time{}}
 
-	// 1. Decide which manifests stay, and gather what they need.
+	// 1. Whole-VM records first: a kept record keeps its disks' manifests.
+	protected := map[string]bool{} // "stream/manifest"
+	var expiredRecords []string
+	recordDisks := map[string][]manifest.VMDisk{}
+	recordVMs, err := r.ListRecordVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, vm := range recordVMs {
+		names, err := r.ListVMRecords(ctx, vm)
+		if err != nil {
+			return nil, err
+		}
+		for i, name := range names {
+			rec, err := r.GetVMRecord(ctx, vm, name)
+			if err != nil {
+				return nil, fmt.Errorf("prune stops rather than guess: %w", err)
+			}
+			if !rec.RetainUntil.IsZero() && o.Now.After(rec.RetainUntil) && i < len(names)-o.KeepLast {
+				rep.ExpiredManifests = append(rep.ExpiredManifests, "vm record "+vm+"/"+name)
+				expiredRecords = append(expiredRecords, repo.VMRecordKey(vm, name))
+				recordDisks[repo.VMRecordKey(vm, name)] = rec.Disks
+				continue
+			}
+			for _, d := range rec.Disks {
+				protected[d.Stream+"/"+d.Manifest] = true
+			}
+		}
+	}
+	// Expired records go before anything they name. One that can't go yet
+	// still protects its disks' manifests.
+	removedRecords, err := removeKeys(ctx, r, o, rep, expiredRecords, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range expiredRecords {
+		if !removedRecords[k] {
+			for _, d := range recordDisks[k] {
+				protected[d.Stream+"/"+d.Manifest] = true
+			}
+		}
+	}
+
+	// 2. Decide which manifests stay, and gather what they need.
 	vms, err := r.ListVMs(ctx)
 	if err != nil {
 		return nil, err
@@ -92,7 +135,7 @@ func Prune(ctx context.Context, o PruneOptions) (*PruneReport, error) {
 				return nil, fmt.Errorf("prune stops rather than guess: %w", err)
 			}
 			rep.Manifests++
-			newest := i >= len(names)-o.KeepLast
+			newest := i >= len(names)-o.KeepLast || protected[vm+"/"+name]
 			if expired(m, o.Now) {
 				if !newest {
 					rep.ExpiredManifests = append(rep.ExpiredManifests, vm+"/"+name)
@@ -119,9 +162,9 @@ func Prune(ctx context.Context, o PruneOptions) (*PruneReport, error) {
 		return true // anything unfamiliar is left alone
 	}
 
-	// 2. Expired manifests go first, so no manifest ever names data that is
-	// already gone. One that can't go yet (too recent, still locked, or a
-	// failed delete) still needs its data, so it counts as kept.
+	// 3. Expired manifests go before data, so no manifest ever names data
+	// that is already gone. One that can't go yet (too recent, still
+	// locked, or a failed delete) still needs its data, so it counts as kept.
 	removed, err := removeKeys(ctx, r, o, rep, expiredKeys, false)
 	if err != nil {
 		return nil, err
@@ -135,7 +178,7 @@ func Prune(ctx context.Context, o PruneOptions) (*PruneReport, error) {
 		}
 	}
 
-	// 3. Data no kept manifest needs.
+	// 4. Data no kept manifest needs.
 	if v, ok := r.Backend.(store.Versioned); ok {
 		if err := pruneVersions(ctx, v, o, rep, live); err != nil {
 			return nil, err
@@ -271,7 +314,7 @@ func removeKeys(ctx context.Context, r *repo.Repo, o PruneOptions, rep *PruneRep
 // re-uploads) go too. For each live key the newest real version always
 // stays, even when a delete marker hides it.
 func pruneVersions(ctx context.Context, v store.Versioned, o PruneOptions, rep *PruneReport, live func(string) bool) error {
-	for _, prefix := range []string{"blocks/", "packs/", "manifests/"} {
+	for _, prefix := range []string{"blocks/", "packs/", "manifests/", "vms/"} {
 		versions, err := v.ListVersions(ctx, prefix)
 		if err != nil {
 			return err
@@ -290,15 +333,15 @@ func pruneVersions(ctx context.Context, v store.Versioned, o PruneOptions, rep *
 		counted := map[string]bool{}
 		for _, ver := range versions {
 			isLive := live(ver.Key)
-			if prefix == "manifests/" {
-				// Manifests were handled already; only their old versions
-				// are tidied here.
+			if prefix == "manifests/" || prefix == "vms/" {
+				// Manifests and records were handled already; only their old
+				// versions are tidied here.
 				isLive = true
 			}
 			switch {
 			case isLive && ver.DeleteMarker:
 				// Leave markers on live keys alone; report hidden objects.
-				if ver.Latest && prefix != "manifests/" {
+				if ver.Latest && prefix != "manifests/" && prefix != "vms/" {
 					rep.Hidden++
 				}
 				continue
