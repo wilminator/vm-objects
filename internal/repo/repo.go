@@ -1,0 +1,323 @@
+// Copyright (c) 2026 Michael Allen Wilmes
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// Package repo is a vmobj repository: a backend plus the layout, keys and
+// sealing rules on top of it.
+//
+// Layout:
+//
+//	config.json                      plaintext settings (no secrets)
+//	blocks/ab/<hash>                 one sealed base block per object
+//	packs/<chain>/<id>.pack          sealed extents, back to back
+//	packs/<chain>/<id>.toc           sealed table of contents for a pack
+//	manifests/<vm>/<name>.manifest   sealed restore points
+package repo
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/wilminator/vm-objects/internal/extent"
+	"github.com/wilminator/vm-objects/internal/hashing"
+	"github.com/wilminator/vm-objects/internal/keys"
+	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/seal"
+	"github.com/wilminator/vm-objects/internal/store"
+)
+
+// ConfigFormat is the repository layout version.
+const ConfigFormat = 1
+
+const configKey = "config.json"
+
+// Config is stored in plaintext so tools can identify a repository without
+// a key. It holds no secrets: KeyID only names the key.
+type Config struct {
+	Format     int           `json:"format"`
+	RepoID     string        `json:"repoID"`
+	KeyID      string        `json:"keyID"`
+	Created    time.Time     `json:"created"`
+	BlockSize  extent.Length `json:"blockSize"`
+	ExtentSize extent.Length `json:"extentSize"`
+	PackTarget int64         `json:"packTarget"`
+	// MAC authenticates every field above with a key derived from the
+	// master key, so whoever holds the storage can't alter the settings.
+	MAC string `json:"mac,omitempty"`
+}
+
+// DefaultConfig uses 4 MiB base blocks, 64 KiB extents and 128 MiB packs.
+func DefaultConfig() Config {
+	return Config{BlockSize: 4 << 20, ExtentSize: 64 << 10, PackTarget: 128 << 20}
+}
+
+// Limits on sizes. They keep memory use bounded (each scan worker holds one
+// block) and stop a damaged or hostile config from causing harm.
+const (
+	minExtentSize = 4 << 10
+	maxBlockSize  = 64 << 20
+	minPackTarget = 1 << 20
+	maxPackTarget = 1 << 30
+)
+
+var hexID = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// Validate checks every field is in range. RepoID is used in local folder
+// names, so it must be exactly 16 hex characters.
+func (c Config) Validate() error {
+	switch {
+	case c.Format != ConfigFormat:
+		return fmt.Errorf("repository format %d is not supported by this version", c.Format)
+	case !hexID.MatchString(c.RepoID):
+		return fmt.Errorf("repository ID %q is malformed", c.RepoID)
+	case c.ExtentSize < minExtentSize || c.BlockSize > maxBlockSize || c.BlockSize < c.ExtentSize || c.BlockSize%c.ExtentSize != 0:
+		return fmt.Errorf("block size %d and extent size %d: blocks must be at most %d bytes and a multiple of extents, which must be at least %d bytes",
+			c.BlockSize, c.ExtentSize, maxBlockSize, minExtentSize)
+	case c.PackTarget < minPackTarget || c.PackTarget > maxPackTarget:
+		return fmt.Errorf("pack size %d must be between %d and %d bytes", c.PackTarget, minPackTarget, maxPackTarget)
+	}
+	return nil
+}
+
+// mac computes the config's authentication code over every field but MAC.
+func (c Config) mac(key [32]byte) (string, error) {
+	c.MAC = ""
+	data, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	m := hmac.New(sha256.New, key[:])
+	m.Write(data)
+	return hex.EncodeToString(m.Sum(nil)), nil
+}
+
+// Repo is an open repository.
+type Repo struct {
+	Backend store.Backend
+	Config  Config
+	sealer  *seal.Sealer
+	hasher  hashing.Hasher
+}
+
+// ErrExists is returned by Init when a repository is already there.
+var ErrExists = errors.New("a repository already exists here")
+
+// Init creates a repository in an empty backend.
+func Init(ctx context.Context, b store.Backend, k keys.Set, cfg Config) (*Repo, error) {
+	if ok, err := b.Exists(ctx, configKey); err != nil {
+		return nil, err
+	} else if ok {
+		return nil, ErrExists
+	}
+	cfg.Format = ConfigFormat
+	cfg.RepoID = NewID()
+	cfg.KeyID = k.KeyID
+	cfg.Created = time.Now().UTC()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	mac, err := cfg.mac(k.Config)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MAC = mac
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := b.Put(ctx, configKey, append(data, '\n')); err != nil {
+		return nil, err
+	}
+	return newRepo(b, k, cfg)
+}
+
+// Open reads an existing repository and checks the key matches it.
+func Open(ctx context.Context, b store.Backend, k keys.Set) (*Repo, error) {
+	data, err := b.Get(ctx, configKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, errors.New("no repository here; create one with \"vmobj init\"")
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("reading %s: %w", configKey, err)
+	}
+	if cfg.KeyID != k.KeyID {
+		return nil, fmt.Errorf("this key file does not match the repository (key ID %s, repository expects %s)", k.KeyID, cfg.KeyID)
+	}
+	want, err := cfg.mac(k.Config)
+	if err != nil {
+		return nil, err
+	}
+	if !hmac.Equal([]byte(want), []byte(cfg.MAC)) {
+		return nil, fmt.Errorf("%s has been altered or damaged (authentication failed)", configKey)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return newRepo(b, k, cfg)
+}
+
+func newRepo(b store.Backend, k keys.Set, cfg Config) (*Repo, error) {
+	s, err := seal.New(k.Data)
+	if err != nil {
+		return nil, err
+	}
+	return &Repo{Backend: b, Config: cfg, sealer: s, hasher: hashing.Keyed(k.ID)}, nil
+}
+
+// Hasher returns the repository's keyed hasher for content IDs.
+func (r *Repo) Hasher() hashing.Hasher { return r.hasher }
+
+// NewID returns 16 random hex characters, used for chain, pack and repo IDs.
+func NewID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("crypto/rand failed: " + err.Error()) // only on a broken OS
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// ---- base blocks ----
+
+// BlockKey is where a base block lives.
+func BlockKey(h extent.Hash) string {
+	s := h.String()
+	return "blocks/" + s[:2] + "/" + s
+}
+
+// PutBlock seals and stores one base block.
+func (r *Repo) PutBlock(ctx context.Context, h extent.Hash, data []byte) (int, error) {
+	sealed, err := r.sealer.Seal(h[:], data)
+	if err != nil {
+		return 0, err
+	}
+	return len(sealed), r.Backend.Put(ctx, BlockKey(h), sealed)
+}
+
+// GetBlock fetches a base block and checks it really has hash h.
+func (r *Repo) GetBlock(ctx context.Context, h extent.Hash) ([]byte, error) {
+	sealed, err := r.Backend.Get(ctx, BlockKey(h))
+	if err != nil {
+		return nil, fmt.Errorf("block %s: %w", h, err)
+	}
+	return r.openContent(h, sealed)
+}
+
+// BlockSet lists every stored base block. One listing is much cheaper than
+// asking about each block separately, especially on S3.
+func (r *Repo) BlockSet(ctx context.Context) (map[extent.Hash]bool, error) {
+	keys, err := r.Backend.List(ctx, "blocks/")
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[extent.Hash]bool, len(keys))
+	for _, k := range keys {
+		h, err := extent.ParseHash(path.Base(k))
+		if err != nil {
+			continue // not ours; ignore
+		}
+		set[h] = true
+	}
+	return set, nil
+}
+
+func (r *Repo) openContent(h extent.Hash, sealed []byte) ([]byte, error) {
+	data, err := r.sealer.Open(h[:], sealed)
+	if err != nil {
+		return nil, fmt.Errorf("object %s: %w", h, err)
+	}
+	if r.hasher.Sum(data) != h {
+		return nil, fmt.Errorf("object %s: contents do not match their hash", h)
+	}
+	return data, nil
+}
+
+// ---- manifests ----
+
+// ManifestKey is where a manifest lives.
+func ManifestKey(vm, name string) string { return "manifests/" + vm + "/" + name + ".manifest" }
+
+// PutManifest seals and stores a manifest. It is written last in every
+// run, so a manifest only exists once everything it points at is stored.
+func (r *Repo) PutManifest(ctx context.Context, m *manifest.Manifest) error {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	key := ManifestKey(m.VM, m.Name)
+	sealed, err := r.sealer.Seal([]byte(key), data)
+	if err != nil {
+		return err
+	}
+	return r.Backend.Put(ctx, key, sealed)
+}
+
+// GetManifest reads and checks a manifest.
+func (r *Repo) GetManifest(ctx context.Context, vm, name string) (*manifest.Manifest, error) {
+	key := ManifestKey(vm, name)
+	sealed, err := r.Backend.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("manifest %s/%s: %w", vm, name, err)
+	}
+	data, err := r.sealer.Open([]byte(key), sealed)
+	if err != nil {
+		return nil, fmt.Errorf("manifest %s/%s: %w", vm, name, err)
+	}
+	var m manifest.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("manifest %s/%s: %w", vm, name, err)
+	}
+	if m.VM != vm || m.Name != name {
+		return nil, fmt.Errorf("manifest %s/%s: names inside do not match", vm, name)
+	}
+	return &m, m.Validate()
+}
+
+// ListManifests returns a VM's manifest names, oldest first.
+func (r *Repo) ListManifests(ctx context.Context, vm string) ([]string, error) {
+	prefix := "manifests/" + vm + "/"
+	keys, err := r.Backend.List(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, k := range keys {
+		if strings.HasSuffix(k, ".manifest") {
+			names = append(names, strings.TrimSuffix(strings.TrimPrefix(k, prefix), ".manifest"))
+		}
+	}
+	return names, nil
+}
+
+// ListVMs returns the VMs that have manifests.
+func (r *Repo) ListVMs(ctx context.Context) ([]string, error) {
+	keys, err := r.Backend.List(ctx, "manifests/")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var vms []string
+	for _, k := range keys {
+		parts := strings.Split(k, "/")
+		if len(parts) == 3 && !seen[parts[1]] {
+			seen[parts[1]] = true
+			vms = append(vms, parts[1])
+		}
+	}
+	return vms, nil
+}
