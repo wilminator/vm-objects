@@ -28,6 +28,8 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install QEMU tools (the qcow2 tests compare against qemu-img)
+        run: sudo apt-get update -q && sudo apt-get install -y -q qemu-utils
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"
@@ -72,6 +74,33 @@ jobs:
           docker build --build-arg VERSION=ci -t vmobj:ci .
           docker run --rm vmobj:ci version | grep -qx 'vmobj ci'
           docker image ls vmobj:ci
+
+  # Real ZFS: a throwaway pool in a file on the runner. Skipped (with a
+  # notice) if the runner's kernel has no ZFS module.
+  zfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Set up ZFS
+        id: zfs
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q zfsutils-linux || true
+          if sudo modprobe zfs 2>/dev/null && command -v zpool >/dev/null; then
+            truncate -s 512M "$RUNNER_TEMP/pool.img"
+            sudo zpool create vmobjci "$RUNNER_TEMP/pool.img"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ZFS is not available on this runner; zfs: sources were not tested end to end"
+          fi
+      - name: End-to-end with zfs:
+        if: steps.zfs.outputs.ok == 'true'
+        run: |
+          make build
+          sudo scripts/zfs-e2e.sh vmobjci bin/vmobj
 
   # The same checks against a real S3 API. MinIO runs in a throwaway
   # container on the runner; the credentials below exist only inside it.
