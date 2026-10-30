@@ -406,17 +406,19 @@ func (q *QCOW2) decompress(entry uint64) ([]byte, error) {
 			return nil, err
 		}
 		defer d.Close()
-		if _, err := io.ReadFull(d, out); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, fmt.Errorf("zstd: %w", err)
+		if _, err := io.ReadFull(d, out); err != nil {
+			return nil, fmt.Errorf("zstd: cluster does not decompress to its full size: %w", err)
 		}
 		return out, nil
 	}
 	// qcow2's default compression is raw deflate (no zlib header).
 	r := flate.NewReader(bytes.NewReader(buf))
 	defer r.Close()
-	// The disk's last cluster may hold less than a full cluster of data.
-	if _, err := io.ReadFull(r, out); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return nil, fmt.Errorf("deflate: %w", err)
+	// Like QEMU, require a whole cluster: a short result means the image
+	// is damaged or truncated, and padding it with zeros would hand back
+	// wrong data without an error.
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil, fmt.Errorf("deflate: cluster does not decompress to its full size: %w", err)
 	}
 	return out, nil
 }

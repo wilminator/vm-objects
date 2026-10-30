@@ -250,3 +250,34 @@ func TestOpenPicksFormat(t *testing.T) {
 		t.Fatal("accepted an unknown format")
 	}
 }
+
+// A truncated image must fail to read, never read back wrong data. (Found
+// in review: short compressed clusters were padded with zeros.)
+func TestQCOW2TruncatedCompressedFailsLoudly(t *testing.T) {
+	needQemu(t)
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "d.raw")
+	want := make([]byte, 1<<20)
+	rng := rand.New(rand.NewSource(3))
+	for i := range want {
+		want[i] = byte('a' + rng.Intn(4)) // compressible, nonzero
+	}
+	os.WriteFile(raw, want, 0o600)
+	img := filepath.Join(dir, "d.qcow2")
+	run(t, "qemu-img", "convert", "-c", "-f", "raw", "-O", "qcow2", raw, img)
+	data, _ := os.ReadFile(img)
+	for cut := 512; cut <= 40000; cut += 512 {
+		p := filepath.Join(dir, "t.qcow2")
+		os.WriteFile(p, data[:len(data)-cut], 0o600)
+		q, err := OpenQCOW2(p)
+		if err != nil {
+			continue
+		}
+		got := make([]byte, q.Size())
+		n, err := q.ReadAt(got, 0)
+		q.Close()
+		if err == nil && !bytes.Equal(got[:n], want) {
+			t.Fatalf("cutting %d bytes: the read succeeded with wrong data", cut)
+		}
+	}
+}

@@ -92,7 +92,6 @@ func TestZFSSnapshotReadAndCleanup(t *testing.T) {
 		"get -H -o value type tank/vms/win11",
 		"snapshot tank/vms/win11@vmobj-20261103T020000Z",
 		"clone -o readonly=on tank/vms/win11@vmobj-20261103T020000Z tank/vms/win11-vmobj-20261103T020000Z",
-		"list -H -o name tank/vms/win11-vmobj-20261103T020000Z",
 		"destroy tank/vms/win11-vmobj-20261103T020000Z",
 		"destroy tank/vms/win11@vmobj-20261103T020000Z",
 	}
@@ -145,5 +144,19 @@ func TestZFSRefusesNonVolumesAndBadNames(t *testing.T) {
 	}
 	if len(f.calls) != 1 { // only the "get" for tank/vms
 		t.Fatalf("ran commands for bad names: %v", f.calls)
+	}
+}
+
+// When cloning fails because the name is taken, the existing dataset is
+// not ours and must survive the cleanup.
+func TestZFSNeverDestroysACloneItDidNotMake(t *testing.T) {
+	f := newFakeZFS(t)
+	f.datasets["tank/vms/win11-vmobj-20261103T020000Z"] = "volume" // already there
+	f.failOn = "clone"
+	if _, err := OpenZFS(context.Background(), "tank/vms/win11", opts(f)); err == nil {
+		t.Fatal("expected the clone failure")
+	}
+	if _, ok := f.datasets["tank/vms/win11-vmobj-20261103T020000Z"]; !ok {
+		t.Fatal("destroyed a dataset vmobj didn't create")
 	}
 }

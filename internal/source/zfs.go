@@ -32,6 +32,7 @@ type ZFS struct {
 	z        ZFSRunner
 	snapshot string
 	clone    string
+	cloned   bool // this run created the clone, so it may destroy it
 	keep     bool
 }
 
@@ -110,6 +111,7 @@ func OpenZFS(ctx context.Context, dataset string, o ZFSOptions) (*ZFS, error) {
 		z.cleanup(context.WithoutCancel(ctx))
 		return nil, err
 	}
+	z.cloned = true
 	dev := filepath.Join(o.DevDir, z.clone)
 	if err := waitFor(ctx, dev, o.DeviceWait); err != nil {
 		z.cleanup(context.WithoutCancel(ctx))
@@ -160,7 +162,9 @@ func (z *ZFS) cleanup(ctx context.Context) error {
 	defer cancel()
 	var errs []error
 	// Destroy the clone first: a snapshot with a clone can't be destroyed.
-	if _, err := z.z.Run(ctx, "list", "-H", "-o", "name", z.clone); err == nil {
+	// Only a clone this run made: a failed clone may mean the name was
+	// already taken by something that isn't ours.
+	if z.cloned {
 		if _, err := z.z.Run(ctx, "destroy", z.clone); err != nil {
 			errs = append(errs, err)
 		}
