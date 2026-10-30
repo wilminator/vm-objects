@@ -92,17 +92,23 @@ jobs:
       - name: Start MinIO
         # MinIO stopped publishing community images in October 2025. Try the
         # last published images in order and use the first that pulls.
+        # Problems are reported as annotations (::error::), which show on
+        # the run's summary page.
         run: |
-          for image in minio/minio:latest quay.io/minio/minio:latest minio/minio:RELEASE.2025-04-22T22-12-26Z; do
-            if docker pull -q "$image"; then echo "Using $image"; break; fi
-            image=""
+          image=""
+          for candidate in minio/minio:latest quay.io/minio/minio:latest; do
+            if docker pull -q "$candidate"; then image=$candidate; break; fi
+            echo "::warning::could not pull $candidate"
           done
-          [ -n "$image" ] || { echo "No MinIO image could be pulled"; exit 1; }
+          [ -n "$image" ] || { echo "::error::no MinIO image could be pulled"; exit 1; }
+          echo "::notice::using $image"
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             "$image" server /data
-          for i in $(seq 60); do curl -sf "$ENDPOINT/minio/health/live" && break; sleep 1; done
-          aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket vmobj-ci --object-lock-enabled-for-bucket
+          for i in $(seq 60); do curl -sf "$ENDPOINT/minio/health/live" >/dev/null && break; sleep 1; done
+          curl -sf "$ENDPOINT/minio/health/live" >/dev/null || { echo "::error::MinIO did not become healthy: $(docker logs minio 2>&1 | tail -3 | tr '\n' ' ')"; exit 1; }
+      - name: Create the test bucket
+        run: go run ./scripts/mkbucket "s3://vmobj-ci?endpoint=$ENDPOINT" || { echo "::error::could not create the test bucket"; exit 1; }
       - name: Backend conformance tests
         run: go test -count=1 -v -run 'Conformance' ./internal/store/
         env:

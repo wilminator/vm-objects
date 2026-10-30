@@ -88,11 +88,12 @@ Save the file, then lock it down:
 chmod 600 ~/.aws/credentials
 ```
 
-For MinIO (Option B) only, create the bucket now. This needs the AWS CLI
-(`sudo apt install awscli`, or the installer from aws.amazon.com):
+For MinIO (Option B) only, create the bucket now, with Object Lock turned on
+(milestone 3 uses it). The repository includes a small helper for this, so
+the AWS CLI isn't needed:
 
 ```bash
-aws --profile vmtest --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket vmobj-test --object-lock-enabled-for-bucket
+go run ./scripts/mkbucket 's3://vmobj-test?endpoint=http://127.0.0.1:9000&profile=vmtest'
 ```
 
 Set a variable holding the connection options, replacing the endpoint with
