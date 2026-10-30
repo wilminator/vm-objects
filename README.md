@@ -6,16 +6,16 @@ extents that changed. Everything is compressed and encrypted on the host
 before it is stored, and every restore point can be restored on its own.
 
 **Status: early development (0.1.0-dev).** It backs up raw disks to a local
-folder and restores them. S3, storage classes, Object Lock, host plugins
-(ZFS, QEMU/libvirt) and VM definitions/TPM state come next. Don't rely on
-it as your only backup yet.
+folder or an S3 bucket and restores them. Storage classes, Object Lock, host
+plugins (ZFS, QEMU/libvirt) and VM definitions/TPM state come next. Don't
+rely on it as your only backup yet.
 
 ## What works today
 
 | Command | What it does |
 | --- | --- |
 | `vmobj key init` | Creates a 256-bit key file (mode 400). Keep a copy offline. |
-| `vmobj init` | Creates a repository in a folder. |
+| `vmobj init` | Creates a repository in a folder or an S3 bucket. |
 | `vmobj measure` | Read-only: hashes a disk and reports how much changed since the last run, at 64 KiB and 4 MiB. Needs no key or repository. |
 | `vmobj backup` | `--type full`, `incremental` or `differential`. |
 | `vmobj list` | Lists restore points. |
@@ -62,6 +62,26 @@ Measure how much a disk changes per day (run it daily):
 
 ```bash
 vmobj measure --source /mnt/scratch/win11.raw --name win11
+```
+
+## Repositories in S3
+
+Anywhere `--repo` takes a folder, it also takes an S3 address:
+
+```text
+s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|false]
+```
+
+- `region` is required for AWS unless `AWS_REGION` is set.
+- `endpoint` points at an S3-compatible service, such as QNAP QuObjects or
+  MinIO. Path-style addressing is switched on automatically when it's set.
+- `profile` picks a section of `~/.aws/credentials`. Credentials are never
+  part of the address: vmobj reads them from the standard AWS environment
+  variables, files or instance role.
+- A `PREFIX` lets several repositories share one bucket.
+
+```bash
+vmobj init --repo 's3://my-backups/nas1?region=us-west-2' --key-file /root/vmobj.key
 ```
 
 ## How it stores data

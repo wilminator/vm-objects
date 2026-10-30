@@ -22,6 +22,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/store"
+	"github.com/wilminator/vm-objects/internal/store/s3fake"
 )
 
 // harness keeps one small repository, disk image and state file for a test.
@@ -37,12 +38,36 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	dir := t.TempDir()
-	k, err := keys.Derive(bytes.Repeat([]byte{7}, 32))
+	b, err := store.NewLocal(filepath.Join(t.TempDir(), "repo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := store.NewLocal(filepath.Join(dir, "repo"))
+	return newHarnessOn(t, b)
+}
+
+// backends lists every kind of repository storage the engine tests run on.
+// Go note: a map of functions lets one test body run once per backend.
+var backends = map[string]func(t *testing.T) store.Backend{
+	"local": func(t *testing.T) store.Backend {
+		b, err := store.NewLocal(filepath.Join(t.TempDir(), "repo"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	},
+	"s3fake": func(t *testing.T) store.Backend {
+		b, err := store.NewS3(s3fake.New("bucket"), "bucket", "repo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	},
+}
+
+func newHarnessOn(t *testing.T, b store.Backend) *harness {
+	t.Helper()
+	dir := t.TempDir()
+	k, err := keys.Derive(bytes.Repeat([]byte{7}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +106,20 @@ func (h *harness) backup(kind manifest.Kind) *BackupStats {
 	return st
 }
 
+// tamper flips the last bit of a stored object. It goes through the
+// backend, so it works on any kind of storage.
+func (h *harness) tamper(key string) {
+	h.t.Helper()
+	data, err := h.repo.Backend.Get(h.ctx, key)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	if err := h.repo.Backend.Put(h.ctx, key, data); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
 func (h *harness) restoreEquals(name string, want []byte) {
 	h.t.Helper()
 	out := filepath.Join(h.dir, "restore-"+name+".raw")
@@ -97,7 +136,12 @@ func (h *harness) restoreEquals(name string, want []byte) {
 }
 
 func TestFullIncrementalDifferentialRestore(t *testing.T) {
-	h := newHarness(t)
+	for name, newBackend := range backends {
+		t.Run(name, func(t *testing.T) { testRoundTrips(t, newHarnessOn(t, newBackend(t))) })
+	}
+}
+
+func testRoundTrips(t *testing.T, h *harness) {
 	rng := rand.New(rand.NewSource(42))
 
 	// 1 MiB + 3000 bytes: 16 full blocks plus a short one, half zeros.
@@ -184,10 +228,7 @@ func TestTamperedBlockFailsRestore(t *testing.T) {
 	full := h.backup(manifest.Full)
 
 	keys, _ := h.repo.Backend.List(h.ctx, "blocks/")
-	path := filepath.Join(h.dir, "repo", filepath.FromSlash(keys[0]))
-	data, _ := os.ReadFile(path)
-	data[len(data)-1] ^= 1
-	os.WriteFile(path, data, 0o600)
+	h.tamper(keys[0])
 
 	out := filepath.Join(h.dir, "bad.raw")
 	_, err := Restore(h.ctx, RestoreOptions{Repo: h.repo, VM: "win11", Manifest: full.Manifest, Output: out})

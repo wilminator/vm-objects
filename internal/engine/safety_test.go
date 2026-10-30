@@ -31,10 +31,7 @@ func TestFailedRestoreLeavesNothing(t *testing.T) {
 
 	// Tamper with one stored block so the restore fails partway.
 	keys, _ := h.repo.Backend.List(h.ctx, "blocks/")
-	p := filepath.Join(h.dir, "repo", filepath.FromSlash(keys[len(keys)-1]))
-	data, _ := os.ReadFile(p)
-	data[len(data)-1] ^= 1
-	os.WriteFile(p, data, 0o600)
+	h.tamper(keys[len(keys)-1])
 
 	out := filepath.Join(h.dir, "existing.raw")
 	os.WriteFile(out, []byte("precious"), 0o600)

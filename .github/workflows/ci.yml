@@ -45,6 +45,11 @@ jobs:
 
       - name: Build static binaries
         run: make build-all
+      - name: End-to-end against a local folder
+        run: |
+          make build
+          scripts/e2e.sh "$RUNNER_TEMP/e2e-repo" bin/vmobj
+
 
   docker:
     runs-on: ubuntu-latest
@@ -67,3 +72,40 @@ jobs:
           docker build --build-arg VERSION=ci -t vmobj:ci .
           docker run --rm vmobj:ci version | grep -qx 'vmobj ci'
           docker image ls vmobj:ci
+
+  # The same checks against a real S3 API. MinIO runs in a throwaway
+  # container on the runner; the credentials below exist only inside it.
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: vmobj-ci
+      AWS_SECRET_ACCESS_KEY: vmobj-ci-not-a-secret
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Start MinIO
+        # MinIO stopped publishing community images in October 2025, so this
+        # is pinned to the last published release.
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 60); do curl -sf "$ENDPOINT/minio/health/live" && break; sleep 1; done
+          aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket vmobj-ci --object-lock-enabled-for-bucket
+      - name: Backend conformance tests
+        run: go test -count=1 -v -run 'Conformance' ./internal/store/
+        env:
+          VMOBJ_TEST_S3: s3://vmobj-ci/conformance?endpoint=http://127.0.0.1:9000
+      - name: End-to-end against S3
+        run: |
+          make build
+          scripts/e2e.sh "s3://vmobj-ci/e2e-$GITHUB_RUN_ID?endpoint=$ENDPOINT" bin/vmobj
+      - name: MinIO log on failure
+        if: failure()
+        run: docker logs minio | tail -50
