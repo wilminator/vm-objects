@@ -194,3 +194,61 @@ func forEach(ctx context.Context, n int, fn func(i int) error) error {
 	}
 	return ctx.Err()
 }
+
+// group runs functions in the background with a limit on how many run at
+// once, and remembers the first error. Go stops accepting work once one
+// has failed, so a scan can stop early.
+type group struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	slots  chan struct{}
+	mu     sync.Mutex
+	err    error
+}
+
+func newGroup(ctx context.Context, limit int) *group {
+	ctx, cancel := context.WithCancel(ctx)
+	return &group{ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit)}
+}
+
+// Go waits for a free slot, then runs fn in the background.
+func (g *group) Go(fn func(ctx context.Context) error) error {
+	select {
+	case g.slots <- struct{}{}:
+	case <-g.ctx.Done():
+		return g.firstErr()
+	}
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		defer func() { <-g.slots }()
+		if err := fn(g.ctx); err != nil {
+			g.mu.Lock()
+			if g.err == nil {
+				g.err = err
+				g.cancel()
+			}
+			g.mu.Unlock()
+		}
+	}()
+	return nil
+}
+
+func (g *group) firstErr() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.err != nil {
+		return g.err
+	}
+	return g.ctx.Err()
+}
+
+// Wait waits for everything started and returns the first error.
+func (g *group) Wait() error {
+	g.wg.Wait()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cancel()
+	return g.err
+}

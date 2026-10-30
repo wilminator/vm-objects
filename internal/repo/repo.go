@@ -43,6 +43,9 @@ const ConfigFormat = 1
 
 const configKey = "config.json"
 
+// ConfigKey is the repository's settings object.
+const ConfigKey = configKey
+
 // Config is stored in plaintext so tools can identify a repository without
 // a key. It holds no secrets: KeyID only names the key.
 type Config struct {
@@ -53,6 +56,10 @@ type Config struct {
 	BlockSize  extent.Length `json:"blockSize"`
 	ExtentSize extent.Length `json:"extentSize"`
 	PackTarget int64         `json:"packTarget"`
+	// ObjectLock means every object is written with a Governance lock.
+	// It is fixed at init and covered by the MAC, so it can't be switched
+	// off by editing the stored config.
+	ObjectLock bool `json:"objectLock,omitempty"`
 	// MAC authenticates every field above with a key derived from the
 	// master key, so whoever holds the storage can't alter the settings.
 	MAC string `json:"mac,omitempty"`
@@ -121,6 +128,11 @@ func Init(ctx context.Context, b store.Backend, k keys.Set, cfg Config) (*Repo, 
 	} else if ok {
 		return nil, ErrExists
 	}
+	if cfg.ObjectLock {
+		if err := CheckLocking(ctx, b); err != nil {
+			return nil, err
+		}
+	}
 	cfg.Format = ConfigFormat
 	cfg.RepoID = NewID()
 	cfg.KeyID = k.KeyID
@@ -172,7 +184,29 @@ func Open(ctx context.Context, b store.Backend, k keys.Set) (*Repo, error) {
 	return newRepo(b, k, cfg)
 }
 
+// ErrNoLocking means Object Lock was asked for but the storage can't do it.
+var ErrNoLocking = errors.New("Object Lock is not available here: the bucket must be created with Object Lock enabled, and local folders have no locks")
+
+// CheckLocking confirms the backend can lock objects.
+func CheckLocking(ctx context.Context, b store.Backend) error {
+	l, ok := b.(store.Locker)
+	if !ok {
+		return ErrNoLocking
+	}
+	on, err := l.LockingEnabled(ctx)
+	if err != nil {
+		return err
+	}
+	if !on {
+		return ErrNoLocking
+	}
+	return nil
+}
+
 func newRepo(b store.Backend, k keys.Set, cfg Config) (*Repo, error) {
+	if _, ok := b.(store.Locker); cfg.ObjectLock && !ok {
+		return nil, ErrNoLocking
+	}
 	s, err := seal.New(k.Data)
 	if err != nil {
 		return nil, err
@@ -254,7 +288,7 @@ func ManifestKey(vm, name string) string { return "manifests/" + vm + "/" + name
 
 // PutManifest seals and stores a manifest. It is written last in every
 // run, so a manifest only exists once everything it points at is stored.
-func (r *Repo) PutManifest(ctx context.Context, m *manifest.Manifest) error {
+func (r *Repo) PutManifest(ctx context.Context, m *manifest.Manifest, opts store.PutOptions) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -264,7 +298,7 @@ func (r *Repo) PutManifest(ctx context.Context, m *manifest.Manifest) error {
 	if err != nil {
 		return err
 	}
-	return r.Backend.Put(ctx, key, sealed)
+	return store.PutWith(ctx, r.Backend, key, sealed, opts)
 }
 
 // GetManifest reads and checks a manifest.

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/wilminator/vm-objects/internal/atomicfile"
 	"github.com/wilminator/vm-objects/internal/extent"
@@ -36,6 +37,12 @@ type State struct {
 	Blocks       []extent.Ref // block refs of the chain's full
 	Base         []extent.Ref // extent refs at the chain's full
 	Current      []extent.Ref // extent refs at the most recent run
+	// Locks remembers the Object Lock date this host last saw or set for
+	// each object key it relies on, so incrementals needn't ask S3 about
+	// every base block. Fulls re-check against S3 and refresh it. A stale
+	// entry can only be earlier than the truth (locks never shorten), so
+	// the worst it causes is an unneeded extension.
+	Locks map[string]time.Time
 }
 
 // LoadState reads a state file. A missing file returns (nil, nil).

@@ -18,11 +18,14 @@
 #
 # E2E_BACKUP_ARGS adds options to every backup, for example
 #   E2E_BACKUP_ARGS="--profile standard"   for services that only know Standard.
+# E2E_INIT_ARGS adds options to "vmobj init", for example
+#   E2E_INIT_ARGS="--object-lock"          for a bucket with Object Lock.
 set -euo pipefail
 
 repo=${1:?usage: e2e.sh REPO [VMOBJ_BINARY]}
 vmobj=${2:-vmobj}
 read -ra extra <<< "${E2E_BACKUP_ARGS:-}"
+read -ra init_extra <<< "${E2E_INIT_ARGS:-}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -37,7 +40,7 @@ scribble() { dd if=/dev/urandom of="$disk" bs=1M seek="$1" count=1 conv=notrunc 
 step "key and repository"
 "$vmobj" key init --key-file "$key"
 # Small blocks keep the test quick; real repositories use the defaults.
-"$vmobj" init --repo "$repo" --key-file "$key" --block-size 1MiB --extent-size 64KiB --pack-size 4MiB
+"$vmobj" init --repo "$repo" --key-file "$key" --block-size 1MiB --extent-size 64KiB --pack-size 4MiB "${init_extra[@]}"
 
 step "full backup"
 truncate -s 40M "$disk"
@@ -73,6 +76,11 @@ for name in "${names[@]}"; do
   cmp "$work/want-$want.raw" "$work/got-$want.raw"
   echo "OK: $name restores byte-identical"
 done
+
+step "prune (dry run): nothing is past its keep-until date yet"
+"$vmobj" prune --repo "$repo" --key-file "$key" | tee "$work/prune.txt"
+grep -q "Backups examined:     3" "$work/prune.txt" || { echo "FAIL: prune did not see the 3 backups"; exit 1; }
+grep -q "Past keep-until:      0" "$work/prune.txt" || { echo "FAIL: prune found expired backups"; exit 1; }
 
 step "wrong key is refused"
 "$vmobj" key init --key-file "$work/other.key"

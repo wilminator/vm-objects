@@ -40,13 +40,14 @@ const usage = `vmobj - block-level backups of virtual machine disks
 
 Usage:
   vmobj key init    --key-file PATH
-  vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB]
+  vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB] [--object-lock]
   vmobj measure     --source DISK [--name NAME] [--state-dir DIR]
   vmobj backup      --repo REPO --key-file PATH --source DISK --vm NAME --type full|incremental|differential
                     [--profile NAME] [--class CLASS]
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
+  vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
   vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
   vmobj version
@@ -92,6 +93,8 @@ func main() {
 		err = cmdVerify(ctx, args)
 	case "profiles":
 		err = cmdProfiles()
+	case "prune":
+		err = cmdPrune(ctx, args)
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
@@ -203,6 +206,7 @@ func cmdInit(ctx context.Context, args []string) error {
 	blockSize := fs.String("block-size", "4MiB", "base block size")
 	extentSize := fs.String("extent-size", "64KiB", "incremental extent size")
 	packSize := fs.String("pack-size", "128MiB", "target pack size")
+	objectLock := fs.Bool("object-lock", false, "lock every object (S3 bucket created with Object Lock)")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file"); err != nil {
 		return err
@@ -212,6 +216,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 	cfg := repo.DefaultConfig()
+	cfg.ObjectLock = *objectLock
 	for _, s := range []struct {
 		in  string
 		out *int64
@@ -232,6 +237,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("Created repository %s in %s (blocks %s, extents %s).\n",
 		r.Config.RepoID, *dir, units.Format(int64(cfg.BlockSize)), units.Format(int64(cfg.ExtentSize)))
+	if cfg.ObjectLock {
+		fmt.Println("Object Lock is on: every backup is locked in Governance mode for its retention period.")
+	}
 	return nil
 }
 
@@ -373,6 +381,9 @@ func cmdBackup(ctx context.Context, args []string) error {
 		fmt.Printf("Packs:     %d\n", st.Packs)
 	}
 	fmt.Printf("Written:   %s (compressed and encrypted)\n", units.Format(st.BytesWritten))
+	if st.LocksExtended > 0 || st.BlocksRefresh > 0 {
+		fmt.Printf("Locks:     %d extended, %d old blocks uploaded again\n", st.LocksExtended, st.BlocksRefresh)
+	}
 	return nil
 }
 
@@ -550,6 +561,61 @@ func cmdProfiles() error {
 				k, ci.Name, int(rule.Retain/policy.Day), int(rule.Every/policy.Day))
 		}
 		fmt.Println()
+	}
+	return nil
+}
+
+func cmdPrune(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	dir := fs.String("repo", "", "repository: a folder path or s3://...")
+	keyFile := fs.String("key-file", "", "key file")
+	apply := fs.Bool("apply", false, "delete for real (without it, only report)")
+	keepLast := fs.Int("keep-last", 1, "always keep this many newest backups of each VM")
+	grace := fs.Duration("grace", engine.DefaultGrace, "never delete objects written more recently than this")
+	fs.Parse(args)
+	if err := require(fs, "repo", "key-file"); err != nil {
+		return err
+	}
+	r, err := openRepo(ctx, *dir, *keyFile)
+	if err != nil {
+		return err
+	}
+	rep, err := engine.Prune(ctx, engine.PruneOptions{Repo: r, Now: time.Now(), Apply: *apply, KeepLast: *keepLast, Grace: *grace})
+	if err != nil {
+		return err
+	}
+	verb := "Would delete"
+	if rep.Applied {
+		verb = "Deleted"
+	}
+	fmt.Printf("Backups examined:     %d\n", rep.Manifests)
+	fmt.Printf("Past keep-until:      %d\n", len(rep.ExpiredManifests))
+	for _, m := range rep.ExpiredManifests {
+		fmt.Printf("  %s\n", m)
+	}
+	for _, m := range rep.KeptExpired {
+		fmt.Printf("  kept (newest of its VM): %s\n", m)
+	}
+	fmt.Printf("Unreferenced objects: %d (%s)\n", rep.Unreferenced, units.Format(rep.UnreferencedSize))
+	if rep.OldVersions > 0 {
+		fmt.Printf("Superseded versions:  %d\n", rep.OldVersions)
+	}
+	if rep.Recent > 0 {
+		fmt.Printf("Too recent to touch:  %d (written within %s)\n", rep.Recent, *grace)
+	}
+	if len(rep.Locked) > 0 {
+		var latest time.Time
+		for _, t := range rep.Locked {
+			if t.After(latest) {
+				latest = t
+			}
+		}
+		fmt.Printf("Still locked:         %d (all unlocked by %s; a later prune removes them)\n", len(rep.Locked), latest.Local().Format("2006-01-02"))
+	}
+	if rep.Applied {
+		fmt.Printf("%s:              %d object versions (%s)\n", verb, rep.Deleted, units.Format(rep.DeletedSize))
+	} else {
+		fmt.Println("Nothing was deleted. Run again with --apply to delete.")
 	}
 	return nil
 }

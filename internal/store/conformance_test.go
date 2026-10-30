@@ -80,3 +80,52 @@ func TestS3Conformance(t *testing.T) {
 		return b
 	})
 }
+
+func TestS3FakeLocks(t *testing.T) {
+	storetest.RunLocks(t, func(t *testing.T) storetest.LockBackend {
+		srv := s3fake.New()
+		srv.AddLockedBucket("locked")
+		b, err := store.NewS3(srv, "locked", "repo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	})
+}
+
+// TestS3Locks runs the lock checks against a real service. VMOBJ_TEST_S3
+// must name a bucket created with Object Lock enabled.
+func TestS3Locks(t *testing.T) {
+	base := os.Getenv("VMOBJ_TEST_S3")
+	if base == "" || os.Getenv("VMOBJ_TEST_S3_LOCKS") == "" {
+		t.Skip("set VMOBJ_TEST_S3 and VMOBJ_TEST_S3_LOCKS=1 to test Object Lock on a real service")
+	}
+	ctx := context.Background()
+	loc, err := store.ParseS3(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := store.NewS3Client(ctx, loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storetest.RunLocks(t, func(t *testing.T) storetest.LockBackend {
+		prefix := strings.Trim(loc.Prefix+"/locks-"+time.Now().UTC().Format("20060102T150405.000000000"), "/")
+		b, err := store.NewS3(client, loc.Bucket, prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	})
+}
+
+func TestS3FakeLockingDisabled(t *testing.T) {
+	b, _ := store.NewS3(s3fake.New("plain"), "plain", "")
+	if on, err := b.LockingEnabled(context.Background()); on || err != nil {
+		t.Fatalf("LockingEnabled on a plain bucket = %v, %v", on, err)
+	}
+	err := b.PutWith(context.Background(), "x", nil, store.PutOptions{LockUntil: time.Now().Add(time.Hour)})
+	if err == nil {
+		t.Fatal("a locked put to a bucket without Object Lock succeeded")
+	}
+}

@@ -68,7 +68,7 @@ var backends = map[string]func(t *testing.T) store.Backend{
 	},
 }
 
-func newHarnessOn(t *testing.T, b store.Backend) *harness {
+func newHarnessOn(t *testing.T, b store.Backend, changes ...func(*repo.Config)) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	k, err := keys.Derive(bytes.Repeat([]byte{7}, 32))
@@ -78,6 +78,9 @@ func newHarnessOn(t *testing.T, b store.Backend) *harness {
 	// Small sizes keep the test fast: 64 KiB blocks, 4 KiB extents,
 	// and the smallest allowed pack size.
 	cfg := repo.Config{BlockSize: 64 << 10, ExtentSize: 4 << 10, PackTarget: 1 << 20}
+	for _, change := range changes {
+		change(&cfg)
+	}
 	r, err := repo.Init(context.Background(), b, k, cfg)
 	if err != nil {
 		t.Fatal(err)

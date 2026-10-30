@@ -8,9 +8,11 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/wilminator/vm-objects/internal/extent"
@@ -73,6 +75,8 @@ type BackupStats struct {
 	ExtentsReused  int // extents found in earlier packs of the chain
 	Packs          int
 	BytesWritten   int64 // sealed bytes sent to the backend
+	LocksExtended  int   // Object Lock: existing locks moved later
+	BlocksRefresh  int   // Object Lock: old blocks uploaded again
 }
 
 // ErrNeedFull means an incremental or differential can't run yet.
@@ -159,11 +163,25 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 		return nil, err
 	}
 	put, policyFields := o.placement(started)
+	var cache map[string]time.Time
+	if prev != nil {
+		cache = prev.Locks
+	}
+	lk, err := newLocks(r, o.Profile, started, policyFields.RetainUntil, cache)
+	if err != nil {
+		return nil, err
+	}
+	put.LockUntil = lk.newObject()
 	stats := &BackupStats{DiskBytes: o.Source.Size()}
 	size := o.Source.Size()
 	blocks := make([]extent.Ref, 0, scan.BlockCount(size, r.Config.BlockSize))
 	extents := make([]extent.Ref, 0, scan.ExtentCount(size, r.Config.ExtentSize))
 
+	// Lock checks on reused blocks run in the background, 16 at a time,
+	// while the scan carries on. Go note: the mutex guards stats, which
+	// both the scan callback and the background checks update.
+	var mu sync.Mutex
+	checks := newGroup(ctx, 16)
 	err = scan.Run(ctx, o.Source, o.scanOptions(), func(b scan.Block) error {
 		blocks = append(blocks, b.Ref)
 		extents = append(extents, b.Extents...)
@@ -172,20 +190,52 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 			stats.ZeroBlocks++
 		case have[b.Ref.Hash]:
 			stats.BlocksReused++
+			if !lk.enabled {
+				return nil
+			}
+			// The scan reuses b.Data for the next block, so a check that
+			// may need to upload again keeps its own copy.
+			h, data := b.Ref.Hash, bytes.Clone(b.Data)
+			return checks.Go(func(ctx context.Context) error {
+				d, err := lk.ensure(ctx, repo.BlockKey(h), true, true)
+				if err != nil || d != refresh {
+					return err
+				}
+				n, err := r.PutBlock(ctx, h, data, put)
+				if err != nil {
+					return err
+				}
+				lk.wrote(repo.BlockKey(h))
+				mu.Lock()
+				stats.BytesWritten += int64(n)
+				mu.Unlock()
+				return nil
+			})
 		default:
 			n, err := r.PutBlock(ctx, b.Ref.Hash, b.Data, put)
 			if err != nil {
 				return err
 			}
+			lk.wrote(repo.BlockKey(b.Ref.Hash))
 			have[b.Ref.Hash] = true
+			mu.Lock()
 			stats.BlocksStored++
 			stats.BytesWritten += int64(n)
+			mu.Unlock()
 		}
 		return nil
 	})
+	if werr := checks.Wait(); err == nil {
+		err = werr
+	}
 	if err != nil {
 		return nil, err
 	}
+	// The repository's config is needed by every restore.
+	if err := lk.ensureAll(ctx, []string{repo.ConfigKey}, true); err != nil {
+		return nil, err
+	}
+	stats.LocksExtended, stats.BlocksRefresh = lk.Extended, lk.Refreshed
 
 	name, err := uniqueName(ctx, r, o.VM, started, manifest.Full)
 	if err != nil {
@@ -202,7 +252,7 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 	if prev != nil {
 		m.Parent = prev.LastManifest
 	}
-	if err := r.PutManifest(ctx, m); err != nil {
+	if err := r.PutManifest(ctx, m, store.PutOptions{LockUntil: lk.manifestLock()}); err != nil {
 		return nil, err
 	}
 	st := &State{
@@ -210,6 +260,7 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 		BlockSize: r.Config.BlockSize, ExtentSize: r.Config.ExtentSize,
 		Chain: m.Chain, BaseManifest: name, LastManifest: name,
 		Blocks: blocks, Base: extents, Current: extents,
+		Locks: lk.cache,
 	}
 	return stats, st.Save(o.StatePath)
 }
@@ -222,23 +273,30 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time.Time) (*BackupStats, error) {
 	r := o.Repo
 	stats := &BackupStats{DiskBytes: o.Source.Size()}
-	known := map[extent.Hash]bool{}
+	// known maps each extent already in the chain's packs to its pack.
+	known := map[extent.Hash]string{}
 	if o.Kind == manifest.Incremental {
 		idx, err := r.ChainIndex(ctx, st.Chain)
 		if err != nil {
 			return nil, err
 		}
-		for h := range idx {
-			known[h] = true
+		for h, loc := range idx {
+			known[h] = loc.Pack
 		}
 	}
 	put, policyFields := o.placement(started)
+	lk, err := newLocks(r, o.Profile, started, policyFields.RetainUntil, st.Locks)
+	if err != nil {
+		return nil, err
+	}
+	put.LockUntil = lk.newObject()
+	reusedPacks := map[string]bool{}
 	pw := r.NewPackWriter(st.Chain, put)
 	extSize := int64(r.Config.ExtentSize)
 	current := make([]extent.Ref, 0, len(st.Base))
 	var overlay []manifest.Overlay
 
-	err := scan.Run(ctx, o.Source, o.scanOptions(), func(b scan.Block) error {
+	err = scan.Run(ctx, o.Source, o.scanOptions(), func(b scan.Block) error {
 		first := int(int64(b.Offset) / extSize)
 		for j, ref := range b.Extents {
 			i := first + j
@@ -251,7 +309,10 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 			if ref.Zero {
 				continue // zeros are recorded, never stored
 			}
-			if known[ref.Hash] {
+			if pack, ok := known[ref.Hash]; ok {
+				if pack != "" {
+					reusedPacks[pack] = true
+				}
 				stats.ExtentsReused++
 				continue
 			}
@@ -260,7 +321,7 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 			if err := pw.Add(ctx, ref.Hash, b.Data[start:end]); err != nil {
 				return err
 			}
-			known[ref.Hash] = true
+			known[ref.Hash] = "" // in a pack written this run, locked as it is written
 			stats.ExtentsStored++
 		}
 		return nil
@@ -273,6 +334,32 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 	}
 	stats.Packs = pw.Packs
 	stats.BytesWritten = pw.Written
+	for _, loc := range pw.Index {
+		lk.wrote(loc.Pack)
+		lk.wrote(repo.TOCForPack(loc.Pack))
+	}
+
+	// Everything the manifest points at must outlast it: the full's base
+	// blocks, packs reused from earlier runs (with their TOCs) and the
+	// repository config. This host's cache usually answers without asking
+	// the storage; the next full re-checks everything.
+	if lk.enabled {
+		need := []string{repo.ConfigKey}
+		seen := map[string]bool{}
+		for _, ref := range st.Blocks {
+			if k := repo.BlockKey(ref.Hash); !ref.Zero && !seen[k] {
+				seen[k] = true
+				need = append(need, k)
+			}
+		}
+		for p := range reusedPacks {
+			need = append(need, p, repo.TOCForPack(p))
+		}
+		if err := lk.ensureAll(ctx, need, false); err != nil {
+			return nil, err
+		}
+		stats.LocksExtended = lk.Extended
+	}
 
 	name, err := uniqueName(ctx, r, o.VM, started, o.Kind)
 	if err != nil {
@@ -286,10 +373,13 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 		Blocks: st.Blocks, Overlay: overlay,
 		Profile: policyFields.Profile, DataClass: policyFields.DataClass, RetainUntil: policyFields.RetainUntil,
 	}
-	if err := r.PutManifest(ctx, m); err != nil {
+	if err := r.PutManifest(ctx, m, store.PutOptions{LockUntil: lk.manifestLock()}); err != nil {
 		return nil, err
 	}
 	st.Current = current
 	st.LastManifest = name
+	if lk.enabled {
+		st.Locks = lk.cache
+	}
 	return stats, st.Save(o.StatePath)
 }
