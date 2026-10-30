@@ -90,12 +90,17 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Start MinIO
-        # MinIO stopped publishing community images in October 2025, so this
-        # is pinned to the last published release.
+        # MinIO stopped publishing community images in October 2025. Try the
+        # last published images in order and use the first that pulls.
         run: |
+          for image in minio/minio:latest quay.io/minio/minio:latest minio/minio:RELEASE.2025-04-22T22-12-26Z; do
+            if docker pull -q "$image"; then echo "Using $image"; break; fi
+            image=""
+          done
+          [ -n "$image" ] || { echo "No MinIO image could be pulled"; exit 1; }
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            "$image" server /data
           for i in $(seq 60); do curl -sf "$ENDPOINT/minio/health/live" && break; sleep 1; done
           aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket vmobj-ci --object-lock-enabled-for-bucket
       - name: Backend conformance tests
