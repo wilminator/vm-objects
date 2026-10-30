@@ -138,7 +138,11 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 		class, put.Class = "", ""
 	}
 	sameKey := o.From.Config.KeyID == o.To.Config.KeyID
-	translate := map[extent.Hash]extent.Hash{}
+	// Blocks and extents are translated separately: an extent can have
+	// the same content (so the same hash) as a short final block, and
+	// still needs its own copy in a pack.
+	translate := map[extent.Hash]extent.Hash{}    // blocks
+	translateExt := map[extent.Hash]extent.Hash{} // extents
 	var reused []string
 
 	// Base blocks.
@@ -212,14 +216,14 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 			if !ok {
 				return fmt.Errorf("%s/%s: extent %s is missing from the source", vm, name, ov.Ref.Hash)
 			}
-			h2, known := translate[ov.Ref.Hash]
+			h2, known := translateExt[ov.Ref.Hash]
 			if !known {
 				data, err := o.From.GetExtent(ctx, loc, ov.Ref.Hash)
 				if err != nil {
 					return err
 				}
 				h2 = o.To.Hasher().Sum(data)
-				translate[ov.Ref.Hash] = h2
+				translateExt[ov.Ref.Hash] = h2
 				if dl, ok := dstIdx[h2]; ok {
 					reusedPacks[dl.Pack] = true
 					st.ExtentsPresent++

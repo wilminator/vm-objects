@@ -234,3 +234,30 @@ func TestCopyVMRecord(t *testing.T) {
 		t.Fatal("VM restored from the copy differs")
 	}
 }
+
+// An overlay extent with the same content as a short final base block
+// must still be copied. (Found in review: one translation table for both
+// made copy skip it.)
+func TestCopyExtentEqualToShortLastBlock(t *testing.T) {
+	h := newHarness(t)
+	disk := make([]byte, 68<<10) // a 64 KiB block plus a 4 KiB one (= one extent)
+	rand.New(rand.NewSource(1)).Read(disk)
+	h.write(disk)
+	full := h.backup(manifest.Full).Manifest
+	copy(disk[0:4<<10], disk[64<<10:]) // extent 0 now equals the last block
+	h.write(disk)
+	inc := h.backup(manifest.Incremental).Manifest
+	to := destRepo(t, s3fake.New("b"), "b", 7)
+	o := CopyOptions{From: h.repo, To: to, Now: func() time.Time { return h.clock }}
+	st := &CopyStats{}
+	for _, n := range []string{full, inc} {
+		if err := CopyManifest(h.ctx, o, "win11", n, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vs, err := Verify(h.ctx, to, "win11", inc, true)
+	if err != nil || len(vs.Missing) > 0 {
+		t.Fatalf("copied incremental is missing pieces: %v %v", err, vs.Missing)
+	}
+	restoreFrom(t, h, to, "win11", inc, disk)
+}
