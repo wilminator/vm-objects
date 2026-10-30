@@ -82,6 +82,21 @@ step "prune (dry run): nothing is past its keep-until date yet"
 grep -q "Backups examined:     3" "$work/prune.txt" || { echo "FAIL: prune did not see the 3 backups"; exit 1; }
 grep -q "Past keep-until:      0" "$work/prune.txt" || { echo "FAIL: prune found expired backups"; exit 1; }
 
+step "copy to a second repository, restore from the copy"
+copy="$work/copy-repo"
+"$vmobj" init --repo "$copy" --key-file "$key" --block-size 1MiB --extent-size 64KiB --pack-size 4MiB
+"$vmobj" copy --from "$repo" --to "$copy" --key-file "$key" --profile standard | tee "$work/copy.txt"
+grep -q "Copied:    3 backups" "$work/copy.txt" || { echo "FAIL: copy did not copy the 3 backups"; exit 1; }
+for name in "${names[@]}"; do
+  case "$name" in *-full) want=full ;; *-incremental) want=inc ;; *-differential) want=diff ;; esac
+  "$vmobj" restore --repo "$copy" --key-file "$key" --vm e2e --manifest "$name" --output "$work/copy-$want.raw"
+  cmp "$work/want-$want.raw" "$work/copy-$want.raw"
+done
+echo "OK: every backup restores from the copy"
+"$vmobj" copy --from "$repo" --to "$copy" --key-file "$key" --profile standard | tee "$work/copy2.txt"
+grep -q "Copied:    0 backups" "$work/copy2.txt" || { echo "FAIL: a second copy copied again"; exit 1; }
+echo "OK: a second copy sends nothing"
+
 step "wrong key is refused"
 "$vmobj" key init --key-file "$work/other.key"
 if "$vmobj" list --repo "$repo" --key-file "$work/other.key" >/dev/null 2>&1; then

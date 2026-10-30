@@ -25,6 +25,7 @@ rely on it as your only backup yet.
 | `vmobj backup-vm` | Backs up a whole libvirt VM: every disk, the definition, UEFI NVRAM and TPM state. |
 | `vmobj vms` | Lists whole-VM backups. |
 | `vmobj restore-vm` | Writes a VM's disks, adjusted definition, NVRAM and TPM state into a folder, with instructions. Never changes libvirt. |
+| `vmobj copy` | Copies backups to another repository, sending only what it lacks; the destination applies its own profile and Object Lock. |
 | `vmobj profiles` | Lists the storage profiles. |
 | `vmobj prune` | Removes backups past their keep-until date and data nothing else uses. Reports only, unless `--apply`. |
 | `vmobj verify` | Checks a restore point's pieces are present; `--deep` also decrypts and hash-checks each one. |
@@ -105,6 +106,20 @@ steps in `RESTORE.txt`. It never registers the VM with libvirt.
 `--new-name` renames the VM and drops its UUID, so the copy can run next to
 the original. Restoring the TPM state is what keeps BitLocker and Windows
 Hello PINs working.
+
+## Several targets
+
+`--copy-to REPO` (repeatable) on `backup` and `backup-vm` copies each new
+backup to more repositories as soon as it's written, so one read of the
+disk keeps, say, a local copy and an S3 copy:
+
+```bash
+vmobj backup-vm --repo /mnt/backup/vmobj --key-file /root/vmobj.key --domain win11 --type incremental --copy-to 's3://my-backups/nas1?region=us-west-2'
+```
+
+`vmobj copy --from A --to B` does the same afterwards, for everything or
+for one backup, and is safe to repeat. Repositories with different keys
+work too: vmobj re-encrypts as it copies.
 
 ## Repositories in S3
 

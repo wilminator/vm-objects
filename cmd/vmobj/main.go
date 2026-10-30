@@ -45,15 +45,18 @@ Usage:
   vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB] [--object-lock]
   vmobj measure     --source DISK [--name NAME] [--state-dir DIR]
   vmobj backup      --repo REPO --key-file PATH --source DISK --vm NAME --type full|incremental|differential
-                    [--profile NAME] [--class CLASS]
+                    [--profile NAME] [--class CLASS] [--copy-to REPO ...]
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
                     [--vm NAME] [--profile NAME] [--quiesce] [--virsh PATH] [--connect URI] [--swtpm-dir DIR]
+                    [--copy-to REPO ...]
   vmobj vms         --repo REPO --key-file PATH [--vm NAME]
   vmobj restore-vm  --repo REPO --key-file PATH --vm NAME --record NAME --to DIR [--new-name NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
+  vmobj copy        --from REPO --to REPO --key-file PATH [--to-key-file PATH] [--vm NAME]
+                    [--manifest NAME | --record NAME] [--profile NAME] [--class CLASS]
   vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
   vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
@@ -76,6 +79,12 @@ NVRAM and its TPM state. A running VM's zvol disks are snapshotted together
 a running VM with disk image files is refused, so shut it down first.
 restore-vm writes the disks, an adjusted definition and the NVRAM/TPM files
 into a folder, with instructions; it never changes libvirt itself.
+
+copy moves backups between repositories, sending only what the destination
+lacks; run it again any time. The destination applies its own --profile
+(retention and class, counted from when the backup was made) and its own
+Object Lock. --copy-to on backup and backup-vm copies the new backup to
+more repositories straight away, so one read of the disk feeds them all.
 
 Profiles pick a storage class and retention for each kind of backup (see
 "vmobj profiles"). The default is disaster-recovery. Self-hosted S3 services
@@ -118,6 +127,8 @@ func main() {
 		err = cmdRestoreVM(ctx, args)
 	case "vms":
 		err = cmdVMs(ctx, args)
+	case "copy":
+		err = cmdCopy(ctx, args)
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
@@ -352,7 +363,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	return cur.Save(path)
 }
 
-func cmdBackup(ctx context.Context, args []string) error {
+func cmdBackup(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
 	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
@@ -365,6 +376,8 @@ func cmdBackup(ctx context.Context, args []string) error {
 	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
 	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
 	keepSnap := fs.Bool("keep-snapshot", false, "with zfs:, keep the snapshot the backup was read from")
+	var copyTo repeated
+	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file", "source", "vm", "type"); err != nil {
 		return err
@@ -422,6 +435,13 @@ func cmdBackup(ctx context.Context, args []string) error {
 		fmt.Printf("Packs:     %d\n", st.Packs)
 	}
 	fmt.Printf("Written:   %s (compressed and encrypted)\n", units.Format(st.BytesWritten))
+	defer func() {
+		if err == nil {
+			err = copyAfterBackup(ctx, r, copyTo, *keyFile, &prof, class, func(o engine.CopyOptions, cs *engine.CopyStats) error {
+				return engine.CopyManifest(ctx, o, *vm, st.Manifest, cs)
+			})
+		}
+	}()
 	if st.LocksExtended > 0 || st.BlocksRefresh > 0 {
 		fmt.Printf("Locks:     %d extended, %d old blocks uploaded again\n", st.LocksExtended, st.BlocksRefresh)
 	}
@@ -676,6 +696,8 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	swtpmDir := fs.String("swtpm-dir", engine.DefaultSwtpmDir, "where libvirt keeps TPM state (QNAP: /QVS/var/lib/libvirt/swtpm)")
 	virshPath := fs.String("virsh", "virsh", "virsh program (QNAP: /QVS/usr/bin/virsh)")
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system")
+	var copyTo repeated
+	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file", "domain", "type"); err != nil {
 		return err
@@ -729,7 +751,31 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		fmt.Printf("Skipped:   %s\n", s)
 	}
 	fmt.Printf("Took:      %s\n", time.Since(start).Round(time.Second))
-	return nil
+	return copyAfterBackup(ctx, r, copyTo, *keyFile, &prof, class, func(o engine.CopyOptions, cs *engine.CopyStats) error {
+		vmName := *vm
+		if vmName == "" {
+			rec, err := findRecord(ctx, r, st.Record)
+			if err != nil {
+				return err
+			}
+			vmName = rec
+		}
+		return engine.CopyRecord(ctx, o, vmName, st.Record, cs)
+	})
+}
+
+// findRecord finds which VM a just-written record belongs to.
+func findRecord(ctx context.Context, r *repo.Repo, record string) (string, error) {
+	vms, err := r.ListRecordVMs(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, v := range vms {
+		if ok, _ := r.Backend.Exists(ctx, repo.VMRecordKey(v, record)); ok {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("VM record %s not found", record)
 }
 
 func cmdVMs(ctx context.Context, args []string) error {
@@ -811,5 +857,109 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	fmt.Printf("Restored %s (%s) into %s in %s.\n", st.Record.DomainName, st.Record.Name, *to, time.Since(start).Round(time.Second))
 	fmt.Printf("Definition: %s\n", st.Definition)
 	fmt.Println("Nothing was registered with libvirt. Read RESTORE.txt in that folder for the next steps.")
+	return nil
+}
+
+// repeated is a flag that may be given several times.
+type repeated []string
+
+func (r *repeated) String() string     { return strings.Join(*r, ",") }
+func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
+
+// copyAfterBackup copies a just-written backup to each --copy-to target.
+// The backup itself has already succeeded; a failed copy is reported as
+// an error so scripts notice, and can be retried with "vmobj copy".
+func copyAfterBackup(ctx context.Context, from *repo.Repo, targets []string, keyFile string, prof *policy.Profile, class policy.Class,
+	copyOne func(engine.CopyOptions, *engine.CopyStats) error) error {
+	var failed []string
+	for _, t := range targets {
+		to, err := openRepo(ctx, t, keyFile)
+		if err == nil {
+			cs := &engine.CopyStats{}
+			if err = copyOne(engine.CopyOptions{From: from, To: to, Profile: prof, Class: class}, cs); err == nil {
+				fmt.Printf("Copied to: %s (%s written)\n", t, units.Format(cs.BytesWritten))
+				continue
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Copy to %s failed: %v\n", t, err)
+		failed = append(failed, t)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("the backup succeeded, but copying it to %s failed; retry with vmobj copy", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
+func cmdCopy(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("copy", flag.ExitOnError)
+	from := fs.String("from", "", "source repository")
+	to := fs.String("to", "", "destination repository")
+	keyFile := fs.String("key-file", "", "key file for the source (and the destination, unless --to-key-file)")
+	toKeyFile := fs.String("to-key-file", "", "key file for the destination, if different")
+	vm := fs.String("vm", "", "only this VM (with --manifest: the disk series, e.g. win11.vda)")
+	name := fs.String("manifest", "", "copy only this backup of --vm")
+	record := fs.String("record", "", "copy only this whole-VM backup of --vm")
+	profileName := fs.String("profile", policy.DefaultProfile, "storage profile at the destination")
+	classFlag := fs.String("class", "", "storage class at the destination, overriding the profile")
+	fs.Parse(args)
+	if err := require(fs, "from", "to", "key-file"); err != nil {
+		return err
+	}
+	if (*name != "" || *record != "") && *vm == "" {
+		return errors.New("copy: --manifest and --record need --vm")
+	}
+	if *name != "" && *record != "" {
+		return errors.New("copy: give --manifest or --record, not both")
+	}
+	prof, err := policy.Lookup(*profileName)
+	if err != nil {
+		return err
+	}
+	var class policy.Class
+	if *classFlag != "" {
+		if class, err = policy.ParseClass(*classFlag); err != nil {
+			return err
+		}
+	}
+	src, err := openRepo(ctx, *from, *keyFile)
+	if err != nil {
+		return err
+	}
+	if *toKeyFile == "" {
+		*toKeyFile = *keyFile
+	}
+	dst, err := openRepo(ctx, *to, *toKeyFile)
+	if err != nil {
+		return err
+	}
+	o := engine.CopyOptions{From: src, To: dst, Profile: &prof, Class: class}
+	start := time.Now()
+	st := &engine.CopyStats{}
+	switch {
+	case *name != "":
+		err = engine.CopyManifest(ctx, o, *vm, *name, st)
+	case *record != "":
+		err = engine.CopyRecord(ctx, o, *vm, *record, st)
+	default:
+		st, err = engine.CopyAll(ctx, o, *vm)
+	}
+	var nr *engine.NotReadyError
+	if errors.As(err, &nr) {
+		fmt.Println("The source backup is in archive storage; restore it there first (vmobj restore --request-restore).")
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Copied:    %d backups, %d VM records in %s\n", st.Manifests, st.Records, time.Since(start).Round(time.Second))
+	fmt.Printf("Blocks:    %d copied, %d already there\n", st.BlocksCopied, st.BlocksPresent)
+	fmt.Printf("Extents:   %d copied, %d already there\n", st.ExtentsCopied, st.ExtentsPresent)
+	fmt.Printf("Written:   %s\n", units.Format(st.BytesWritten))
+	if st.LocksExtended > 0 {
+		fmt.Printf("Locks:     %d extended\n", st.LocksExtended)
+	}
+	for _, s := range st.Skipped {
+		fmt.Printf("Skipped:   %s\n", s)
+	}
 	return nil
 }
