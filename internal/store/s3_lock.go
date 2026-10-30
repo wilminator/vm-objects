@@ -8,6 +8,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // Object Lock on S3.
@@ -56,7 +58,7 @@ func (s *S3) ExtendLock(ctx context.Context, key string, until time.Time) error 
 		},
 	})
 	if err != nil {
-		if apiCode(err) == "AccessDenied" {
+		if isLockError(err) {
 			return fmt.Errorf("s3 extend lock %s: %w (%v)", key, ErrLocked, err)
 		}
 		return fmt.Errorf("s3 extend lock %s: %w", key, err)
@@ -128,8 +130,8 @@ func (s *S3) DeleteVersion(ctx context.Context, key, versionID string) error {
 	}
 	_, err = s.api.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: k, VersionId: aws.String(versionID)})
 	if err != nil {
-		if apiCode(err) == "AccessDenied" {
-			return fmt.Errorf("s3 delete %s@%s: %w", key, versionID, ErrLocked)
+		if isLockError(err) {
+			return fmt.Errorf("s3 delete %s@%s: %w (%v)", key, versionID, ErrLocked, err)
 		}
 		if !isNotFound(err) {
 			return fmt.Errorf("s3 delete %s@%s: %w", key, versionID, err)
@@ -156,4 +158,21 @@ func headInfo(out *s3.HeadObjectOutput) ObjectInfo {
 	}
 	info.Restoring, info.RestoredUntil = parseRestore(aws.ToString(out.Restore))
 	return info
+}
+
+// isLockError recognises "refused because of Object Lock". AWS answers
+// AccessDenied; other services use their own codes (MinIO, for one, can
+// answer InvalidRequest with a "WORM protected" message), so the message
+// is checked too.
+func isLockError(err error) bool {
+	switch apiCode(err) {
+	case "AccessDenied", "ObjectLocked":
+		return true
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		m := strings.ToLower(ae.ErrorMessage())
+		return strings.Contains(m, "worm") || strings.Contains(m, "object lock") || strings.Contains(m, "retention")
+	}
+	return false
 }

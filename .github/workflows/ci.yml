@@ -113,7 +113,14 @@ jobs:
       - name: Create the test bucket
         run: go run ./scripts/mkbucket "s3://vmobj-ci?endpoint=$ENDPOINT" || { echo "::error::could not create the test bucket"; exit 1; }
       - name: Backend conformance tests (including Object Lock)
-        run: go test -count=1 -v -run 'Conformance|Locks' ./internal/store/
+        # Failing test lines are repeated as annotations, which can be read
+        # from the run summary and the API without downloading logs.
+        run: |
+          set -o pipefail
+          go test -count=1 -v -run 'Conformance|Locks' ./internal/store/ 2>&1 | tee "$RUNNER_TEMP/conformance.txt" || {
+            grep -E -- '--- FAIL|_test\.go:[0-9]+:|\.go:[0-9]+: ' "$RUNNER_TEMP/conformance.txt" | head -20 | sed 's/^/::error::/'
+            exit 1
+          }
         env:
           VMOBJ_TEST_S3: s3://vmobj-ci/conformance?endpoint=http://127.0.0.1:9000
           VMOBJ_TEST_S3_LOCKS: "1"
