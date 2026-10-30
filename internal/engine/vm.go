@@ -377,7 +377,17 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 		return nil, fmt.Errorf("%s is not empty", dir)
 	}
 
-	// Every disk must be readable before anything is written.
+	// Every disk must be complete and readable before anything is written,
+	// so a failure never leaves some disks restored and others not.
+	for _, d := range rec.Disks {
+		vs, err := Verify(ctx, o.Repo, d.Stream, d.Manifest, false)
+		if err != nil {
+			return nil, fmt.Errorf("disk %s: %w", d.Target, err)
+		}
+		if len(vs.Missing) > 0 {
+			return nil, fmt.Errorf("disk %s: %w: %d pieces missing, first: %s", d.Target, ErrIncomplete, len(vs.Missing), vs.Missing[0])
+		}
+	}
 	total := &Readiness{}
 	for _, d := range rec.Disks {
 		rd, err := CheckReady(ctx, o.Repo, d.Stream, d.Manifest)

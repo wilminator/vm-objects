@@ -383,3 +383,40 @@ func TestPruneVMRecords(t *testing.T) {
 		t.Fatal("the kept VM backup no longer restores")
 	}
 }
+
+// If any disk of a VM backup is incomplete, restore-vm writes nothing at
+// all, rather than restoring the disks before it. (Found in review.)
+func TestRestoreVMWritesNothingIfADiskIsIncomplete(t *testing.T) {
+	v := newVMHarness(t)
+	vda, vdb := filepath.Join(v.dir, "vda.img"), filepath.Join(v.dir, "vdb.img")
+	diskA := randomDisk(t, vda, 128<<10, 1)
+	diskB := randomDisk(t, vdb, 128<<10, 2)
+	v.virsh.xml = domainXML(fileDisk("vda", vda)+"\n"+fileDisk("vdb", vdb), "")
+	if _, err := BackupVM(v.ctx, v.opts(manifest.Full)); err != nil {
+		t.Fatal(err)
+	}
+	rand.New(rand.NewSource(7)).Read(diskA[:4096])
+	rand.New(rand.NewSource(8)).Read(diskB[:4096])
+	os.WriteFile(vda, diskA, 0o600)
+	os.WriteFile(vdb, diskB, 0o600)
+	inc, err := BackupVM(v.ctx, v.opts(manifest.Incremental))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Lose the pack holding vdb's changed extent: vda (restored first) is
+	// fine, vdb is not.
+	m, _ := v.repo.GetManifest(v.ctx, "win11.vdb", inc.Disks["vdb"].Manifest)
+	packs, _ := v.repo.Backend.List(v.ctx, "packs/"+m.Chain+"/")
+	for _, k := range packs {
+		if strings.HasSuffix(k, ".pack") {
+			v.repo.Backend.Delete(v.ctx, k)
+		}
+	}
+	dir := filepath.Join(v.dir, "partial")
+	if _, err := RestoreVM(v.ctx, RestoreVMOptions{Repo: v.repo, VM: "win11", Record: inc.Record, Dir: dir}); !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("restore with a damaged disk: %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("restore-vm wrote into the folder before finding the damaged disk")
+	}
+}
