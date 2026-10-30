@@ -50,12 +50,14 @@ make build && make test
 ### Option B: MinIO in Docker on your computer
 
 If QuObjects isn't available, run MinIO under Docker Desktop (with WSL
-integration turned on), the same way CI does:
+integration turned on), the same way CI does. MinIO stopped publishing new
+community images in October 2025; `latest` is the last one they published.
+If it won't pull, try `quay.io/minio/minio:latest` instead.
 
 ```bash
 docker run -d --name vmobj-minio -p 9000:9000 \
   -e MINIO_ROOT_USER=vmobj-test -e MINIO_ROOT_PASSWORD=vmobj-test-local-only \
-  minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+  minio/minio:latest server /data
 ```
 
 Its endpoint is `http://127.0.0.1:9000`, the access key is `vmobj-test`
