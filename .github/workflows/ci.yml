@@ -96,7 +96,7 @@ jobs:
           else
             echo "::notice::ZFS is not available on this runner; zfs: sources were not tested end to end"
           fi
-      - name: End-to-end with zfs:
+      - name: "End-to-end with zfs: sources"
         if: steps.zfs.outputs.ok == 'true'
         run: |
           make build
