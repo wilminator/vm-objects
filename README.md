@@ -114,6 +114,22 @@ docker build -t vmobj .
 docker run --rm vmobj version
 ```
 
+### Getting the binary out of an image
+
+The image doubles as an installer. It has no shell, so copy the file out
+with `docker cp` from a container that is created but never started. This
+puts `vmobj` in the current folder, built for the machine you run it on:
+
+```bash
+id=$(docker create vmobj) && docker cp "$id":/vmobj ./vmobj && docker rm "$id"
+```
+
+Once releases are published, use the ready-made image instead of building
+one: replace `vmobj` above with `ghcr.io/wilminator/vm-objects:latest` (or
+`:edge` for the newest build of `main`).
+
+### Running from the image
+
 The image suits jobs that only touch files and object storage. Mount the
 key file and any folders it needs, and the S3 credentials at
 `/home/vmobj/.aws`. Backups of VMs and ZFS datasets call the host's
