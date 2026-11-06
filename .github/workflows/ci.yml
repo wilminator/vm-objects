@@ -45,11 +45,11 @@ jobs:
 
       - name: Build static binaries
         run: make build-all
+
       - name: End-to-end against a local folder
         run: |
           make build
           scripts/e2e.sh "$RUNNER_TEMP/e2e-repo" bin/vmobj
-
 
   docker:
     runs-on: ubuntu-latest
