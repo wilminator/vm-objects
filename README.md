@@ -125,8 +125,9 @@ id=$(docker create vmobj) && docker cp "$id":/vmobj ./vmobj && docker rm "$id"
 ```
 
 Once releases are published, use the ready-made image instead of building
-one: replace `vmobj` above with `ghcr.io/wilminator/vm-objects:latest` (or
-`:edge` for the newest build of `main`).
+one: replace `vmobj` above with `ghcr.io/wilminator/vmobj:latest` (or
+`:edge` for the newest build of `main`). The same image is also published
+as `ghcr.io/wilminator/vm-objects`, after the repository.
 
 ### Running from the image
 

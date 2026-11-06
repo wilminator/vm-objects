@@ -5,7 +5,8 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Publishes the vmobj image to the GitHub Container Registry, for amd64
-# and arm64, at ghcr.io/wilminator/vm-objects:
+# and arm64, under two names, ghcr.io/wilminator/vmobj and
+# ghcr.io/wilminator/vm-objects:
 #
 #   - a version tag such as v1.2.3 publishes 1.2.3, 1.2 and latest;
 #   - every push to main publishes edge.
@@ -45,7 +46,11 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          # The same image under two names: the repository's, and the
+          # command's (shorter to type).
+          images: |
+            ghcr.io/${{ github.repository }}
+            ghcr.io/${{ github.repository_owner }}/vmobj
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
