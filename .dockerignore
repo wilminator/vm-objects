@@ -1,0 +1,8 @@
+# Keep the build context to the source: no git history, build output or
+# disk images.
+.git
+.github
+bin
+*.raw
+*.qcow2
+*.img

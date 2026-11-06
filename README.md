@@ -93,6 +93,49 @@ make build
 make test
 ```
 
+### Building with Docker instead
+
+If you'd rather not install Go, the `Dockerfile` builds in a container.
+This writes `bin/vmobj-linux-amd64` and `bin/vmobj-linux-arm64`, the same
+files `make build-all` makes:
+
+```bash
+docker build --target export --output type=local,dest=bin .
+```
+
+(`make docker-bin` runs the same command.) The default target is a small
+image holding just `vmobj`, its root certificates and an unprivileged user:
+
+```bash
+docker build -t vmobj .
+```
+
+```bash
+docker run --rm vmobj version
+```
+
+### Getting the binary out of an image
+
+The image doubles as an installer. It has no shell, so copy the file out
+with `docker cp` from a container that is created but never started. This
+puts `vmobj` in the current folder, built for the machine you run it on:
+
+```bash
+id=$(docker create vmobj) && docker cp "$id":/vmobj ./vmobj && docker rm "$id"
+```
+
+Once releases are published, use the ready-made image instead of building
+one: replace `vmobj` above with `ghcr.io/wilminator/vmobj:latest` (or
+`:edge` for the newest build of `main`). The same image is also published
+as `ghcr.io/wilminator/vm-objects`, after the repository.
+
+### Running from the image
+
+The image suits jobs that only touch files and object storage. Mount the
+key file and any folders it needs, and the S3 credentials at
+`/home/vmobj/.aws`. Backups of VMs and ZFS datasets call the host's
+`virsh` and `zfs`, so run the binary directly on the host for those.
+
 ## License
 
 Mozilla Public License 2.0. Copyright (c) 2026 Michael Allen Wilmes.

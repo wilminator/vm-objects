@@ -7,7 +7,7 @@
 VERSION ?= 0.1.0-dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build build-all test vet clean
+.PHONY: build build-all docker-bin docker-image test vet clean
 
 # Static binary for this machine's OS and CPU.
 build:
@@ -17,6 +17,14 @@ build:
 build-all:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/vmobj-linux-amd64 ./cmd/vmobj
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/vmobj-linux-arm64 ./cmd/vmobj
+
+# The same two binaries, built in a container: needs Docker, not Go.
+docker-bin:
+	docker build --target export --build-arg VERSION=$(VERSION) --output type=local,dest=bin .
+
+# The runtime image, tagged vmobj:VERSION.
+docker-image:
+	docker build --build-arg VERSION=$(VERSION) -t vmobj:$(VERSION) .
 
 test:
 	go test -race ./...
