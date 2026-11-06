@@ -61,6 +61,7 @@ Usage:
   vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
   vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
+  vmobj install     [--name vmobj] DIR
   vmobj version
 
 REPO is a folder path, or an S3 bucket:
@@ -80,6 +81,10 @@ NVRAM and its TPM state. A running VM's zvol disks are snapshotted together
 a running VM with disk image files is refused, so shut it down first.
 restore-vm writes the disks, an adjusted definition and the NVRAM/TPM files
 into a folder, with instructions; it never changes libvirt itself.
+
+install copies this vmobj binary into a folder, for example out of the
+container image: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/out
+ghcr.io/wilminator/vmobj install /out
 
 copy moves backups between repositories, sending only what the destination
 lacks; run it again any time. The destination applies its own --profile
@@ -130,6 +135,8 @@ func main() {
 		err = cmdVMs(ctx, args)
 	case "copy":
 		err = cmdCopy(ctx, args)
+	case "install":
+		err = cmdInstall(args)
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
