@@ -17,8 +17,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +61,10 @@ Usage:
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
   vmobj install     [--name vmobj] DIR
   vmobj version
+  vmobj help [progress]
+
+measure, backup, backup-vm, restore and restore-vm also take --progress,
+--progress-format and related options; see "vmobj help progress".
 
 REPO is a folder path, or an S3 bucket:
   s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|false]
@@ -140,7 +142,11 @@ func main() {
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
-		fmt.Print(usage)
+		if len(args) > 0 && args[0] == "progress" {
+			os.Stdout.WriteString(progressHelp)
+		} else {
+			fmt.Print(usage)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
@@ -195,106 +201,6 @@ func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (so
 		return source.OpenZFS(ctx, ds, source.ZFSOptions{KeepSnapshot: keepSnapshot})
 	}
 	return source.Open(spec, format)
-}
-
-// meter prints how far a long job has got every few seconds: percent,
-// bytes and average speed. Go note: atomic.Int64 can be updated from the
-// working goroutine and read from the printing goroutine without a lock.
-type meter struct {
-	done, total atomic.Int64
-	stop        chan struct{}
-	stopped     sync.Once
-}
-
-func startMeter(total int64) *meter {
-	m := &meter{stop: make(chan struct{})}
-	m.total.Store(total)
-	start := time.Now()
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-m.stop:
-				return
-			case <-t.C:
-				n, tot := m.done.Load(), m.total.Load()
-				pct := 0.0
-				if tot > 0 {
-					pct = 100 * float64(n) / float64(tot)
-				}
-				rate := float64(n) / time.Since(start).Seconds()
-				fmt.Fprintf(os.Stderr, "  %5.1f%%  %s of %s  (%s/s)\n",
-					pct, units.Format(n), units.Format(tot), units.Format(int64(rate)))
-			}
-		}
-	}()
-	return m
-}
-
-// Stop ends the printing; safe to call more than once.
-func (m *meter) Stop() { m.stopped.Do(func() { close(m.stop) }) }
-
-// progress wraps a source and counts what a scan has read.
-type progress struct {
-	source.Source
-	m *meter
-}
-
-func (p *progress) ReadAt(b []byte, off int64) (int, error) {
-	n, err := p.Source.ReadAt(b, off)
-	p.m.done.Add(int64(n))
-	return n, err
-}
-
-func withProgress(src source.Source) (*progress, func()) {
-	m := startMeter(src.Size())
-	return &progress{Source: src, m: m}, m.Stop
-}
-
-// restoreProgress prints what a restore is doing: a line when it starts
-// checking the backup, writing the disk and applying later changes
-// (naming the disk, if given), and the meter while it writes. Call the returned func when the
-// restore ends.
-func restoreProgress(dest string) (func(target string, p engine.Phase, done, total int64), func()) {
-	var (
-		mu      sync.Mutex
-		m       *meter
-		current string
-		phase   engine.Phase
-	)
-	finish := func() {
-		if m != nil {
-			m.Stop()
-			m = nil
-		}
-	}
-	report := func(target string, p engine.Phase, done, total int64) {
-		mu.Lock()
-		defer mu.Unlock()
-		label := dest
-		if target != "" {
-			label = "disk " + target
-		}
-		switch {
-		case p == engine.PhaseChecking:
-			finish()
-			fmt.Fprintf(os.Stderr, "Checking that the backup for %s is complete...\n", label)
-		case p != phase || target != current || m == nil:
-			finish()
-			phase, current = p, target
-			if p == engine.PhaseChanges {
-				fmt.Fprintf(os.Stderr, "Applying %s of later changes to %s...\n", units.Format(total), label)
-			} else {
-				fmt.Fprintf(os.Stderr, "Writing %s to %s...\n", units.Format(total), label)
-			}
-			m = startMeter(total)
-			m.done.Store(done)
-		default:
-			m.done.Store(done)
-		}
-	}
-	return report, func() { mu.Lock(); finish(); mu.Unlock() }
 }
 
 // ---- commands ----
@@ -370,7 +276,12 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	extentSize := fs.String("extent-size", "64KiB", "small extent size to report")
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
 	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
+	pf := addProgressFlags(fs)
 	fs.Parse(args)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "source"); err != nil {
 		return err
 	}
@@ -398,7 +309,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 		return err
 	}
 	defer disk.Close()
-	p, stopProgress := withProgress(disk)
+	p, stopProgress := withProgress(pc, *src, disk)
 	fmt.Fprintf(os.Stderr, "Measuring %s (%s)...\n", *src, units.Format(disk.Size()))
 	start := time.Now()
 	cur, err := measure.Run(ctx, p, scan.Options{BlockSize: extent.Length(bs), ExtentSize: extent.Length(es), Workers: *workers})
@@ -450,7 +361,12 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	keepSnap := fs.Bool("keep-snapshot", false, "with zfs:, keep the snapshot the backup was read from")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
+	pf := addProgressFlags(fs)
 	fs.Parse(args)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "repo", "key-file", "source", "vm", "type"); err != nil {
 		return err
 	}
@@ -483,7 +399,7 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	if z, ok := disk.(*source.ZFS); ok {
 		fmt.Fprintf(os.Stderr, "Reading from snapshot %s\n", z.Snapshot())
 	}
-	p, stopProgress := withProgress(disk)
+	p, stopProgress := withProgress(pc, *src, disk)
 	fmt.Fprintf(os.Stderr, "%s backup of %s (%s)...\n", k, *vm, units.Format(disk.Size()))
 	start := time.Now()
 	st, err := engine.Backup(ctx, engine.BackupOptions{
@@ -576,7 +492,12 @@ func cmdRestore(ctx context.Context, args []string) error {
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
+	pf := addProgressFlags(fs)
 	fs.Parse(args)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "repo", "key-file", "vm", "manifest", "output"); err != nil {
 		return err
 	}
@@ -589,7 +510,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	report, stopReport := restoreProgress(*out)
+	report, stopReport := restoreProgress(pc, *out)
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
 		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
 	stopReport()
@@ -773,7 +694,12 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
+	pf := addProgressFlags(fs)
 	fs.Parse(args)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "repo", "key-file", "domain", "type"); err != nil {
 		return err
 	}
@@ -805,7 +731,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		Virsh: libvirt.Virsh{Path: *virshPath, Connect: *connect},
 		Progress: func(target string, s source.Source) (source.Source, func()) {
 			fmt.Fprintf(os.Stderr, "Disk %s (%s)...\n", target, units.Format(s.Size()))
-			return withProgress(s)
+			return withProgress(pc, "disk "+target, s)
 		},
 	})
 	if err != nil {
@@ -908,7 +834,12 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
+	pf := addProgressFlags(fs)
 	fs.Parse(args)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "repo", "key-file", "vm", "record", "to"); err != nil {
 		return err
 	}
@@ -921,7 +852,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	report, stopReport := restoreProgress(*to)
+	report, stopReport := restoreProgress(pc, *to)
 	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
 	stopReport()
 	var nr *engine.NotReadyError
