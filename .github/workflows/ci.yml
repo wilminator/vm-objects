@@ -45,3 +45,25 @@ jobs:
 
       - name: Build static binaries
         run: make build-all
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the binaries in a container
+        run: docker build --target export --build-arg VERSION=ci --output type=local,dest=out .
+
+      - name: Check them
+        run: |
+          file out/vmobj-linux-amd64 out/vmobj-linux-arm64
+          file out/vmobj-linux-amd64 | grep -q 'x86-64.*statically linked'
+          file out/vmobj-linux-arm64 | grep -q 'ARM aarch64.*statically linked'
+          ./out/vmobj-linux-amd64 version | grep -qx 'vmobj ci'
+
+      - name: Build the runtime image and run it
+        run: |
+          docker build --build-arg VERSION=ci -t vmobj:ci .
+          docker run --rm vmobj:ci version | grep -qx 'vmobj ci'
+          docker image ls vmobj:ci
