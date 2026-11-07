@@ -20,6 +20,7 @@ git clone https://github.com/wilminator/vm-objects.git ~/vm-objects && cd ~/vm-o
 | Failure safety | [hardening.md](hardening.md) | `scripts/hardening.sh` passes, and runs in CI; still to run on the NAS |
 | A real VM, end to end | [hardening.md](hardening.md#a-real-vm-scriptsvalidate-vmsh) | `scripts/validate-vm.sh`; its self-test runs in CI. Still to run on TrueNAS |
 | Block-level restore (`--mode copy`, `in-place`, `staged`; `--base`) | [m7-block-restore.md](m7-block-restore.md) | Unit tests and `restore-modes-e2e.sh` (loop device included) pass in CI (staged on a loop device too), `zfs-replay-e2e.sh` in CI's ZFS job (plain, `--verify end` and `--staged`). To do: the WinGames move on TrueNAS |
+| S3 services: AWS, Backblaze B2, QuObjects, MinIO, and copies between them | [providers.md](providers.md) | CI runs the matrix on two MinIO prefixes. To do: AWS, B2 and QuObjects together |
 | S3 backend | [m1-s3-backend.md](m1-s3-backend.md) | CI only (MinIO). To do: QuObjects, then AWS |
 | Storage classes | [m2-storage-classes.md](m2-storage-classes.md) | CI only. To do: AWS archive restore |
 | Object Lock and prune | [m3-object-lock.md](m3-object-lock.md) | CI only. To do: QuObjects, then AWS |

@@ -65,7 +65,7 @@ jobs:
         run: scripts/hardening.sh bin/vmobj corrupt-block corrupt-pack corrupt-manifest missing-block kill-full kill-incremental stop-backup stop-copy quit-copy long-chain install diskfull
 
       - name: Lint the shell scripts
-        run: shellcheck scripts/*.sh scripts/aws/*.sh
+        run: shellcheck scripts/*.sh scripts/aws/*.sh scripts/b2/*.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -190,6 +190,8 @@ jobs:
           E2E_BACKUP_ARGS: --profile standard
           E2E_INIT_ARGS: --object-lock
         run: scripts/e2e.sh "s3://vmobj-ci/e2e-locked-$GITHUB_RUN_ID?endpoint=$ENDPOINT" bin/vmobj
+      - name: Providers matrix (two prefixes, copies both ways, Object Lock)
+        run: scripts/providers-matrix.sh --vmobj bin/vmobj --only-pairs "one=s3://vmobj-ci/m1-$GITHUB_RUN_ID?endpoint=$ENDPOINT" "two=s3://vmobj-ci/m2-$GITHUB_RUN_ID?endpoint=$ENDPOINT"
       - name: MinIO log on failure
         if: failure()
         run: tail -50 "$RUNNER_TEMP/minio.log" || true

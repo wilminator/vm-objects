@@ -108,6 +108,42 @@ var builtins = map[string]Profile{
 		RefreshAge: 180 * Day,
 		Margin:     Day,
 	},
+	"offsite": {
+		Name: "offsite",
+		Description: "Nightly offsite copies on a service with one storage class (Backblaze B2, MinIO, QuObjects) " +
+			"or in S3 Standard: monthly fulls kept a year, weekly differentials 90 days, daily incrementals 90 days.",
+		Rules: map[manifest.Kind]Rule{
+			manifest.Full:         {Class: Standard, Retain: 365 * Day, Every: 30 * Day},
+			manifest.Differential: {Class: Standard, Retain: 90 * Day, Every: 7 * Day},
+			manifest.Incremental:  {Class: Standard, Retain: 90 * Day, Every: Day},
+		},
+		RefreshAge: 180 * Day,
+		Margin:     Day,
+	},
+	"cold": {
+		Name: "cold",
+		Description: "A last-resort copy in Glacier Deep Archive, for monthly fulls copied with vmobj copy --record: " +
+			"kept a year, restores take 12 to 48 hours. Other kinds land there too if copied.",
+		Rules: map[manifest.Kind]Rule{
+			manifest.Full:         {Class: DeepArchive, Retain: 365 * Day, Every: 30 * Day},
+			manifest.Differential: {Class: DeepArchive, Retain: 180 * Day, Every: 30 * Day},
+			manifest.Incremental:  {Class: DeepArchive, Retain: 180 * Day, Every: 30 * Day},
+		},
+		RefreshAge: 365 * Day,
+		Margin:     Day,
+	},
+	"test": {
+		Name: "test",
+		Description: "For tests run in a real, locked bucket: everything in Standard, kept and locked one day, " +
+			"so a test's objects can be pruned two days later.",
+		Rules: map[manifest.Kind]Rule{
+			manifest.Full:         {Class: Standard, Retain: Day, Every: Day},
+			manifest.Differential: {Class: Standard, Retain: Day, Every: Day},
+			manifest.Incremental:  {Class: Standard, Retain: Day, Every: Day},
+		},
+		RefreshAge: 30 * Day,
+		Margin:     Day,
+	},
 	"standard": {
 		Name:        "standard",
 		Description: "Everything in S3 Standard: no minimum storage periods, highest monthly price. Good for testing.",
