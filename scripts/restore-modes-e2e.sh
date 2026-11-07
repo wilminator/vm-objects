@@ -49,12 +49,13 @@ mapfile -t names < <("$vmobj" list --repo repo --key-file k --vm d | sed -n 's/^
 [ ${#names[@]} -eq 4 ] || fail "expected 4 backups, got ${#names[@]}"
 echo "   ${names[*]}"
 
-# check_steps TARGET: walks TARGET through the restore points, in place.
+# check_steps TARGET [PREFIX]: walks TARGET through the restore points, in
+# place. PREFIX (sudo, for a device) runs the comparison with it.
 check_steps() {
-  local t=$1 i out
+  local t=$1 as=${2:-} i out
   for i in 0 1 2 3 1 0; do
     out=$(restore --manifest "${names[$i]}" --output "$t" --mode in-place --check 2>&1) || { echo "$out"; fail "in-place to backup $i"; }
-    $sudo cmp -s "want-$i.raw" "$t" || fail "after the in-place step to backup $i the target differs"
+    $as cmp -s "want-$i.raw" "$t" || fail "after the in-place step to backup $i the target differs"
     echo "   -> backup $i: $(field Written <<<"$out") written; $(grep -c 'every block matches' <<<"$out") check"
   done
   out=$(restore --manifest "${names[0]}" --output "$t" --mode in-place 2>&1)
@@ -91,7 +92,7 @@ if [ -z "$sudo" ] || sudo -n true 2>/dev/null; then
   loop=$($sudo losetup --find --show dev.img)
   echo "   $loop"
   restore() { $sudo "$vmobj" restore --repo repo --key-file k --vm d --progress none "$@"; }
-  check_steps "$loop"
+  check_steps "$loop" "$sudo"
 else
   echo; echo "(skipping the block device test: needs root or sudo)"
 fi

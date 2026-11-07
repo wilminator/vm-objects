@@ -17,6 +17,10 @@
 # another incremental in an existing WORKDIR: for example a snapshot taken
 # just before moving the zvol with scripts/zfs-replay.sh.
 #
+# Backups are stored as VM "waypoints". WAYPOINT_VM=NAME uses another name,
+# for example to add to a work folder made by an earlier version that used
+# the VM's own name.
+#
 # Run as root. ZVOL is a zvol with two or more snapshots, for example
 # tank/vms/win11; they are used oldest first. WORKDIR must not exist yet
 # for "backup"; it receives a test key, a local repository, the state
@@ -37,6 +41,7 @@
 set -uo pipefail
 
 usage() { sed -n '12,14p' "$0" | sed 's/^# //' >&2; exit 2; }
+wpvm=${WAYPOINT_VM:-waypoints}
 
 # The clone is destroyed and made again under the same name for each
 # snapshot. udev updates /dev/zvol links in the background, so wait for the
@@ -79,7 +84,7 @@ backup() {
     make_clone "$zvol@$snap" "$clone" "$dev"
     echo "$snap $(sha256sum "$dev" | cut -d' ' -f1)" | tee -a "$work/hashes.txt"
     "$vmobj" backup --repo "$work/repo" --key-file "$work/test.key" --source "$dev" --format raw \
-      --vm waypoints --type "$type" --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
+      --vm "$wpvm" --type "$type" --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
     drop_clone "$clone"
     type=incremental
   done
@@ -104,7 +109,7 @@ add() {
   local hash
   hash=$(sha256sum "$dev" | cut -d' ' -f1)
   "$vmobj" backup --repo "$work/repo" --key-file "$work/test.key" --source "$dev" --format raw \
-    --vm waypoints --type incremental --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
+    --vm "$wpvm" --type incremental --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
   # Recorded only once the backup succeeded, so hashes.txt and the backups stay in step.
   echo "$snap $hash" | tee -a "$work/hashes.txt"
   drop_clone "$clone"
@@ -114,7 +119,7 @@ add() {
 verify() {
   local work=$1 vmobj=${2:-vmobj}
   local names want fail=0
-  mapfile -t names < <("$vmobj" list --repo "$work/repo" --key-file "$work/test.key" --vm waypoints | sed -n 's/^  //p')
+  mapfile -t names < <("$vmobj" list --repo "$work/repo" --key-file "$work/test.key" --vm "$wpvm" | sed -n 's/^  //p')
   mapfile -t want < "$work/hashes.txt"
   if [ "${#names[@]}" -ne "${#want[@]}" ]; then
     echo "FAIL: ${#names[@]} backups but ${#want[@]} hashes" >&2; exit 1
@@ -124,7 +129,7 @@ verify() {
   for i in "${!names[@]}"; do
     local snap=${want[$i]%% *} expect=${want[$i]##* } out="$work/restore.raw" got
     rm -f "$out"
-    if ! "$vmobj" restore --repo "$work/repo" --key-file "$work/test.key" --vm waypoints \
+    if ! "$vmobj" restore --repo "$work/repo" --key-file "$work/test.key" --vm "$wpvm" \
         --manifest "${names[$i]}" --output "$out" --progress none >/dev/null 2>&1; then
       echo "FAIL $snap: restore of ${names[$i]} failed"; fail=1; continue
     fi
