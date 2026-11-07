@@ -9,18 +9,20 @@
 # snapshots in order (a full, then one incremental each), then restore
 # every backup and check it is byte-identical to its snapshot.
 #
-#   scripts/zfs-waypoints.sh backup ZVOL WORKDIR [VMOBJ_BINARY]
-#   scripts/zfs-waypoints.sh add ZVOL@SNAPSHOT WORKDIR [VMOBJ_BINARY]
-#   scripts/zfs-waypoints.sh verify WORKDIR [VMOBJ_BINARY]
+#   scripts/zfs-waypoints.sh backup ZVOL WORKDIR [VMOBJ_BINARY] [--vm NAME]
+#   scripts/zfs-waypoints.sh add ZVOL@SNAPSHOT WORKDIR [VMOBJ_BINARY] [--vm NAME]
+#   scripts/zfs-waypoints.sh verify WORKDIR [VMOBJ_BINARY] [--vm NAME]
 #
 # "add" backs up one more snapshot, newer than the last one backed up, as
 # another incremental in an existing WORKDIR: for example a snapshot taken
 # just before moving the zvol with scripts/zfs-replay.sh.
 #
-# Backups are stored as VM "waypoints". For "add" and "verify", a work
-# folder whose repository holds just one series uses that series, whatever
-# its name (an earlier version used the VM's own name). WAYPOINT_VM=NAME
-# picks one explicitly.
+# --vm NAME names the backup series in the repository (it can go anywhere
+# on the line). Without it: "backup" uses "waypoints"; "add" and "verify"
+# use the work folder's only series, whatever its name (an earlier version
+# used the VM's own name), else "waypoints". The WAYPOINT_VM environment
+# variable is still read when --vm isn't given, but sudo usually drops it,
+# so prefer --vm.
 #
 # Run as root. ZVOL is a zvol with two or more snapshots, for example
 # tank/vms/win11; they are used oldest first. WORKDIR must not exist yet
@@ -42,12 +44,24 @@
 set -uo pipefail
 
 usage() { sed -n '12,14p' "$0" | sed 's/^# //' >&2; exit 2; }
-wpvm=${WAYPOINT_VM:-waypoints}
+
+# Take --vm NAME out of the arguments, wherever it is.
+vm_arg=""
+args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --vm) [ $# -ge 2 ] || usage; vm_arg=$2; shift 2 ;;
+    --vm=*) vm_arg=${1#--vm=}; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+wpvm=${vm_arg:-${WAYPOINT_VM:-waypoints}}
 
 # series WORKDIR VMOBJ: the repository's only series, if it has just one;
-# otherwise $wpvm. Sets wpvm.
+# otherwise $wpvm. Sets wpvm. An explicit --vm or WAYPOINT_VM wins.
 series() {
-  [ -n "${WAYPOINT_VM:-}" ] && return
+  if [ -n "$vm_arg" ] || [ -n "${WAYPOINT_VM:-}" ]; then echo "backup series: $wpvm"; return; fi
   local found
   mapfile -t found < <("$2" list --repo "$1/repo" --key-file "$1/test.key" 2>/dev/null | sed -n 's/^\([^ ].*\):$/\1/p')
   if [ "${#found[@]}" -eq 1 ]; then wpvm=${found[0]}; fi
