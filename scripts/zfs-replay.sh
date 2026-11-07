@@ -29,7 +29,8 @@ Options:
   --work DIR        a zfs-waypoints.sh work folder: its repository (repo),
                     key (test.key), backups of VM "waypoints" and
                     hashes.txt (snapshot names and sha256s, in order).
-                    Add --vm NAME if its backups use another name.
+                    A repository with just one series uses it, whatever
+                    its name; --vm NAME picks one otherwise.
   --repo, --key-file, --vm, --names "a b c"
                     instead of --work: any repository, the disk's backup
                     series, and one snapshot name per backup, oldest first
@@ -82,7 +83,13 @@ compression=""
 
 snaps=() hashes=()
 if [ -n "$work" ]; then
-  repo="$work/repo" key="$work/test.key" vm=${vm:-waypoints}
+  repo="$work/repo" key="$work/test.key"
+  if [ -z "$vm" ]; then
+    # The repository's only series, whatever it's called; else "waypoints".
+    mapfile -t found < <("$vmobj" list --repo "$repo" --key-file "$key" | sed -n 's/^\([^ ].*\):$/\1/p')
+    if [ ${#found[@]} -eq 1 ]; then vm=${found[0]}; else vm=waypoints; fi
+  fi
+  echo "backup series: $vm"
   [ -f "$work/hashes.txt" ] || die "$work/hashes.txt not found; is this a zfs-waypoints.sh work folder?"
   while read -r s h; do snaps+=("$s"); hashes+=("$h"); done < "$work/hashes.txt"
 else

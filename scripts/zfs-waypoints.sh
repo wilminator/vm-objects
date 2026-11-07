@@ -17,9 +17,10 @@
 # another incremental in an existing WORKDIR: for example a snapshot taken
 # just before moving the zvol with scripts/zfs-replay.sh.
 #
-# Backups are stored as VM "waypoints". WAYPOINT_VM=NAME uses another name,
-# for example to add to a work folder made by an earlier version that used
-# the VM's own name.
+# Backups are stored as VM "waypoints". For "add" and "verify", a work
+# folder whose repository holds just one series uses that series, whatever
+# its name (an earlier version used the VM's own name). WAYPOINT_VM=NAME
+# picks one explicitly.
 #
 # Run as root. ZVOL is a zvol with two or more snapshots, for example
 # tank/vms/win11; they are used oldest first. WORKDIR must not exist yet
@@ -42,6 +43,16 @@ set -uo pipefail
 
 usage() { sed -n '12,14p' "$0" | sed 's/^# //' >&2; exit 2; }
 wpvm=${WAYPOINT_VM:-waypoints}
+
+# series WORKDIR VMOBJ: the repository's only series, if it has just one;
+# otherwise $wpvm. Sets wpvm.
+series() {
+  [ -n "${WAYPOINT_VM:-}" ] && return
+  local found
+  mapfile -t found < <("$2" list --repo "$1/repo" --key-file "$1/test.key" 2>/dev/null | sed -n 's/^\([^ ].*\):$/\1/p')
+  if [ "${#found[@]}" -eq 1 ]; then wpvm=${found[0]}; fi
+  echo "backup series: $wpvm"
+}
 
 # The clone is destroyed and made again under the same name for each
 # snapshot. udev updates /dev/zvol links in the background, so wait for the
@@ -100,6 +111,7 @@ add() {
   [ "$zvol" != "$snapshot" ] || { echo "give ZVOL@SNAPSHOT" >&2; exit 1; }
   [ -f "$work/hashes.txt" ] || { echo "$work isn't a waypoint work folder (no hashes.txt)" >&2; exit 1; }
   ! grep -q "^$snap " "$work/hashes.txt" || { echo "$snap is already in $work/hashes.txt" >&2; exit 1; }
+  series "$work" "$vmobj"
   zfs list "$snapshot" >/dev/null || exit 1
   ! zfs list "$clone" >/dev/null 2>&1 || { echo "$clone already exists; remove it first" >&2; exit 1; }
   # shellcheck disable=SC2064
@@ -119,6 +131,7 @@ add() {
 verify() {
   local work=$1 vmobj=${2:-vmobj}
   local names want fail=0
+  series "$work" "$vmobj"
   mapfile -t names < <("$vmobj" list --repo "$work/repo" --key-file "$work/test.key" --vm "$wpvm" | sed -n 's/^  //p')
   mapfile -t want < "$work/hashes.txt"
   if [ "${#names[@]}" -ne "${#want[@]}" ]; then
