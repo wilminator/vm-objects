@@ -54,9 +54,11 @@ type VMDisk struct {
 
 // VMFile is a small file the VM needs, stored whole inside the record.
 type VMFile struct {
-	Role string `json:"role"` // "nvram" or "tpm"
-	// Name is the file's name: the NVRAM file's base name, or a path
-	// relative to the TPM state directory.
+	// Role is "nvram", "tpm", or "config": the platform's own settings
+	// for the VM (TrueNAS's), restored next to the definition.
+	Role string `json:"role"`
+	// Name is the file's name: the NVRAM file's base name, a path
+	// relative to the TPM state directory, or the settings file's name.
 	Name string `json:"name"`
 	Mode uint32 `json:"mode"`
 	Data []byte `json:"data"`
@@ -93,7 +95,7 @@ func (r *VMRecord) Validate() error {
 		if f.Name == "" || clean != f.Name || path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return fmt.Errorf("VM record %s has an unsafe file name %q", r.Name, f.Name)
 		}
-		if f.Role != "nvram" && f.Role != "tpm" {
+		if f.Role != "nvram" && f.Role != "tpm" && f.Role != "config" {
 			return fmt.Errorf("VM record %s has a file with unknown role %q", r.Name, f.Role)
 		}
 		total += len(f.Data)

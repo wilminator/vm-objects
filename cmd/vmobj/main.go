@@ -768,8 +768,13 @@ func newPlatform(name, virshPath, connect, swtpmDir string) (platform.Platform, 
 		}
 		return platform.NewQNAP(libvirt.Virsh{Path: virshPath, Connect: connect}, swtpmDir), nil
 	case "truenas":
-		return nil, errors.New("the TrueNAS module isn't finished yet (milestone 8); until it is, back up a TrueNAS VM's disks " +
-			"with vmobj backup --source zfs:POOL/ZVOL")
+		if connect == "" {
+			connect = platform.TrueNASLibvirtURI
+		}
+		if virshPath == "" {
+			virshPath = "virsh"
+		}
+		return platform.NewTrueNAS(nil, libvirt.Virsh{Path: virshPath, Connect: connect}), nil
 	}
 	if virshPath == "" {
 		virshPath = "virsh"
@@ -937,12 +942,17 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	record := fs.String("record", "", "VM record to restore (see vmobj vms)")
 	to := fs.String("to", "", "folder to restore into (created; must be empty)")
 	newName := fs.String("new-name", "", "rename the VM and drop its UUID, to run it next to the original")
+	targetFlag := fs.String("platform", "auto", "where the VM will run next, for RESTORE.txt: auto (this host), libvirt, qnap or truenas")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
 	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	target, err := platform.Check(*targetFlag)
+	if err != nil {
+		return err
+	}
 	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
@@ -961,7 +971,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	}
 	start := time.Now()
 	report, stopReport := restoreProgress(pc, *to, "")
-	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
+	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
 	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {

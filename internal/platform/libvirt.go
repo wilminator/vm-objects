@@ -84,7 +84,11 @@ func (l *Libvirt) Describe(ctx context.Context, domain string) (*VM, error) {
 	}
 	tpmDir := ""
 	if dom.TPM {
-		tpmDir = filepath.Join(l.SwtpmDir, dom.UUID)
+		// A folder named in the definition wins over libvirt's default.
+		tpmDir = dom.TPMPath
+		if tpmDir == "" {
+			tpmDir = filepath.Join(l.SwtpmDir, dom.UUID)
+		}
 	}
 	if vm.Files, err = ReadVMFiles(dom.NVRAM, tpmDir); err != nil {
 		return nil, err

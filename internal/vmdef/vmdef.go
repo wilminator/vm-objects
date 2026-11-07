@@ -41,9 +41,12 @@ type Domain struct {
 	// NVRAM is the UEFI variable store, if the domain has one.
 	NVRAM string
 	// TPM is true when the domain has an emulated (swtpm) TPM, whose state
-	// lives outside the definition, in a directory named by UUID.
+	// lives outside the definition: in TPMPath when the definition names
+	// a folder (<source type='dir' path=.../>, as TrueNAS does), otherwise
+	// in libvirt's swtpm folder, under the domain's UUID.
 	TPM        bool
 	TPMVersion string
+	TPMPath    string
 	// Skipped lists devices that are not backed up, with the reason.
 	Skipped []string
 }
@@ -79,6 +82,10 @@ func parse(data []byte, needUUID bool) (*Domain, error) {
 				Backend struct {
 					Type    string `xml:"type,attr"`
 					Version string `xml:"version,attr"`
+					Source  struct {
+						Type string `xml:"type,attr"`
+						Path string `xml:"path,attr"`
+					} `xml:"source"`
 				} `xml:"backend"`
 			} `xml:"tpm"`
 		} `xml:"devices"`
@@ -123,6 +130,9 @@ func parse(data []byte, needUUID bool) (*Domain, error) {
 		switch t.Backend.Type {
 		case "emulator":
 			d.TPM, d.TPMVersion = true, firstNonEmpty(t.Backend.Version, "1.2")
+			if t.Backend.Source.Type == "dir" {
+				d.TPMPath = t.Backend.Source.Path
+			}
 		case "passthrough":
 			d.Skipped = append(d.Skipped, "TPM passthrough (state lives in the host's TPM chip and can't be backed up)")
 		}
@@ -150,6 +160,11 @@ type Changes struct {
 	// DropUUID removes the <uuid> element, so libvirt assigns a new one
 	// and the copy can be defined next to the original.
 	DropUUID bool
+	// TPMDir, when set, is the new folder for an emulated TPM's state. It
+	// applies only to a definition that names its TPM folder
+	// (<backend><source type='dir' path=.../>, as TrueNAS writes); one that
+	// leaves it to libvirt's default is left alone.
+	TPMDir string
 }
 
 // DiskChange is a disk's new location.
@@ -218,6 +233,12 @@ func Rewrite(data []byte, ch Changes) ([]byte, error) {
 				inName = true
 			case path == "domain/uuid":
 				uuidAt = span.start
+			case path == "domain/devices/tpm/backend/source" && ch.TPMDir != "" && attr(t, "type", "") == "dir":
+				e, err := setAttr(data, span, "path", ch.TPMDir)
+				if err != nil {
+					return nil, fmt.Errorf("TPM state folder: %w", err)
+				}
+				edits = append(edits, e)
 			}
 		case xml.CharData:
 			if nvram && ch.NVRAM != "" && len(bytes.TrimSpace(t)) > 0 {

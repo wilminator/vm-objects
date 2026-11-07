@@ -315,6 +315,9 @@ type RestoreVMOptions struct {
 	// Progress, when set, reports each disk's restore as in
 	// RestoreOptions.Progress, with the disk's target name (vda, hda...).
 	Progress func(target string, phase Phase, done, total int64)
+	// Target is the platform the VM will run on next (libvirt, qnap or
+	// truenas): RESTORE.txt explains the steps for it. Empty means libvirt.
+	Target string
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -402,6 +405,10 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 		case "tpm":
 			p = filepath.Join(dir, "tpm", filepath.FromSlash(f.Name))
 			tpmFiles = true
+		case "config":
+			p = filepath.Join(dir, f.Name)
+		default:
+			continue
 		}
 		if err := atomicfile.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 			return nil, err
@@ -412,6 +419,11 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 		st.Files++
 	}
 	changes.Name, changes.DropUUID = o.NewName, o.NewName != ""
+	if tpmFiles {
+		// A definition that names its TPM folder (TrueNAS's do) now names
+		// the restored one.
+		changes.TPMDir = filepath.Join(dir, "tpm")
+	}
 	def, err := vmdef.Rewrite(rec.Definition, changes)
 	if err != nil {
 		return nil, err
@@ -420,7 +432,7 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if err := atomicfile.Write(st.Definition, def, 0o600); err != nil {
 		return nil, err
 	}
-	notes := restoreNotes(rec, st, name, o.NewName != "", tpmFiles)
+	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
 	if err := atomicfile.Write(filepath.Join(dir, "RESTORE.txt"), []byte(notes), 0o600); err != nil {
 		return nil, err
 	}
@@ -446,16 +458,158 @@ func (rd *Readiness) merge(o *Readiness) {
 	sort.Slice(rd.Classes, func(i, j int) bool { return rd.Classes[i] < rd.Classes[j] })
 }
 
-func restoreNotes(rec *manifest.VMRecord, st *RestoreVMStats, name string, renamed, tpm bool) string {
+// restoreNotesFor writes RESTORE.txt for the platform the VM will run on.
+func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, name string, renamed, tpm bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Restored %s from backup %s (%s, taken %s, %s).\n\n",
-		rec.DomainName, rec.Name, rec.Kind, rec.Created.Local().Format("2006-01-02 15:04"), rec.Consistency)
+	from := rec.Platform
+	if from == "" {
+		from = "libvirt"
+	}
+	fmt.Fprintf(&b, "Restored %s from backup %s (%s, taken %s, %s, made on %s).\n\n",
+		rec.DomainName, rec.Name, rec.Kind, rec.Created.Local().Format("2006-01-02 15:04"), rec.Consistency, from)
+	dir := filepath.Dir(st.Definition)
+	var disks []string
+	for t := range st.Disks {
+		disks = append(disks, t)
+	}
+	sort.Strings(disks)
+	var config string
+	for _, f := range rec.Files {
+		if f.Role == "config" {
+			config = f.Name
+		}
+	}
+	// Libvirt keeps TPM 2.0 state in a tpm2/ subfolder; TrueNAS keeps it
+	// directly in the VM's folder. Say where the files go either way.
+	flatTPM := true
+	for _, f := range rec.Files {
+		if f.Role == "tpm" && strings.HasPrefix(f.Name, "tpm2/") {
+			flatTPM = false
+		}
+	}
+	tpmInto := func(folder string) string {
+		if flatTPM {
+			return folder + "/tpm2"
+		}
+		return folder
+	}
+	switch target {
+	case "qnap":
+		b.WriteString("To run it in QNAP Virtualization Station (which manages its own VMs, so\n")
+		b.WriteString("nothing is defined from here):\n\n")
+		b.WriteString("1. In Virtualization Station, create a VM with UEFI firmware")
+		if tpm {
+			b.WriteString(" and a TPM 2.0 device")
+		}
+		b.WriteString(",\n   and give it the restored disks as its disk images:\n\n")
+		for _, t := range disks {
+			fmt.Fprintf(&b, "     %s  %s\n", t, st.Disks[t])
+		}
+		b.WriteString("\n   Use the original's settings (CPU, memory, firmware) from the definition\n")
+		fmt.Fprintf(&b, "   %s", filepath.Base(st.Definition))
+		if config != "" {
+			fmt.Fprintf(&b, " and %s", config)
+		}
+		b.WriteString(". Don't start it yet.\n\n")
+		if tpm {
+			b.WriteString("2. Find the new VM's UUID, then put the TPM state where QNAP keeps it:\n\n")
+			fmt.Fprintf(&b, "     %s list --all --uuid\n", platform.QNAPVirsh)
+			fmt.Fprintf(&b, "     mkdir -p %s\n", tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
+			fmt.Fprintf(&b, "     cp -a %s/. %s/\n\n", filepath.Join(dir, "tpm"), tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
+		}
+		b.WriteString("3. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
+		b.WriteString("   over the new VM's (its path is the <nvram> line of `virsh dumpxml`) while\n")
+		b.WriteString("   it is stopped.\n\n")
+		if from == "truenas" {
+			b.WriteString("Windows activation is tied to the original's hardware identity (its SMBIOS\n")
+			fmt.Fprintf(&b, "line is in %s, command_line_args). Virtualization Station may not let\n", config)
+			b.WriteString("you set it, so expect Windows to ask for activation on the copy. Keep the\n")
+			b.WriteString("copy off the network if the original is still in use.\n")
+		}
+	case "truenas":
+		b.WriteString("To run it on TrueNAS:\n\n")
+		b.WriteString("1. Make a zvol per disk, the same size as the original, and restore each\n")
+		b.WriteString("   disk straight onto it (faster than copying the .raw file):\n\n")
+		for _, t := range disks {
+			d := diskOf(rec, t)
+			fmt.Fprintf(&b, "     vmobj restore --repo REPO --key-file KEY --vm %s --manifest %s --output /dev/zvol/POOL/ZVOL --mode in-place --check\n", d.Stream, d.Manifest)
+		}
+		b.WriteString("\n2. Create the VM in the TrueNAS UI (Virtualization) with the original's\n")
+		if config != "" {
+			fmt.Fprintf(&b, "   settings, which are in %s: CPU mode, cores, memory, firmware\n", config)
+			b.WriteString("   (bootloader_ovmf), machine_type, and command_line_args (the SMBIOS line\n")
+			b.WriteString("   that keeps Windows activated). Add a DISK device per zvol.\n")
+		} else {
+			fmt.Fprintf(&b, "   settings from %s.\n", filepath.Base(st.Definition))
+		}
+		b.WriteString("   Don't start it yet.\n\n")
+		b.WriteString("3. TrueNAS names the new VM <ID>_<NAME> in its libvirt. With it stopped,\n")
+		b.WriteString("   put the firmware state where TrueNAS keeps it:\n\n")
+		for _, f := range rec.Files {
+			if f.Role == "nvram" {
+				fmt.Fprintf(&b, "     cp %s /var/db/system/vm/nvram/<ID>_<NAME>_VARS.fd\n", filepath.Join(dir, f.Name))
+			}
+		}
+		if tpm {
+			src := filepath.Join(dir, "tpm")
+			if !flatTPM {
+				src = filepath.Join(src, "tpm2")
+			}
+			b.WriteString("     mkdir -p /var/db/system/vm/tpm/<ID>_<NAME>_tpm_state\n")
+			fmt.Fprintf(&b, "     cp -a %s/. /var/db/system/vm/tpm/<ID>_<NAME>_tpm_state/\n", src)
+			b.WriteString("     chown -R tss:tss /var/db/system/vm/tpm/<ID>_<NAME>_tpm_state\n")
+			b.WriteString("     chmod 700 /var/db/system/vm/tpm/<ID>_<NAME>_tpm_state\n")
+		}
+		b.WriteString("\n4. Start it.\n")
+	default:
+		return restoreNotes(rec, st, name, renamed, tpm, flatTPM)
+	}
+	if tpm {
+		b.WriteString("\nWithout the TPM state, Windows asks for the BitLocker recovery key and\n")
+		b.WriteString("Windows Hello PINs must be set up again.\n")
+	}
+	return b.String()
+}
+
+// diskOf finds a disk of a VM record by its target.
+func diskOf(rec *manifest.VMRecord, target string) manifest.VMDisk {
+	for _, d := range rec.Disks {
+		if d.Target == target {
+			return d
+		}
+	}
+	return manifest.VMDisk{}
+}
+
+// restoreNotes are the steps for a libvirt host that defines VMs with virsh.
+func restoreNotes(rec *manifest.VMRecord, st *RestoreVMStats, name string, renamed, tpm, flatTPM bool) string {
+	var b strings.Builder
+	from := rec.Platform
+	if from == "" {
+		from = "libvirt"
+	}
+	fmt.Fprintf(&b, "Restored %s from backup %s (%s, taken %s, %s, made on %s).\n\n",
+		rec.DomainName, rec.Name, rec.Kind, rec.Created.Local().Format("2006-01-02 15:04"), rec.Consistency, from)
+	// The name libvirt will see is the one in the definition (TrueNAS's
+	// libvirt calls WinGames 1_WinGames).
+	defName := rec.DomainName
+	if dom, err := vmdef.Parse(rec.Definition); err == nil && dom.Name != "" {
+		defName = dom.Name
+	}
 	fmt.Fprintf(&b, "Disks were restored as raw images; the definition %s points at them.\n", filepath.Base(st.Definition))
 	b.WriteString("Nothing has been registered with libvirt. To use this VM:\n\n")
 	if !renamed {
-		fmt.Fprintf(&b, "WARNING: the definition keeps the original name (%s) and UUID (%s). If this host\n", rec.DomainName, rec.UUID)
+		fmt.Fprintf(&b, "WARNING: the definition keeps the original name (%s) and UUID (%s). If this host\n", defName, rec.UUID)
 		b.WriteString("still has that VM, defining it REPLACES the original's definition. To run it\n")
 		b.WriteString("alongside the original, restore again with --new-name instead.\n\n")
+	}
+	if dom, err := vmdef.Parse(rec.Definition); err == nil && dom.TPMPath != "" && tpm {
+		// The definition names its TPM folder, and Rewrite pointed it at
+		// the restored state: nothing to copy.
+		fmt.Fprintf(&b, "The definition keeps its TPM state in %s (as restored), so just:\n\n", filepath.Join(filepath.Dir(st.Definition), "tpm"))
+		fmt.Fprintf(&b, "     virsh define %s\n\n", st.Definition)
+		b.WriteString("swtpm must be able to write that folder (on most hosts, user tss or swtpm).\n")
+		return b.String()
 	}
 	if tpm {
 		uuid := rec.UUID
@@ -473,8 +627,14 @@ func restoreNotes(rec *manifest.VMRecord, st *RestoreVMStats, name string, renam
 		if rec.Platform == "qnap" {
 			swtpm = platform.QNAPSwtpmDir
 		}
-		fmt.Fprintf(&b, "     mkdir -p %s/%s\n", swtpm, uuid)
-		fmt.Fprintf(&b, "     cp -a %s/. %s/%s/\n", filepath.Join(filepath.Dir(st.Definition), "tpm"), swtpm, uuid)
+		into := swtpm + "/" + uuid
+		if flatTPM {
+			// TrueNAS keeps the files directly in the folder; libvirt
+			// expects them in tpm2/.
+			into += "/tpm2"
+		}
+		fmt.Fprintf(&b, "     mkdir -p %s\n", into)
+		fmt.Fprintf(&b, "     cp -a %s/. %s/\n", filepath.Join(filepath.Dir(st.Definition), "tpm"), into)
 		if rec.Platform != "qnap" {
 			fmt.Fprintf(&b, "     (On QNAP it goes under %s instead.)\n", platform.QNAPSwtpmDir)
 		}

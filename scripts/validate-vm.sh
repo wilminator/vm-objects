@@ -95,7 +95,10 @@ nvram=$(sed -n 's:.*<nvram[^>]*>\(.*\)</nvram>.*:\1:p' <<<"$xml" | head -n1)
 [ -n "$nvram" ] && echo "   NVRAM: $nvram"
 tpmdir=""
 if grep -q "<backend type='emulator'" <<<"$xml"; then
-  tpmdir="$swtpm/$uuid"
+  # A definition can name its TPM folder (TrueNAS's do); otherwise it is
+  # libvirt's swtpm folder, under the UUID.
+  tpmdir=$(sed -n "/<tpm/,/<\/tpm>/s:.*<source type=.dir. path=.\([^'\"]*\).*:\1:p" <<<"$xml" | head -n1)
+  [ -n "$tpmdir" ] || tpmdir="$swtpm/$uuid"
   echo "   TPM state: $tpmdir"
 fi
 
@@ -146,8 +149,11 @@ check_restore() {
   fi
   local d target src got
   for d in "${disks[@]}"; do
-    target=${d%% *} src=${d#* } got="$out/$name-$target.raw"
-    [ -f "$got" ] || { bad "disk $target wasn't restored"; continue; }
+    # Restored disks are named <VM>-<target>.raw; the VM's name there is
+    # the platform's (TrueNAS's WinGames, not libvirt's 1_WinGames).
+    target=${d%% *} src=${d#* }
+    got=$(find "$out" -maxdepth 1 -name "*-$target.raw" | head -n1)
+    if [ -z "$got" ] || [ ! -f "$got" ]; then bad "disk $target wasn't restored"; continue; fi
     case $src in
       *.qcow2|*.qcow)
         if qemu-img compare -q -f qcow2 -F raw "$src" "$got"; then ok "disk $target matches $src"; else bad "disk $target differs from $src"; fi ;;
@@ -162,11 +168,12 @@ check_restore() {
   if [ -n "$tpmdir" ]; then
     if diff -r "$tpmdir" "$out/tpm" >/dev/null; then ok "TPM state identical ($(find "$tpmdir" -type f | wc -l) files)"; else bad "TPM state differs or is missing"; fi
   fi
-  local def="$out/$name.xml"
-  if [ -f "$def" ]; then
+  local def
+  def=$(find "$out" -maxdepth 1 -name '*.xml' | head -n1)
+  if [ -n "$def" ]; then
     local bad_def=0
     for d in "${disks[@]}"; do
-      grep -q "$out/$name-${d%% *}.raw" "$def" || { bad "the definition doesn't point disk ${d%% *} at its restored file"; bad_def=1; }
+      grep -q "$out/[^/'\"]*-${d%% *}.raw" "$def" || { bad "the definition doesn't point disk ${d%% *} at its restored file"; bad_def=1; }
     done
     if grep -q "<backingStore" "$def"; then bad "the definition still has a <backingStore> chain"; bad_def=1; fi
     [ $bad_def -eq 0 ] && ok "definition points every disk at its restored file, with no backing chain"
