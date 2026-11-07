@@ -67,6 +67,27 @@ the oldest in full and each later one with `--mode in-place`, calling
 When a platform can't recreate a snapshot (a plain raw file, say), the
 restore writes the newest state and lists the history in `RESTORE.txt`.
 
+## Fast replay (built first)
+
+Replaying a history used to read the whole disk three times per step
+(compare, `--check`, `sha256sum`). Two changes, in `vmobj restore`:
+
+- `--base NAME` (in-place): the target already holds backup NAME (the
+  previous step, just checked), so blocks the same in NAME and the backup
+  being restored are skipped without reading the target. Only the blocks
+  that differ are read, compared and written.
+- `--check` computes the whole disk's SHA-256 while it reads back, and
+  `--expect-sha256 HEX` fails the restore when it differs; `--check-written`
+  reads back only the blocks written.
+
+`zfs-replay.sh` uses them: `--verify every` (default) is one full read per
+step; `--verify end` reads back only what each step wrote and checks the
+whole disk once, after the last.
+
+A plain restore also became one pass: each block is written once, with its
+newer extents merged in memory, and a full block that newer extents cover
+entirely isn't fetched.
+
 ## First step: how Virtualization Station stores snapshots
 
 QNAP stores VM snapshots as deltas. Which kind decides how `Recreate`

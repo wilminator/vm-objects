@@ -48,6 +48,8 @@ Usage:
                     [--profile NAME] [--class CLASS] [--copy-to REPO ...]
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
+                    [--mode rename|copy|in-place] [--scratch DIR] [--check [--check-written | --expect-sha256 HEX]]
+                    [--base NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
                     [--vm NAME] [--profile NAME] [--quiesce] [--virsh PATH] [--connect URI] [--swtpm-dir DIR]
@@ -516,7 +518,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 	force := fs.Bool("force", false, "replace an existing output file (rename mode)")
 	modeFlag := fs.String("mode", "rename", "rename: write a new file and rename it into place; copy: restore to scratch space, then update the existing target, writing only what differs; in-place: update the existing target directly, fetching and writing only what differs")
 	scratch := fs.String("scratch", "", "copy mode: folder for the temporary full restore (default: the target's folder)")
-	check := fs.Bool("check", false, "copy and in-place: read the target back afterwards and compare it")
+	check := fs.Bool("check", false, "copy and in-place: read the target back afterwards and compare it; also prints the whole disk's SHA-256")
+	base := fs.String("base", "", "in-place: a backup the target already holds (e.g. the previous step of a replay, just checked); blocks the same in both are skipped without reading the target")
+	checkWritten := fs.Bool("check-written", false, "with --check: read back only the blocks this restore wrote (faster; no SHA-256)")
+	expectSHA := fs.String("expect-sha256", "", "with a full --check: fail unless the restored disk's SHA-256 is this")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
@@ -545,6 +550,15 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if *check && mode == engine.ModeRename {
 		return errors.New("restore: --check works with --mode copy or in-place")
 	}
+	if *base != "" && mode != engine.ModeInPlace {
+		return errors.New("restore: --base works with --mode in-place")
+	}
+	if *checkWritten && !*check {
+		return errors.New("restore: --check-written needs --check")
+	}
+	if *expectSHA != "" && (!*check || *checkWritten) {
+		return errors.New("restore: --expect-sha256 needs --check (without --check-written)")
+	}
 	if mode != engine.ModeRename && *force {
 		return errors.New("restore: --force only applies to --mode rename; copy and in-place always update the existing target")
 	}
@@ -562,7 +576,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	report, stopReport := restoreProgress(pc, *out, scratchLabel)
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
-		Mode: mode, Scratch: *scratch, Check: *check,
+		Mode: mode, Scratch: *scratch, Check: *check, Base: *base, CheckWritten: *checkWritten, ExpectSHA256: *expectSHA,
 		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
 	stopReport()
 	var nr *engine.NotReadyError
@@ -585,6 +599,9 @@ func cmdRestore(ctx context.Context, args []string) error {
 // printUpdateSummary reports a copy or in-place restore.
 func printUpdateSummary(out string, mode engine.Mode, st *engine.RestoreStats, took time.Duration) {
 	fmt.Printf("Updated %s (%s, %s) in %s.\n", out, mode, units.Format(st.DiskBytes), took)
+	if st.BlocksSkipped > 0 {
+		fmt.Printf("  Skipped:   %s (%d blocks the same in --base, not read)\n", units.Format(st.SkippedBytes), st.BlocksSkipped)
+	}
 	fmt.Printf("  Compared:  %s; %d blocks were already right\n", units.Format(st.Compared), st.BlocksSame)
 	fmt.Printf("  Written:   %s (%d pieces of 4 KiB, in %d writes)\n", units.Format(st.Written), st.PiecesWritten, st.Writes)
 	if mode == engine.ModeInPlace {
@@ -597,7 +614,12 @@ func printUpdateSummary(out string, mode engine.Mode, st *engine.RestoreStats, t
 		fmt.Printf("  Note:      the device is %s larger than the disk; that part was left as it was\n", units.Format(st.TargetExtra))
 	}
 	if st.Checked {
-		fmt.Println("  Checked:   read back, every block matches")
+		if st.SHA256 != "" {
+			fmt.Println("  Checked:   read back, every block matches")
+			fmt.Printf("  SHA-256:   %s\n", st.SHA256)
+		} else {
+			fmt.Printf("  Checked:   read back the %s written, every block matches\n", units.Format(st.CheckedBytes))
+		}
 	}
 }
 

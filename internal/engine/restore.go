@@ -34,11 +34,23 @@ type RestoreOptions struct {
 	Mode     Mode   // rename (default), copy or in-place; see ModeRename
 	Scratch  string // copy mode: folder for the temporary full restore (default: the target's folder)
 	Check    bool   // copy and in-place: read the target back afterwards and compare
+	// Base (in-place only) names a backup of the same disk that the target
+	// is known to hold already, for example because the previous step of a
+	// replay just checked it. Blocks that are the same in Base and Manifest
+	// are then skipped without reading the target. Only use it when the
+	// target really does hold Base: a block that differs from Base but is
+	// the same in both backups is left wrong (a full --check catches it).
+	Base string
+	// CheckWritten, with Check, reads back only the blocks this restore
+	// wrote, instead of the whole target. No SHA-256 is computed then.
+	CheckWritten bool
+	// ExpectSHA256, with a full Check, fails the restore when the whole
+	// disk's SHA-256 (computed during the check) differs from it.
+	ExpectSHA256 string
 	// Progress, when set, is told what the restore is doing: once with
 	// PhaseChecking before the backup is checked, then with PhaseWriting
-	// as the disk is written (done and total count bytes of the disk), then,
-	// for an incremental or differential, with PhaseChanges as the newer
-	// extents are laid over it (bytes of those extents). Copy and in-place
+	// as the disk is written (done and total count bytes of the disk; newer
+	// extents are merged into each block as it is written). Copy and in-place
 	// modes then report PhaseUpdating as the target is compared (bytes of
 	// the disk), and PhaseCheckingTarget for --check. In each phase done
 	// reaches total at the end.
@@ -51,7 +63,7 @@ type Phase int
 const (
 	PhaseChecking       Phase = iota // checking the backup is complete and readable
 	PhaseWriting                     // writing the disk
-	PhaseChanges                     // laying newer extents over it
+	PhaseChanges                     // vmobj copy: newer extents (a restore merges them as each block is written)
 	PhaseUpdating                    // copy and in-place: comparing the target and writing what differs
 	PhaseCheckingTarget              // --check: reading the target back
 )
@@ -74,6 +86,14 @@ type RestoreStats struct {
 	ResizedFrom   int64
 	TargetExtra   int64 // bytes of a block device past the disk, left as they were
 	Checked       bool  // --check read the target back and it matched
+
+	// With Base: blocks the same in both backups, skipped without reading.
+	BlocksSkipped int
+	SkippedBytes  int64
+	// A full check: the SHA-256 of the whole disk as read back (hex), and
+	// how many bytes the check read. CheckWritten reads only what was written.
+	SHA256       string
+	CheckedBytes int64
 }
 
 // ErrIncomplete means a restore point is missing pieces; nothing was written.
@@ -146,19 +166,45 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 }
 
 func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, sparse bool, stats *RestoreStats, report func(Phase, int64, int64)) error {
-	zeros := make([]byte, m.BlockSize)
+	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
+	zeros := make([]byte, bs)
+	overlays := overlaysByBlock(m)
+	var idx map[extent.Hash]repo.Location
+	if len(m.Overlay) > 0 {
+		var err error
+		if idx, err = r.ChainIndex(ctx, m.Chain); err != nil {
+			return err
+		}
+	}
+	buf := make([]byte, bs)
 
-	phase, total, done := PhaseWriting, m.DiskSize, int64(0)
-	report(phase, 0, total)
-
-	// 1. Base blocks.
+	// One pass, block by block: the newest data for every part of the block
+	// is gathered in memory (the full's block, with the newer extents laid
+	// over it) and written once. A full block entirely covered by newer
+	// extents isn't fetched at all.
+	report(PhaseWriting, 0, m.DiskSize)
+	var done int64
 	for i, ref := range m.Blocks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		off := int64(i) * int64(m.BlockSize)
-		length := min(int64(m.BlockSize), m.DiskSize-off)
-		if ref.Zero {
+		off := int64(i) * bs
+		length := min(bs, m.DiskSize-off)
+		ovs := overlays[i]
+		block := buf[:length]
+
+		covered := make([]bool, (length+es-1)/es)
+		for _, ov := range ovs {
+			eo := int64(ov.Index)*es - off
+			if eo < 0 || eo >= length {
+				return fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
+			}
+			covered[eo/es] = true
+		}
+		all := len(ovs) == len(covered)
+
+		switch {
+		case ref.Zero && len(ovs) == 0:
 			stats.ZeroBlocks++
 			if !sparse {
 				if _, err := timedWriteAt(r, out, zeros[:length], off); err != nil {
@@ -166,69 +212,71 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 				}
 			}
 			done += length
-			report(phase, done, total)
+			report(PhaseWriting, done, m.DiskSize)
 			continue
-		}
-		data, err := r.GetBlock(ctx, ref.Hash)
-		if err != nil {
-			return err
-		}
-		if int64(len(data)) != length {
-			return fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
-		}
-		if _, err := timedWriteAt(r, out, data, off); err != nil {
-			return err
-		}
-		stats.BlocksRead++
-		done += length
-		report(phase, done, total)
-	}
-
-	// 2. Newer extents laid over the base.
-	if len(m.Overlay) == 0 {
-		return nil
-	}
-	idx, err := r.ChainIndex(ctx, m.Chain)
-	if err != nil {
-		return err
-	}
-	phase, total, done = PhaseChanges, 0, 0
-	for _, ov := range m.Overlay {
-		off := int64(ov.Index) * int64(m.ExtentSize)
-		total += min(int64(m.ExtentSize), m.DiskSize-off)
-	}
-	report(phase, 0, total)
-	for _, ov := range m.Overlay {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		off := int64(ov.Index) * int64(m.ExtentSize)
-		length := min(int64(m.ExtentSize), m.DiskSize-off)
-		if ov.Ref.Zero {
-			if _, err := timedWriteAt(r, out, zeros[:length], off); err != nil {
+		case ref.Zero || all:
+			if ref.Zero {
+				stats.ZeroBlocks++
+			}
+			copy(block, zeros[:length])
+		default:
+			data, err := r.GetBlock(ctx, ref.Hash)
+			if err != nil {
 				return err
 			}
-			done += length
-			report(phase, done, total)
+			if int64(len(data)) != length {
+				return fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
+			}
+			copy(block, data)
+			stats.BlocksRead++
+		}
+		for _, ov := range ovs {
+			eo := int64(ov.Index)*es - off
+			el := min(es, length-eo)
+			if ov.Ref.Zero {
+				copy(block[eo:eo+el], zeros[:el])
+				continue
+			}
+			loc, ok := idx[ov.Ref.Hash]
+			if !ok {
+				return fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
+			}
+			data, err := r.GetExtent(ctx, loc, ov.Ref.Hash)
+			if err != nil {
+				return err
+			}
+			if int64(len(data)) != el {
+				return fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), el)
+			}
+			copy(block[eo:eo+el], data)
+			stats.ExtentsRead++
+		}
+		// On a sparse file, a zero block with a few newer extents gets only
+		// its non-zero pieces written, so the rest stays unallocated.
+		if ref.Zero && sparse {
+			if err := writeNonZero(r, out, block, off, es); err != nil {
+				return err
+			}
+		} else if _, err := timedWriteAt(r, out, block, off); err != nil {
+			return err
+		}
+		done += length
+		report(PhaseWriting, done, m.DiskSize)
+	}
+	return nil
+}
+
+// writeNonZero writes the extent-sized pieces of block that aren't all zero.
+func writeNonZero(r *repo.Repo, out *os.File, block []byte, off, es int64) error {
+	n := int64(len(block))
+	for e := int64(0); e < n; e += es {
+		end := min(e+es, n)
+		if extent.IsAllZero(block[e:end]) {
 			continue
 		}
-		loc, ok := idx[ov.Ref.Hash]
-		if !ok {
-			return fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
-		}
-		data, err := r.GetExtent(ctx, loc, ov.Ref.Hash)
-		if err != nil {
+		if _, err := timedWriteAt(r, out, block[e:end], off+e); err != nil {
 			return err
 		}
-		if int64(len(data)) != length {
-			return fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), length)
-		}
-		if _, err := timedWriteAt(r, out, data, off); err != nil {
-			return err
-		}
-		stats.ExtentsRead++
-		done += length
-		report(phase, done, total)
 	}
 	return nil
 }

@@ -70,6 +70,21 @@ out=$(restore --manifest "${names[1]}" --output target.raw --mode in-place)
 grep -q "Written:   24.00 KiB" <<<"$out" || { echo "$out"; fail "full -> incremental 1 should write exactly the 6 changed 4 KiB pieces"; }
 echo "   full -> incremental 1 wrote exactly the 6 changed pieces (24 KiB)"
 
+step "a replay with --base: only the blocks that differ are read"
+restore --manifest "${names[0]}" --output target.raw --mode in-place >/dev/null
+for i in 1 2 3; do
+  want=$(sha256sum "want-$i.raw" | cut -d' ' -f1)
+  out=$(restore --manifest "${names[$i]}" --output target.raw --mode in-place --base "${names[$((i - 1))]}" --check --expect-sha256 "$want" 2>&1) \
+    || { echo "$out"; fail "--base step to backup $i"; }
+  cmp -s "want-$i.raw" target.raw || fail "after the --base step to backup $i the target differs"
+  grep -q "Skipped:" <<<"$out" || { echo "$out"; fail "--base skipped nothing"; }
+  grep -q "SHA-256:   $want" <<<"$out" || { echo "$out"; fail "the check didn't print the expected SHA-256"; }
+  echo "   -> backup $i: $(field Compared <<<"$out") compared instead of 64 MiB; sha256 matches"
+done
+out=$(restore --manifest "${names[3]}" --output target.raw --mode in-place --check --expect-sha256 "$(sha256sum want-0.raw | cut -d' ' -f1)" 2>&1) \
+  && fail "--expect-sha256 with the wrong hash was accepted"
+echo "   a wrong --expect-sha256 is refused"
+
 step "copy mode keeps the file and writes only what differs"
 restore --manifest "${names[0]}" --output target.raw --mode in-place >/dev/null
 ino=$(stat -c %i target.raw)

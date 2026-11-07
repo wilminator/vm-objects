@@ -9,12 +9,16 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 
 	"github.com/wilminator/vm-objects/internal/extent"
@@ -107,10 +111,9 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 		return fmt.Errorf("block size %d is not a multiple of extent size %d", m.BlockSize, m.ExtentSize)
 	}
 	var (
-		src  *os.File // copy mode: the complete restore in scratch space
-		tmp  string
-		want []extent.Ref
-		err  error
+		src *os.File // copy mode: the complete restore in scratch space
+		tmp string
+		err error
 	)
 	if o.Mode == ModeCopy {
 		scratch := o.Scratch
@@ -136,15 +139,34 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 			return err
 		}
 	}
+	var base *manifest.Manifest
+	if o.Base != "" {
+		if o.Mode != ModeInPlace {
+			return errors.New("--base works with --mode in-place")
+		}
+		if base, err = o.Repo.GetManifest(ctx, o.VM, o.Base); err != nil {
+			return fmt.Errorf("--base: %w", err)
+		}
+		if base.DiskSize != m.DiskSize || base.BlockSize != m.BlockSize || base.ExtentSize != m.ExtentSize {
+			return fmt.Errorf("--base %s doesn't fit: its disk, block or extent size differs from %s's", o.Base, o.Manifest)
+		}
+	}
+	if o.CheckWritten && !o.Check {
+		return errors.New("--check-written needs --check")
+	}
+	if o.ExpectSHA256 != "" && (!o.Check || o.CheckWritten) {
+		return errors.New("--expect-sha256 needs a full --check")
+	}
 	out, err := existingTarget(o.Output, m.DiskSize, stats)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	var u update
 	if o.Mode == ModeCopy {
-		want, err = copyChanged(ctx, o.Repo, m, src, out, stats, report)
+		u, err = copyChanged(ctx, o.Repo, m, src, out, stats, report)
 	} else {
-		want, err = updateInPlace(ctx, o.Repo, m, out, stats, report)
+		u, err = updateInPlace(ctx, o.Repo, m, base, out, stats, report)
 	}
 	if err != nil {
 		return err
@@ -152,10 +174,60 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 	if err := out.Sync(); err != nil {
 		return err
 	}
-	if o.Check {
-		return checkTarget(ctx, o.Repo, m, out, want, stats, report)
+	if !o.Check {
+		return nil
+	}
+	if err := checkTarget(ctx, o.Repo, m, out, u, o.CheckWritten, stats, report); err != nil {
+		return err
+	}
+	if o.ExpectSHA256 != "" && !strings.EqualFold(o.ExpectSHA256, stats.SHA256) {
+		return fmt.Errorf("check after restore: the disk's SHA-256 is %s, expected %s", stats.SHA256, o.ExpectSHA256)
 	}
 	return nil
+}
+
+// update records what an update did to each block, for checkTarget.
+type update struct {
+	want    []extent.Ref // what each block should hash to, where known
+	known   []bool       // want[i] is set (false: a block skipped thanks to --base that has newer extents over it)
+	written []bool       // the update wrote to block i
+}
+
+func newUpdate(n int) update {
+	return update{want: make([]extent.Ref, n), known: make([]bool, n), written: make([]bool, n)}
+}
+
+// sameBlock reports whether block i has the same content in a and b by
+// their manifests alone: the same full block and the same newer extents
+// over it. (It can say no for blocks that are in fact equal; those are
+// then compared the usual way.)
+func sameBlock(a, b map[int][]manifest.Overlay, am, bm *manifest.Manifest, i int) bool {
+	if !am.Blocks[i].Equal(bm.Blocks[i]) {
+		return false
+	}
+	x, y := a[i], b[i]
+	if len(x) != len(y) {
+		return false
+	}
+	for k := range x {
+		if x[k].Index != y[k].Index || !x[k].Ref.Equal(y[k].Ref) {
+			return false
+		}
+	}
+	return true
+}
+
+// overlaysByBlock groups a manifest's newer extents by the block they fall in.
+func overlaysByBlock(m *manifest.Manifest) map[int][]manifest.Overlay {
+	perBlock := int(int64(m.BlockSize) / int64(m.ExtentSize))
+	by := make(map[int][]manifest.Overlay)
+	for _, ov := range m.Overlay {
+		by[ov.Index/perBlock] = append(by[ov.Index/perBlock], ov)
+	}
+	for _, ovs := range by {
+		slices.SortFunc(ovs, func(a, b manifest.Overlay) int { return a.Index - b.Index })
+	}
+	return by
 }
 
 // updateInPlace makes out hold m's disk, touching only what differs. For
@@ -170,42 +242,56 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 //
 // Only the 4 KiB pieces whose bytes differ are written, coalesced into
 // runs. It returns the ref of each block as written, for checkTarget.
-func updateInPlace(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, stats *RestoreStats, report func(Phase, int64, int64)) ([]extent.Ref, error) {
+//
+// With base (the backup the target is known to hold), blocks the same in
+// base and m are skipped without reading the target.
+func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest, out *os.File, stats *RestoreStats, report func(Phase, int64, int64)) (update, error) {
 	h := r.Hasher()
 	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
-	perBlock := int(bs / es)
-	overlays := make(map[int][]manifest.Overlay)
-	for _, ov := range m.Overlay {
-		overlays[ov.Index/perBlock] = append(overlays[ov.Index/perBlock], ov)
+	overlays := overlaysByBlock(m)
+	var baseOverlays map[int][]manifest.Overlay
+	if base != nil {
+		baseOverlays = overlaysByBlock(base)
 	}
 	var idx map[extent.Hash]repo.Location
+	u := newUpdate(len(m.Blocks))
 	if len(m.Overlay) > 0 {
 		var err error
 		if idx, err = r.ChainIndex(ctx, m.Chain); err != nil {
-			return nil, err
+			return u, err
 		}
 	}
 	zeros := make([]byte, bs)
 	cur := make([]byte, bs)
-	want := make([]extent.Ref, len(m.Blocks))
+	want := u.want
 	report(PhaseUpdating, 0, m.DiskSize)
 	var done int64
 	for i, ref := range m.Blocks {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return u, err
 		}
 		off := int64(i) * bs
 		length := min(bs, m.DiskSize-off)
+		ovs := overlays[i]
+		if base != nil && sameBlock(overlays, baseOverlays, m, base, i) {
+			stats.BlocksSkipped++
+			stats.SkippedBytes += length
+			if len(ovs) == 0 {
+				want[i], u.known[i] = ref, true
+			}
+			done += length
+			report(PhaseUpdating, done, m.DiskSize)
+			continue
+		}
 		have := cur[:length]
 		if err := readTarget(r, out, have, off); err != nil {
-			return nil, err
+			return u, err
 		}
 		stats.Compared += length
-		ovs := overlays[i]
 
 		if len(ovs) == 0 && h.Ref(have).Equal(ref) {
 			stats.BlocksSame++
-			want[i] = ref
+			want[i], u.known[i] = ref, true
 			done += length
 			report(PhaseUpdating, done, m.DiskSize)
 			continue
@@ -218,10 +304,10 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out 
 		} else {
 			data, err := r.GetBlock(ctx, ref.Hash)
 			if err != nil {
-				return nil, err
+				return u, err
 			}
 			if int64(len(data)) != length {
-				return nil, fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
+				return u, fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
 			}
 			desired = data
 			stats.BlocksRead++
@@ -230,7 +316,7 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out 
 			eo := int64(ov.Index)*es - off
 			el := min(es, length-eo)
 			if eo < 0 || el <= 0 {
-				return nil, fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
+				return u, fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
 			}
 			if h.Ref(have[eo : eo+el]).Equal(ov.Ref) {
 				copy(desired[eo:eo+el], have[eo:eo+el])
@@ -243,60 +329,65 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out 
 			}
 			loc, ok := idx[ov.Ref.Hash]
 			if !ok {
-				return nil, fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
+				return u, fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
 			}
 			data, err := r.GetExtent(ctx, loc, ov.Ref.Hash)
 			if err != nil {
-				return nil, err
+				return u, err
 			}
 			if int64(len(data)) != el {
-				return nil, fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), el)
+				return u, fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), el)
 			}
 			copy(desired[eo:eo+el], data)
 			stats.ExtentsRead++
 		}
+		before := stats.Writes
 		if err := writeDiff(r, out, off, have, desired, writeGrain, stats); err != nil {
-			return nil, err
+			return u, err
 		}
-		want[i] = h.Ref(desired)
+		want[i], u.known[i] = h.Ref(desired), true
+		u.written[i] = stats.Writes > before
 		done += length
 		report(PhaseUpdating, done, m.DiskSize)
 	}
-	return want, nil
+	return u, nil
 }
 
 // copyChanged makes out match src, the complete restore, writing only the
 // 4 KiB pieces that differ. Both are local, so it compares bytes directly.
-func copyChanged(ctx context.Context, r *repo.Repo, m *manifest.Manifest, src, out *os.File, stats *RestoreStats, report func(Phase, int64, int64)) ([]extent.Ref, error) {
+func copyChanged(ctx context.Context, r *repo.Repo, m *manifest.Manifest, src, out *os.File, stats *RestoreStats, report func(Phase, int64, int64)) (update, error) {
 	h := r.Hasher()
 	bs := int64(m.BlockSize)
 	from, have := make([]byte, bs), make([]byte, bs)
-	want := make([]extent.Ref, len(m.Blocks))
+	u := newUpdate(len(m.Blocks))
 	report(PhaseUpdating, 0, m.DiskSize)
 	var done int64
 	for i := range m.Blocks {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return u, err
 		}
 		off := int64(i) * bs
 		length := min(bs, m.DiskSize-off)
 		if _, err := src.ReadAt(from[:length], off); err != nil {
-			return nil, fmt.Errorf("reading the scratch copy: %w", err)
+			return u, fmt.Errorf("reading the scratch copy: %w", err)
 		}
 		if err := readTarget(r, out, have[:length], off); err != nil {
-			return nil, err
+			return u, err
 		}
 		stats.Compared += length
 		if bytes.Equal(from[:length], have[:length]) {
 			stats.BlocksSame++
-		} else if err := writeDiff(r, out, off, have[:length], from[:length], writeGrain, stats); err != nil {
-			return nil, err
+		} else {
+			if err := writeDiff(r, out, off, have[:length], from[:length], writeGrain, stats); err != nil {
+				return u, err
+			}
+			u.written[i] = true
 		}
-		want[i] = h.Ref(from[:length])
+		u.want[i], u.known[i] = h.Ref(from[:length]), true
 		done += length
 		report(PhaseUpdating, done, m.DiskSize)
 	}
-	return want, nil
+	return u, nil
 }
 
 // writeGrain is the size of the pieces writeDiff compares and writes. It is
@@ -342,30 +433,108 @@ func writeDiff(r *repo.Repo, out *os.File, off int64, have, desired []byte, grai
 // checkTarget reads the target back after the update and compares each
 // block's hash with what was meant to be written. The page cache is
 // dropped first, where the system allows it, so the read comes from the
-// disk rather than memory.
-func checkTarget(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, want []extent.Ref, stats *RestoreStats, report func(Phase, int64, int64)) error {
+// disk rather than memory. A full check also computes the SHA-256 of the
+// whole disk as it goes; writtenOnly reads back only the blocks written.
+func checkTarget(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, u update, writtenOnly bool, stats *RestoreStats, report func(Phase, int64, int64)) error {
 	dropCache(out)
 	h := r.Hasher()
 	bs := int64(m.BlockSize)
 	buf := make([]byte, bs)
-	report(PhaseCheckingTarget, 0, m.DiskSize)
+	sum := sha256.New()
+	var overlays map[int][]manifest.Overlay
+	total := m.DiskSize
+	if writtenOnly {
+		total = 0
+		for i, w := range u.written {
+			if w {
+				total += min(bs, m.DiskSize-int64(i)*bs)
+			}
+		}
+	}
+	report(PhaseCheckingTarget, 0, total)
 	var done int64
-	for i := range want {
+	for i := range u.want {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if writtenOnly && !u.written[i] {
+			continue
 		}
 		off := int64(i) * bs
 		length := min(bs, m.DiskSize-off)
 		if err := readTarget(r, out, buf[:length], off); err != nil {
 			return err
 		}
-		if !h.Ref(buf[:length]).Equal(want[i]) {
-			return fmt.Errorf("check after restore: block %d (offset %d) doesn't hold what was written", i, off)
+		if !writtenOnly {
+			sum.Write(buf[:length])
+		}
+		if u.known[i] {
+			if !h.Ref(buf[:length]).Equal(u.want[i]) {
+				return fmt.Errorf("check after restore: block %d (offset %d) doesn't hold what was written", i, off)
+			}
+		} else {
+			if overlays == nil {
+				overlays = overlaysByBlock(m)
+			}
+			if err := checkByParts(ctx, r, m, overlays[i], i, buf[:length]); err != nil {
+				return err
+			}
 		}
 		done += length
-		report(PhaseCheckingTarget, done, m.DiskSize)
+		stats.CheckedBytes += length
+		report(PhaseCheckingTarget, done, total)
+	}
+	if !writtenOnly {
+		stats.SHA256 = hex.EncodeToString(sum.Sum(nil))
 	}
 	stats.Checked = true
+	return nil
+}
+
+// checkByParts checks block i, which has newer extents over it and was
+// skipped thanks to --base, so no hash of the whole block is known: each
+// newer extent must match its ref, and the rest must match the full's
+// block, which is fetched.
+func checkByParts(ctx context.Context, r *repo.Repo, m *manifest.Manifest, ovs []manifest.Overlay, i int, have []byte) error {
+	h := r.Hasher()
+	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
+	off := int64(i) * bs
+	length := int64(len(have))
+	covered := make([]bool, (length+es-1)/es)
+	for _, ov := range ovs {
+		eo := int64(ov.Index)*es - off
+		el := min(es, length-eo)
+		if eo < 0 || el <= 0 {
+			return fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
+		}
+		if !h.Ref(have[eo : eo+el]).Equal(ov.Ref) {
+			return fmt.Errorf("check after restore: extent %d (offset %d) doesn't hold what it should", ov.Index, off+eo)
+		}
+		covered[eo/es] = true
+	}
+	var full []byte
+	ref := m.Blocks[i]
+	for k, c := range covered {
+		if c {
+			continue
+		}
+		eo := int64(k) * es
+		el := min(es, length-eo)
+		if full == nil {
+			if ref.Zero {
+				full = make([]byte, length)
+			} else {
+				data, err := r.GetBlock(ctx, ref.Hash)
+				if err != nil {
+					return err
+				}
+				full = data
+			}
+		}
+		if int64(len(full)) < eo+el || !bytes.Equal(have[eo:eo+el], full[eo:eo+el]) {
+			return fmt.Errorf("check after restore: block %d (offset %d) doesn't hold what it should", i, off+eo)
+		}
+	}
 	return nil
 }
 
