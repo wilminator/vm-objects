@@ -10,7 +10,12 @@
 # every backup and check it is byte-identical to its snapshot.
 #
 #   scripts/zfs-waypoints.sh backup ZVOL WORKDIR [VMOBJ_BINARY]
+#   scripts/zfs-waypoints.sh add ZVOL@SNAPSHOT WORKDIR [VMOBJ_BINARY]
 #   scripts/zfs-waypoints.sh verify WORKDIR [VMOBJ_BINARY]
+#
+# "add" backs up one more snapshot, newer than the last one backed up, as
+# another incremental in an existing WORKDIR: for example a snapshot taken
+# just before moving the zvol with scripts/zfs-replay.sh.
 #
 # Run as root. ZVOL is a zvol with two or more snapshots, for example
 # tank/vms/win11; they are used oldest first. WORKDIR must not exist yet
@@ -31,7 +36,7 @@
 # restored identical.
 set -uo pipefail
 
-usage() { sed -n '12,13p' "$0" | sed 's/^# //' >&2; exit 2; }
+usage() { sed -n '12,14p' "$0" | sed 's/^# //' >&2; exit 2; }
 [ $# -ge 2 ] || usage
 cmd=$1; shift
 
@@ -63,6 +68,30 @@ backup() {
   echo "Backed up ${#snaps[@]} snapshots. Next: $0 verify $work"
 }
 
+add() {
+  local snapshot=$1 work=$2 vmobj=${3:-vmobj}
+  local zvol=${snapshot%@*} snap=${snapshot#*@}
+  local clone="$zvol-wp" dev="/dev/zvol/$zvol-wp"
+  set -e
+  [ "$zvol" != "$snapshot" ] || { echo "give ZVOL@SNAPSHOT" >&2; exit 1; }
+  [ -f "$work/hashes.txt" ] || { echo "$work isn't a waypoint work folder (no hashes.txt)" >&2; exit 1; }
+  ! grep -q "^$snap " "$work/hashes.txt" || { echo "$snap is already in $work/hashes.txt" >&2; exit 1; }
+  zfs list "$snapshot" >/dev/null || exit 1
+  ! zfs list "$clone" >/dev/null 2>&1 || { echo "$clone already exists; remove it first" >&2; exit 1; }
+  trap 'zfs destroy "$clone" 2>/dev/null || true' EXIT
+  echo "== $snap (incremental, after $(tail -n1 "$work/hashes.txt" | cut -d' ' -f1))"
+  zfs clone -o readonly=on "$snapshot" "$clone"
+  for _ in $(seq 30); do [ -e "$dev" ] && break; sleep 1; done
+  [ -e "$dev" ] || { echo "$dev never appeared" >&2; exit 1; }
+  local hash
+  hash=$(sha256sum "$dev" | cut -d' ' -f1)
+  "$vmobj" backup --repo "$work/repo" --key-file "$work/test.key" --source "$dev" --format raw \
+    --vm waypoints --type incremental --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
+  # Recorded only once the backup succeeded, so hashes.txt and the backups stay in step.
+  echo "$snap $hash" | tee -a "$work/hashes.txt"
+  zfs destroy "$clone"
+}
+
 verify() {
   local work=$1 vmobj=${2:-vmobj}
   local names want fail=0
@@ -89,6 +118,7 @@ verify() {
 
 case $cmd in
   backup) [ $# -ge 2 ] || usage; backup "$@" ;;
+  add) [ $# -ge 2 ] || usage; add "$@" ;;
   verify) verify "$@" ;;
   *) usage ;;
 esac

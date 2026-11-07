@@ -30,13 +30,18 @@ type RestoreOptions struct {
 	VM       string
 	Manifest string
 	Output   string // a raw image file, or a block device such as a zvol
-	Force    bool   // allow replacing an existing regular file
+	Force    bool   // allow replacing an existing regular file (rename mode)
+	Mode     Mode   // rename (default), copy or in-place; see ModeRename
+	Scratch  string // copy mode: folder for the temporary full restore (default: the target's folder)
+	Check    bool   // copy and in-place: read the target back afterwards and compare
 	// Progress, when set, is told what the restore is doing: once with
 	// PhaseChecking before the backup is checked, then with PhaseWriting
 	// as the disk is written (done and total count bytes of the disk), then,
 	// for an incremental or differential, with PhaseChanges as the newer
-	// extents are laid over it (bytes of those extents). In each writing
-	// phase done reaches total at the end.
+	// extents are laid over it (bytes of those extents). Copy and in-place
+	// modes then report PhaseUpdating as the target is compared (bytes of
+	// the disk), and PhaseCheckingTarget for --check. In each phase done
+	// reaches total at the end.
 	Progress func(phase Phase, done, total int64)
 }
 
@@ -44,17 +49,31 @@ type RestoreOptions struct {
 type Phase int
 
 const (
-	PhaseChecking Phase = iota // checking the backup is complete and readable
-	PhaseWriting               // writing the disk
-	PhaseChanges               // laying newer extents over it
+	PhaseChecking       Phase = iota // checking the backup is complete and readable
+	PhaseWriting                     // writing the disk
+	PhaseChanges                     // laying newer extents over it
+	PhaseUpdating                    // copy and in-place: comparing the target and writing what differs
+	PhaseCheckingTarget              // --check: reading the target back
 )
 
 // RestoreStats summarise a restore.
 type RestoreStats struct {
 	DiskBytes   int64
-	BlocksRead  int
-	ExtentsRead int
+	BlocksRead  int // blocks fetched from the repository
+	ExtentsRead int // newer extents fetched from the repository
 	ZeroBlocks  int
+
+	// Copy and in-place modes.
+	Compared      int64 // bytes of the target read and compared
+	Written       int64 // bytes written to the target
+	PiecesWritten int   // 4 KiB pieces written (the disk's last maybe shorter)
+	Writes        int   // write calls; neighbouring pieces go out together
+	BlocksSame    int   // blocks already right, left alone
+	ExtentsSame   int   // newer extents already in place, not fetched
+	Resized       bool  // a target file was resized to the disk's size
+	ResizedFrom   int64
+	TargetExtra   int64 // bytes of a block device past the disk, left as they were
+	Checked       bool  // --check read the target back and it matched
 }
 
 // ErrIncomplete means a restore point is missing pieces; nothing was written.
@@ -98,11 +117,24 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 		return nil, &NotReadyError{Readiness: rd}
 	}
 
+	stats := &RestoreStats{DiskBytes: m.DiskSize}
+	switch o.Mode {
+	case ModeCopy, ModeInPlace:
+		if err := restoreUpdate(ctx, o, m, stats, report); err != nil {
+			return nil, err
+		}
+		return stats, nil
+	case "", ModeRename:
+		if o.Check {
+			return nil, errors.New("--check works with --mode copy or in-place")
+		}
+	default:
+		return nil, fmt.Errorf("unknown restore mode %q", o.Mode)
+	}
 	t, err := openTarget(o.Output, m.DiskSize, o.Force)
 	if err != nil {
 		return nil, err
 	}
-	stats := &RestoreStats{DiskBytes: m.DiskSize}
 	if err := writeDisk(ctx, r, m, t.f, t.sparse, stats, report); err != nil {
 		t.abort()
 		return nil, err

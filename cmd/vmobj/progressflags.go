@@ -78,7 +78,9 @@ func withProgress(pc progress.Config, label string, src source.Source) (source.S
 // checking the backup, writing the disk and applying later changes
 // (naming the disk, if given), and progress while it writes. Call the
 // returned func when the restore ends.
-func restoreProgress(pc progress.Config, dest string) (func(target string, p engine.Phase, done, total int64), func()) {
+// restoreProgress shows a restore's phases. scratch, when set, names where
+// a copy-mode restore first writes the whole disk.
+func restoreProgress(pc progress.Config, dest, scratch string) (func(target string, p engine.Phase, done, total int64), func()) {
 	var (
 		mu      sync.Mutex
 		t       *progress.Task
@@ -103,6 +105,9 @@ func restoreProgress(pc progress.Config, dest string) (func(target string, p eng
 		if target != "" {
 			label = "disk " + target
 		}
+		if scratch != "" && (p == engine.PhaseWriting || p == engine.PhaseChanges) {
+			label = scratch
+		}
 		switch {
 		case p == engine.PhaseChecking:
 			finish()
@@ -112,10 +117,17 @@ func restoreProgress(pc progress.Config, dest string) (func(target string, p eng
 			finish()
 			phase, current = p, target
 			name := label
-			if p == engine.PhaseChanges {
+			switch p {
+			case engine.PhaseChanges:
 				name = label + " (later changes)"
 				say("Applying %s of later changes to %s...\n", units.Format(total), label)
-			} else {
+			case engine.PhaseUpdating:
+				name = label + " (compare)"
+				say("Comparing %s of %s and writing only what differs...\n", units.Format(total), label)
+			case engine.PhaseCheckingTarget:
+				name = label + " (check)"
+				say("Reading %s back to check it...\n", label)
+			default:
 				say("Writing %s to %s...\n", units.Format(total), label)
 			}
 			t = pc.Start(name, total)

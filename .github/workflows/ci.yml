@@ -58,6 +58,9 @@ jobs:
       - name: The VM validation script, on a stand-in VM
         run: scripts/validate-vm-selftest.sh bin/vmobj
 
+      - name: Restore modes (copy, in-place; a loop device for the block path)
+        run: scripts/restore-modes-e2e.sh bin/vmobj
+
       - name: Failure-safety tests (damage, kills, stops, a full disk)
         run: scripts/hardening.sh bin/vmobj corrupt-block corrupt-pack corrupt-manifest missing-block kill-full kill-incremental stop-backup stop-copy quit-copy long-chain install diskfull
 
@@ -120,6 +123,9 @@ jobs:
         run: |
           make build
           sudo scripts/zfs-e2e.sh vmobjci bin/vmobj
+      - name: "Rebuild a zvol's snapshots with zfs-replay.sh"
+        if: steps.zfs.outputs.ok == 'true'
+        run: sudo scripts/zfs-replay-e2e.sh vmobjci bin/vmobj
 
   # The same checks against a real S3 API. MinIO runs in a throwaway
   # container on the runner; the credentials below exist only inside it.

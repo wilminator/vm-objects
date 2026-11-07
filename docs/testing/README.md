@@ -19,6 +19,7 @@ git clone https://github.com/wilminator/vm-objects.git ~/vm-objects && cd ~/vm-o
 | Copy and `--copy-to` | [m6-copy.md](m6-copy.md) | Passed on the QNAP: restore from the copy identical; a repeat copy sends nothing |
 | Failure safety | [hardening.md](hardening.md) | `scripts/hardening.sh` passes, and runs in CI; still to run on the NAS |
 | A real VM, end to end | [hardening.md](hardening.md#a-real-vm-scriptsvalidate-vmsh) | `scripts/validate-vm.sh`; its self-test runs in CI. Still to run on TrueNAS |
+| Block-level restore (`--mode copy`, `in-place`) | [m7-block-restore.md](m7-block-restore.md) | Unit tests and `restore-modes-e2e.sh` (loop device included) pass in CI, `zfs-replay-e2e.sh` in CI's ZFS job. To do: the WinGames move on TrueNAS |
 | S3 backend | [m1-s3-backend.md](m1-s3-backend.md) | CI only (MinIO). To do: QuObjects, then AWS |
 | Storage classes | [m2-storage-classes.md](m2-storage-classes.md) | CI only. To do: AWS archive restore |
 | Object Lock and prune | [m3-object-lock.md](m3-object-lock.md) | CI only. To do: QuObjects, then AWS |

@@ -512,7 +512,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 	vm := fs.String("vm", "", "VM name")
 	name := fs.String("manifest", "", "manifest to restore (see vmobj list)")
 	out := fs.String("output", "", "raw image file or block device to write")
-	force := fs.Bool("force", false, "replace an existing output file")
+	force := fs.Bool("force", false, "replace an existing output file (rename mode)")
+	modeFlag := fs.String("mode", "rename", "rename: write a new file and rename it into place; copy: restore to scratch space, then update the existing target, writing only what differs; in-place: update the existing target directly, fetching and writing only what differs")
+	scratch := fs.String("scratch", "", "copy mode: folder for the temporary full restore (default: the target's folder)")
+	check := fs.Bool("check", false, "copy and in-place: read the target back afterwards and compare it")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
@@ -531,13 +534,34 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	mode, err := engine.ParseMode(*modeFlag)
+	if err != nil {
+		return err
+	}
+	if *scratch != "" && mode != engine.ModeCopy {
+		return errors.New("restore: --scratch only applies to --mode copy")
+	}
+	if *check && mode == engine.ModeRename {
+		return errors.New("restore: --check works with --mode copy or in-place")
+	}
+	if mode != engine.ModeRename && *force {
+		return errors.New("restore: --force only applies to --mode rename; copy and in-place always update the existing target")
+	}
 	r, err := openRepo(ctx, *dir, *keyFile)
 	if err != nil {
 		return err
 	}
 	start := time.Now()
-	report, stopReport := restoreProgress(pc, *out)
+	scratchLabel := ""
+	if mode == engine.ModeCopy {
+		scratchLabel = "a scratch copy"
+	}
+	if mode == engine.ModeInPlace {
+		fmt.Fprintf(os.Stderr, "In-place restore: %s is changed as the restore runs. If it stops part-way, the target is part old, part new; run the same command again to finish it.\n", *out)
+	}
+	report, stopReport := restoreProgress(pc, *out, scratchLabel)
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
+		Mode: mode, Scratch: *scratch, Check: *check,
 		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
 	stopReport()
 	var nr *engine.NotReadyError
@@ -547,9 +571,33 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Restored %s to %s in %s: %d blocks, %d newer extents, %d zero blocks.\n",
-		units.Format(st.DiskBytes), *out, time.Since(start).Round(time.Second), st.BlocksRead, st.ExtentsRead, st.ZeroBlocks)
+	took := time.Since(start).Round(time.Second)
+	if mode == engine.ModeRename {
+		fmt.Printf("Restored %s to %s in %s: %d blocks, %d newer extents, %d zero blocks.\n",
+			units.Format(st.DiskBytes), *out, took, st.BlocksRead, st.ExtentsRead, st.ZeroBlocks)
+		return nil
+	}
+	printUpdateSummary(*out, mode, st, took)
 	return nil
+}
+
+// printUpdateSummary reports a copy or in-place restore.
+func printUpdateSummary(out string, mode engine.Mode, st *engine.RestoreStats, took time.Duration) {
+	fmt.Printf("Updated %s (%s, %s) in %s.\n", out, mode, units.Format(st.DiskBytes), took)
+	fmt.Printf("  Compared:  %s; %d blocks were already right\n", units.Format(st.Compared), st.BlocksSame)
+	fmt.Printf("  Written:   %s (%d pieces of 4 KiB, in %d writes)\n", units.Format(st.Written), st.PiecesWritten, st.Writes)
+	if mode == engine.ModeInPlace {
+		fmt.Printf("  Fetched:   %d blocks and %d newer extents (%d newer extents were already in place)\n", st.BlocksRead, st.ExtentsRead, st.ExtentsSame)
+	}
+	if st.Resized {
+		fmt.Printf("  Resized:   the file was %s; now %s\n", units.Format(st.ResizedFrom), units.Format(st.DiskBytes))
+	}
+	if st.TargetExtra > 0 {
+		fmt.Printf("  Note:      the device is %s larger than the disk; that part was left as it was\n", units.Format(st.TargetExtra))
+	}
+	if st.Checked {
+		fmt.Println("  Checked:   read back, every block matches")
+	}
 }
 
 func cmdVerify(ctx context.Context, args []string) error {
@@ -884,7 +932,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	report, stopReport := restoreProgress(pc, *to)
+	report, stopReport := restoreProgress(pc, *to, "")
 	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
 	stopReport()
 	var nr *engine.NotReadyError
