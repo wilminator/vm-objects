@@ -355,3 +355,23 @@ func (r *Repo) ListVMs(ctx context.Context) ([]string, error) {
 	}
 	return vms, nil
 }
+
+// GetSealedBlock returns a block's stored (encrypted) bytes after checking
+// they decrypt to content with hash h. Copying between repositories that
+// share a key moves these bytes as they are.
+func (r *Repo) GetSealedBlock(ctx context.Context, h extent.Hash) ([]byte, error) {
+	sealed, err := r.Backend.Get(ctx, BlockKey(h))
+	if err != nil {
+		return nil, fmt.Errorf("block %s: %w", h, err)
+	}
+	if _, err := r.openContent(h, sealed); err != nil {
+		return nil, err
+	}
+	return sealed, nil
+}
+
+// PutSealedBlock stores bytes from GetSealedBlock of a repository with the
+// same key. The caller must have checked the keys match.
+func (r *Repo) PutSealedBlock(ctx context.Context, h extent.Hash, sealed []byte, opts store.PutOptions) error {
+	return store.PutWith(ctx, r.Backend, BlockKey(h), sealed, opts)
+}

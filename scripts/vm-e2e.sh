@@ -51,7 +51,8 @@ step() { printf '\n== %s\n' "$*"; }
 step "full whole-VM backup"
 "$vmobj" key init --key-file k
 "$vmobj" init --repo repo --key-file k --block-size 1MiB
-"$vmobj" backup-vm --repo repo --key-file k --domain e2e --type full --virsh ./virsh --swtpm-dir swtpm --state-dir st
+"$vmobj" init --repo copy --key-file k --block-size 1MiB
+"$vmobj" backup-vm --repo repo --key-file k --domain e2e --type full --virsh ./virsh --swtpm-dir swtpm --state-dir st --copy-to copy
 qemu-img convert -O raw vda.qcow2 want-vda-full.raw
 cp vdb.img want-vdb-full.raw
 
@@ -75,6 +76,12 @@ for rec in "${recs[@]}"; do
   grep -q "<source file='/nonexistent.iso'/>" "out-$w/e2e.xml" # the CD-ROM is untouched
   echo "OK: $rec restores disks, NVRAM, TPM and definition"
 done
+
+step "restore the full from the --copy-to copy"
+"$vmobj" restore-vm --repo copy --key-file k --vm e2e --record "${recs[0]}" --to out-from-copy
+cmp want-vda-full.raw out-from-copy/e2e-vda.raw
+cmp "swtpm/$uuid/tpm2/tpm2-00.permall" out-from-copy/tpm/tpm2/tpm2-00.permall
+echo "OK: the copy restores the whole VM"
 
 step "restore under a new name"
 "$vmobj" restore-vm --repo repo --key-file k --vm e2e --record "${recs[0]}" --to out-copy --new-name e2e-copy
