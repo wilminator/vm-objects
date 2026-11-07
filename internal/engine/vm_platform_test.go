@@ -58,8 +58,8 @@ func TestTrueNASBackupRestoresForEachTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.NVRAMFiles != 1 || st.TPMFiles != 1 {
-		t.Fatalf("backed up %d NVRAM and %d TPM files", st.NVRAMFiles, st.TPMFiles)
+	if st.NVRAMFiles != 1 || st.TPMFiles != 1 || len(st.ConfigFiles) != 1 || st.ConfigFiles[0] != platform.TrueNASConfigFile || st.Files != 3 {
+		t.Fatalf("backed up %d NVRAM, %d TPM and settings files %v (%d in all)", st.NVRAMFiles, st.TPMFiles, st.ConfigFiles, st.Files)
 	}
 	rec, err := h.repo.GetVMRecord(h.ctx, "Games", st.Record)
 	if err != nil {

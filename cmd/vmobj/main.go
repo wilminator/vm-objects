@@ -880,7 +880,11 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		d := st.Disks[t]
 		fmt.Printf("  %-6s %s, %s written\n", t, d.Manifest, units.Format(d.BytesWritten))
 	}
-	fmt.Printf("Files:     %s (inside the record)\n", describeVMFiles(st.NVRAMFiles, st.TPMFiles))
+	files := describeVMFiles(st.NVRAMFiles, st.TPMFiles)
+	for _, c := range st.ConfigFiles {
+		files += ", settings " + c
+	}
+	fmt.Printf("Files:     %s (inside the record)\n", files)
 	for _, s := range st.Skipped {
 		fmt.Printf("Skipped:   %s\n", s)
 	}

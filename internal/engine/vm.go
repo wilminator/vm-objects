@@ -72,9 +72,10 @@ type BackupVMStats struct {
 	Record      string
 	Consistency string
 	Disks       map[string]*BackupStats // by target
-	Files       int                     // NVRAMFiles + TPMFiles
+	Files       int                     // every file kept with the record
 	NVRAMFiles  int
 	TPMFiles    int
+	ConfigFiles []string // names of platform settings files, such as truenas-vm.json
 	Skipped     []string
 }
 
@@ -234,6 +235,8 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 			stats.NVRAMFiles++
 		case "tpm":
 			stats.TPMFiles++
+		case "config":
+			stats.ConfigFiles = append(stats.ConfigFiles, f.Name)
 		}
 	}
 	return stats, nil
