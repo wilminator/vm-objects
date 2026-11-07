@@ -10,8 +10,11 @@
 package manifest
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wilminator/vm-objects/internal/extent"
@@ -71,6 +74,51 @@ type Manifest struct {
 // NewName builds a sortable manifest name such as "20261030T202000Z-full".
 func NewName(t time.Time, k Kind) string {
 	return t.UTC().Format("20060102T150405Z") + "-" + string(k)
+}
+
+// CompareNames orders manifest names oldest first. Names sort by their
+// timestamp, then by the -2, -3... suffix a backup gets when another of the
+// same VM and kind started in the same second, then by kind. Plain text
+// order gets the suffixes wrong: "…-incremental-2" sorts before
+// "…-incremental", and "-10" before "-2". Names that don't follow the
+// pattern sort after the ones that do, by plain text.
+func CompareNames(a, b string) int {
+	sa, ka, na, oka := splitName(a)
+	sb, kb, nb, okb := splitName(b)
+	switch {
+	case oka && okb:
+		if c := cmp.Compare(sa, sb); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(na, nb); c != 0 {
+			return c
+		}
+		return cmp.Compare(ka, kb)
+	case oka:
+		return -1
+	case okb:
+		return 1
+	}
+	return cmp.Compare(a, b)
+}
+
+// splitName takes "20261030T202000Z-incremental-3" apart into its stamp,
+// its kind and its sequence number (1 when there is no suffix).
+func splitName(n string) (stamp, kind string, seq int, ok bool) {
+	const width = len("20060102T150405Z")
+	if len(n) < width+2 || n[width] != '-' {
+		return "", "", 0, false
+	}
+	if _, err := time.Parse("20060102T150405Z", n[:width]); err != nil {
+		return "", "", 0, false
+	}
+	stamp, kind, seq = n[:width], n[width+1:], 1
+	if i := strings.LastIndexByte(kind, '-'); i > 0 {
+		if v, err := strconv.Atoi(kind[i+1:]); err == nil && v > 1 {
+			kind, seq = kind[:i], v
+		}
+	}
+	return stamp, kind, seq, true
 }
 
 var vmName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
