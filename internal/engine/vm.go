@@ -506,13 +506,23 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 	case "qnap":
 		b.WriteString("To run it in QNAP Virtualization Station (which manages its own VMs, so\n")
 		b.WriteString("nothing is defined from here):\n\n")
-		b.WriteString("1. In Virtualization Station, create a VM with UEFI firmware")
+		// Virtualization Station's disk picker lists only qcow2 images, so
+		// each raw disk is converted first, with QNAP's own qemu-img.
+		b.WriteString("1. Convert each restored disk to qcow2: Virtualization Station's disk\n")
+		b.WriteString("   picker lists only .qcow2 files. Use QNAP's own qemu-img:\n\n")
+		for _, t := range disks {
+			raw := st.Disks[t]
+			fmt.Fprintf(&b, "     LD_LIBRARY_PATH=%s %s convert -p -f raw -O qcow2 %s %s\n", platform.QNAPLibDir, platform.QNAPQemuImg, raw, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
+		}
+		b.WriteString("\n   Keep the .img until the VM runs: it is the copy checked against the backup.\n\n")
+		b.WriteString("2. In Virtualization Station, create a VM with UEFI firmware")
 		if tpm {
 			b.WriteString(" and a TPM 2.0 device")
 		}
-		b.WriteString(",\n   and give it the restored disks as its disk images:\n\n")
+		b.WriteString(",\n   and give it the converted disks as its disk images:\n\n")
 		for _, t := range disks {
-			fmt.Fprintf(&b, "     %s  %s\n", t, st.Disks[t])
+			raw := st.Disks[t]
+			fmt.Fprintf(&b, "     %s  %s\n", t, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
 		}
 		b.WriteString("\n   Use the original's settings (CPU, memory, firmware) from the definition\n")
 		fmt.Fprintf(&b, "   %s", filepath.Base(st.Definition))
@@ -521,7 +531,7 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 		}
 		b.WriteString(". Don't start it yet.\n\n")
 		if tpm {
-			b.WriteString("2. Find the new VM's UUID, then put the TPM state where QNAP keeps it:\n\n")
+			b.WriteString("3. Find the new VM's UUID, then put the TPM state where QNAP keeps it:\n\n")
 			fmt.Fprintf(&b, "     %s list --all --uuid\n", platform.QNAPVirsh)
 			fmt.Fprintf(&b, "     mkdir -p %s\n", tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
 			fmt.Fprintf(&b, "     cp -a %s/. %s/\n\n", filepath.Join(dir, "tpm"), tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
@@ -533,7 +543,7 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 			}
 		}
 		if nvram != "" {
-			b.WriteString("3. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
+			b.WriteString("4. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
 			b.WriteString("   over the new VM's while it is stopped. Its path is the <nvram> line of\n")
 			fmt.Fprintf(&b, "   `%s dumpxml <UUID>`:\n\n", platform.QNAPVirsh)
 			fmt.Fprintf(&b, "     cp %s <that path>\n\n", nvram)

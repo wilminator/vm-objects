@@ -106,7 +106,7 @@ func TestTrueNASBackupRestoresForEachTarget(t *testing.T) {
 			switch target {
 			case "qnap":
 				// QNAP's layout wants the flat TrueNAS files in tpm2/.
-				if !strings.Contains(n, platform.QNAPSwtpmDir+"/<UUID>/tpm2") || !strings.Contains(n, "activation") || !strings.Contains(n, "-vda.img") {
+				if !strings.Contains(n, platform.QNAPSwtpmDir+"/<UUID>/tpm2") || !strings.Contains(n, "activation") || !strings.Contains(n, "-vda.img") || !strings.Contains(n, "-O qcow2") || !strings.Contains(n, "-vda.qcow2") {
 					t.Fatalf("qnap notes:\n%s", n)
 				}
 			case "truenas":

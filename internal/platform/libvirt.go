@@ -26,6 +26,9 @@ const DefaultSwtpmDir = "/var/lib/libvirt/swtpm"
 const (
 	QNAPVirsh    = "/QVS/usr/bin/virsh"
 	QNAPSwtpmDir = "/QVS/var/lib/libvirt/swtpm"
+	// QNAPQemuImg needs LD_LIBRARY_PATH=QNAPLibDir to find its libraries.
+	QNAPQemuImg = "/QVS/usr/bin/qemu-img"
+	QNAPLibDir  = "/QVS/usr/lib"
 )
 
 // LibvirtConfig says where one libvirt installation keeps its pieces. The

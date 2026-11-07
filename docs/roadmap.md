@@ -17,6 +17,9 @@ what has been tested and how.
 
 ## Later
 
+- **qcow2 output for restores**, so a restore for QNAP Virtualization
+  Station (whose disk picker lists only .qcow2) needs no conversion step.
+
 - **VMware and Nutanix modules**, on the M8 interface. VMware's changed
   block tracking would plug in as a faster way to find what changed; the
   repository format stays the same.
