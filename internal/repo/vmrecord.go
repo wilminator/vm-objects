@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -70,7 +71,7 @@ func (r *Repo) ListVMRecords(ctx context.Context, vm string) ([]string, error) {
 			names = append(names, n)
 		}
 	}
-	sort.Strings(names)
+	slices.SortStableFunc(names, manifest.CompareNames)
 	return names, nil
 }
 

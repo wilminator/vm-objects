@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -377,6 +378,9 @@ func (r *Repo) ListManifests(ctx context.Context, vm string) ([]string, error) {
 			names = append(names, strings.TrimSuffix(strings.TrimPrefix(k, prefix), ".manifest"))
 		}
 	}
+	// Storage lists keys in plain text order, which puts "…-incremental-2"
+	// before "…-incremental" (the ".manifest" ending sorts after "-").
+	slices.SortStableFunc(names, manifest.CompareNames)
 	return names, nil
 }
 

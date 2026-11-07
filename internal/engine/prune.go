@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -128,7 +129,7 @@ func Prune(ctx context.Context, o PruneOptions) (*PruneReport, error) {
 		if err != nil {
 			return nil, err
 		}
-		sort.Strings(names) // names start with a UTC timestamp: oldest first
+		slices.SortStableFunc(names, manifest.CompareNames) // oldest first
 		for i, name := range names {
 			m, err := r.GetManifest(ctx, vm, name)
 			if err != nil {
