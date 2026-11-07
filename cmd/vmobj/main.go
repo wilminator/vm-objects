@@ -48,8 +48,8 @@ Usage:
                     [--profile NAME] [--class CLASS] [--copy-to REPO ...]
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
-                    [--mode rename|copy|in-place] [--scratch DIR] [--check [--check-written | --expect-sha256 HEX]]
-                    [--base NAME]
+                    [--mode rename|copy|in-place|staged] [--scratch DIR] [--journal PATH]
+                    [--check [--check-written]] [--expect-sha256 HEX] [--base NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
                     [--vm NAME] [--profile NAME] [--quiesce] [--virsh PATH] [--connect URI] [--swtpm-dir DIR]
@@ -516,10 +516,11 @@ func cmdRestore(ctx context.Context, args []string) error {
 	name := fs.String("manifest", "", "manifest to restore (see vmobj list)")
 	out := fs.String("output", "", "raw image file or block device to write")
 	force := fs.Bool("force", false, "replace an existing output file (rename mode)")
-	modeFlag := fs.String("mode", "rename", "rename: write a new file and rename it into place; copy: restore to scratch space, then update the existing target, writing only what differs; in-place: update the existing target directly, fetching and writing only what differs")
+	modeFlag := fs.String("mode", "rename", "rename: write a new file and rename it into place; copy: restore to scratch space, then update the existing target, writing only what differs; in-place: update the existing target directly, fetching and writing only what differs; staged: like in-place, but the changes wait in a journal until the whole result is checked, and only then go into the target")
+	journal := fs.String("journal", "", "staged: the journal file (default: next to a file target, as NAME.vmobj-journal; a block device needs one, on another filesystem)")
 	scratch := fs.String("scratch", "", "copy mode: folder for the temporary full restore (default: the target's folder)")
 	check := fs.Bool("check", false, "copy and in-place: read the target back afterwards and compare it; also prints the whole disk's SHA-256")
-	base := fs.String("base", "", "in-place: a backup the target already holds (e.g. the previous step of a replay, just checked); blocks the same in both are skipped without reading the target")
+	base := fs.String("base", "", "in-place or staged: a backup the target already holds (e.g. the previous step of a replay, just checked); blocks the same in both are skipped without reading the target")
 	checkWritten := fs.Bool("check-written", false, "with --check: read back only the blocks this restore wrote (faster; no SHA-256)")
 	expectSHA := fs.String("expect-sha256", "", "with a full --check: fail unless the restored disk's SHA-256 is this")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
@@ -550,13 +551,19 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if *check && mode == engine.ModeRename {
 		return errors.New("restore: --check works with --mode copy or in-place")
 	}
-	if *base != "" && mode != engine.ModeInPlace {
-		return errors.New("restore: --base works with --mode in-place")
+	if *base != "" && mode != engine.ModeInPlace && mode != engine.ModeStaged {
+		return errors.New("restore: --base works with --mode in-place or staged")
+	}
+	if *journal != "" && mode != engine.ModeStaged {
+		return errors.New("restore: --journal only applies to --mode staged")
+	}
+	if mode == engine.ModeStaged && *checkWritten {
+		return errors.New("restore: staged mode always checks the whole result; --check-written doesn't apply")
 	}
 	if *checkWritten && !*check {
 		return errors.New("restore: --check-written needs --check")
 	}
-	if *expectSHA != "" && (!*check || *checkWritten) {
+	if *expectSHA != "" && mode != engine.ModeStaged && (!*check || *checkWritten) {
 		return errors.New("restore: --expect-sha256 needs --check (without --check-written)")
 	}
 	if mode != engine.ModeRename && *force {
@@ -576,7 +583,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	report, stopReport := restoreProgress(pc, *out, scratchLabel)
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
-		Mode: mode, Scratch: *scratch, Check: *check, Base: *base, CheckWritten: *checkWritten, ExpectSHA256: *expectSHA,
+		Mode: mode, Scratch: *scratch, Check: *check, Base: *base, CheckWritten: *checkWritten, ExpectSHA256: *expectSHA, Journal: *journal,
 		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
 	stopReport()
 	var nr *engine.NotReadyError
@@ -592,8 +599,38 @@ func cmdRestore(ctx context.Context, args []string) error {
 			units.Format(st.DiskBytes), *out, took, st.BlocksRead, st.ExtentsRead, st.ZeroBlocks)
 		return nil
 	}
+	if mode == engine.ModeStaged {
+		printStagedSummary(*out, st, took)
+		return nil
+	}
 	printUpdateSummary(*out, mode, st, took)
 	return nil
+}
+
+// printStagedSummary reports a staged restore.
+func printStagedSummary(out string, st *engine.RestoreStats, took time.Duration) {
+	if st.Finished {
+		fmt.Printf("Finished an interrupted staged restore of %s (%s) in %s.\n", out, units.Format(st.DiskBytes), took)
+		fmt.Printf("  Applied:   %s from the journal; read back, it matches\n", units.Format(st.Applied))
+		fmt.Printf("  SHA-256:   %s (checked before applying)\n", st.SHA256)
+		return
+	}
+	fmt.Printf("Updated %s (staged, %s) in %s.\n", out, units.Format(st.DiskBytes), took)
+	if st.Discarded {
+		fmt.Println("  Note:      an unfinished journal from an earlier run was discarded (it was never applied)")
+	}
+	if st.BlocksSkipped > 0 {
+		fmt.Printf("  Skipped:   %s (%d blocks the same in --base, not compared)\n", units.Format(st.SkippedBytes), st.BlocksSkipped)
+	}
+	fmt.Printf("  Compared:  %s; %d blocks were already right\n", units.Format(st.Compared), st.BlocksSame)
+	fmt.Printf("  Journal:   %s of changes (%s on disk), %d pieces of 4 KiB\n", units.Format(st.JournalBytes), units.Format(st.JournalFile), st.PiecesWritten)
+	if st.Repaired > 0 {
+		fmt.Printf("  Repaired:  %d blocks didn't hold what --base said; fetched whole before anything was written\n", st.Repaired)
+	}
+	fmt.Printf("  Checked:   every block of the result, before writing\n")
+	fmt.Printf("  SHA-256:   %s\n", st.SHA256)
+	fmt.Printf("  Applied:   %s in %d writes; read back, it matches\n", units.Format(st.Applied), st.Writes)
+	fmt.Printf("  Fetched:   %d blocks and %d newer extents\n", st.BlocksRead, st.ExtentsRead)
 }
 
 // printUpdateSummary reports a copy or in-place restore.

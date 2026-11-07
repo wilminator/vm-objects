@@ -22,7 +22,7 @@ vmobj=$(realpath "${2:-$(command -v vmobj)}")
 here=$(cd "$(dirname "$0")" && pwd)
 src="$parent/replay-src" dst="$parent/replay-dst"
 work=$(mktemp -d)
-cleanup() { for d in "$src" "$dst" "$dst-end"; do zfs destroy -r "$d" 2>/dev/null || true; done; rm -rf "$work"; }
+cleanup() { for d in "$src" "$dst" "$dst-end" "$dst-staged"; do zfs destroy -r "$d" 2>/dev/null || true; done; rm -rf "$work"; }
 trap cleanup EXIT
 step() { printf '\n== %s\n' "$*"; }
 settle() { command -v udevadm >/dev/null && udevadm settle 2>/dev/null; true; }
@@ -73,6 +73,14 @@ for s in first second third fourth; do
   zfs list "$dst-end@$s" >/dev/null || { echo "FAIL: --verify end lost @$s"; exit 1; }
 done
 echo "   ok: all four snapshots, the last one checked whole"
+zfs destroy -r "$dst-end"   # room for the next replay on a small test pool
+
+step "replay again, staged"
+mkdir -p "$work/journal"
+"$here/zfs-replay.sh" --work "$work/wp" --zvol "$dst-staged" --like "$src" --vmobj "$vmobj" --staged "$work/journal"
+[ -z "$(ls -A "$work/journal")" ] || { echo "FAIL: a journal was left behind"; exit 1; }
+echo "   ok: four snapshots, no journal left"
+zfs destroy -r "$dst-staged"
 
 step "resume skips what's done"
 "$here/zfs-replay.sh" --work "$work/wp" --zvol "$dst" --like "$src" --vmobj "$vmobj" --resume | grep -c "already there, skipped" | grep -qx 4 \

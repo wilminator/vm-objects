@@ -421,3 +421,15 @@ func (r *Repo) GetSealedBlock(ctx context.Context, h extent.Hash) ([]byte, error
 func (r *Repo) PutSealedBlock(ctx context.Context, h extent.Hash, sealed []byte, opts store.PutOptions) error {
 	return r.put(ctx, BlockKey(h), sealed, opts)
 }
+
+// SealLocal encrypts (and compresses) data kept outside the repository
+// with the repository's key, such as a restore journal. label binds it to
+// its place: Open fails if the sealed bytes are moved or swapped.
+func (r *Repo) SealLocal(label string, data []byte) ([]byte, error) {
+	return r.sealer.Seal([]byte("local/"+label), data)
+}
+
+// OpenLocal reverses SealLocal.
+func (r *Repo) OpenLocal(label string, sealed []byte) ([]byte, error) {
+	return r.sealer.Open([]byte("local/"+label), sealed)
+}

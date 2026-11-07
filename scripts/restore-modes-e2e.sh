@@ -85,6 +85,23 @@ out=$(restore --manifest "${names[3]}" --output target.raw --mode in-place --che
   && fail "--expect-sha256 with the wrong hash was accepted"
 echo "   a wrong --expect-sha256 is refused"
 
+step "staged: the target is untouched until the result is proven"
+restore --manifest "${names[0]}" --output target.raw --mode in-place >/dev/null 2>&1
+before=$(sha256sum target.raw | cut -d' ' -f1)
+restore --manifest "${names[1]}" --output target.raw --mode staged --expect-sha256 "$before" >/dev/null 2>&1 \
+  && fail "staged with the wrong --expect-sha256 was accepted"
+[ "$(sha256sum target.raw | cut -d' ' -f1)" = "$before" ] || fail "a refused staged restore changed the target"
+[ ! -e target.raw.vmobj-journal ] || fail "a refused staged restore left its journal"
+echo "   a refused staged restore leaves the target as it was, and no journal"
+for i in 1 2 3; do
+  want=$(sha256sum "want-$i.raw" | cut -d' ' -f1)
+  out=$(restore --manifest "${names[$i]}" --output target.raw --mode staged --base "${names[$((i - 1))]}" --expect-sha256 "$want" 2>&1) \
+    || { echo "$out"; fail "staged step to backup $i"; }
+  cmp -s "want-$i.raw" target.raw || fail "after the staged step to backup $i the target differs"
+  [ ! -e target.raw.vmobj-journal ] || fail "the journal was left behind"
+  echo "   -> backup $i: journal $(sed -n 's/^  Journal: *\([0-9.]* [KMG]\?i\?B\).*/\1/p' <<<"$out"); applied and read back"
+done
+
 step "copy mode keeps the file and writes only what differs"
 restore --manifest "${names[0]}" --output target.raw --mode in-place >/dev/null
 ino=$(stat -c %i target.raw)
@@ -108,6 +125,12 @@ if [ -z "$sudo" ] || sudo -n true 2>/dev/null; then
   echo "   $loop"
   restore() { $sudo "$vmobj" restore --repo repo --key-file k --vm d --progress none "$@"; }
   check_steps "$loop" "$sudo"
+  step "staged on the block device, journal in the temporary folder"
+  out=$(restore --manifest "${names[2]}" --output "$loop" --mode staged --journal "$w/dev.journal" --base "${names[0]}" --expect-sha256 "$(sha256sum want-2.raw | cut -d' ' -f1)" 2>&1) \
+    || { echo "$out"; fail "staged onto the loop device"; }
+  $sudo cmp -s want-2.raw "$loop" || fail "the device differs after the staged restore"
+  [ ! -e "$w/dev.journal" ] || fail "the device journal was left behind"
+  echo "   ok"
 else
   echo; echo "(skipping the block device test: needs root or sudo)"
 fi

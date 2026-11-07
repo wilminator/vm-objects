@@ -44,6 +44,12 @@ const (
 	// block, hashes it, and fetches and writes only what differs. It needs
 	// no scratch space and downloads the least.
 	ModeInPlace Mode = "in-place"
+	// ModeStaged leaves the existing target untouched until the result is
+	// proven: it reads the target, writes only the changes to a journal,
+	// checks every block of the target-plus-journal against the backup,
+	// and only then applies the journal. Interrupted while applying, the
+	// same command finishes the job from the journal.
+	ModeStaged Mode = "staged"
 )
 
 // ParseMode checks a --mode value.
@@ -51,10 +57,10 @@ func ParseMode(s string) (Mode, error) {
 	switch m := Mode(s); m {
 	case "", ModeRename:
 		return ModeRename, nil
-	case ModeCopy, ModeInPlace:
+	case ModeCopy, ModeInPlace, ModeStaged:
 		return m, nil
 	}
-	return "", fmt.Errorf("unknown restore mode %q: use rename, copy or in-place", s)
+	return "", fmt.Errorf("unknown restore mode %q: use rename, copy, in-place or staged", s)
 }
 
 // existingTarget opens a target that copy and in-place modes update. It
@@ -104,11 +110,32 @@ func existingTarget(path string, size int64, stats *RestoreStats) (*os.File, err
 	return nil, fmt.Errorf("%s is neither a file nor a block device", path)
 }
 
-// restoreUpdate runs a copy or in-place restore, after the backup has been
-// checked complete and readable.
+// loadBase reads --base, when given, and checks it fits m.
+func loadBase(ctx context.Context, o RestoreOptions, m *manifest.Manifest) (*manifest.Manifest, error) {
+	if o.Base == "" {
+		return nil, nil
+	}
+	if o.Mode != ModeInPlace && o.Mode != ModeStaged {
+		return nil, errors.New("--base works with --mode in-place or staged")
+	}
+	base, err := o.Repo.GetManifest(ctx, o.VM, o.Base)
+	if err != nil {
+		return nil, fmt.Errorf("--base: %w", err)
+	}
+	if base.DiskSize != m.DiskSize || base.BlockSize != m.BlockSize || base.ExtentSize != m.ExtentSize {
+		return nil, fmt.Errorf("--base %s doesn't fit: its disk, block or extent size differs from %s's", o.Base, o.Manifest)
+	}
+	return base, nil
+}
+
+// restoreUpdate runs a copy, in-place or staged restore, after the backup
+// has been checked complete and readable.
 func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, stats *RestoreStats, report func(Phase, int64, int64)) error {
 	if m.ExtentSize <= 0 || m.BlockSize%m.ExtentSize != 0 {
 		return fmt.Errorf("block size %d is not a multiple of extent size %d", m.BlockSize, m.ExtentSize)
+	}
+	if o.Mode == ModeStaged {
+		return restoreStaged(ctx, o, m, stats, report)
 	}
 	var (
 		src *os.File // copy mode: the complete restore in scratch space
@@ -139,17 +166,9 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 			return err
 		}
 	}
-	var base *manifest.Manifest
-	if o.Base != "" {
-		if o.Mode != ModeInPlace {
-			return errors.New("--base works with --mode in-place")
-		}
-		if base, err = o.Repo.GetManifest(ctx, o.VM, o.Base); err != nil {
-			return fmt.Errorf("--base: %w", err)
-		}
-		if base.DiskSize != m.DiskSize || base.BlockSize != m.BlockSize || base.ExtentSize != m.ExtentSize {
-			return fmt.Errorf("--base %s doesn't fit: its disk, block or extent size differs from %s's", o.Base, o.Manifest)
-		}
+	base, err := loadBase(ctx, o, m)
+	if err != nil {
+		return err
 	}
 	if o.CheckWritten && !o.Check {
 		return errors.New("--check-written needs --check")
@@ -166,7 +185,7 @@ func restoreUpdate(ctx context.Context, o RestoreOptions, m *manifest.Manifest, 
 	if o.Mode == ModeCopy {
 		u, err = copyChanged(ctx, o.Repo, m, src, out, stats, report)
 	} else {
-		u, err = updateInPlace(ctx, o.Repo, m, base, out, stats, report)
+		u, err = updateInPlace(ctx, o.Repo, m, base, out, out, stats, report)
 	}
 	if err != nil {
 		return err
@@ -245,9 +264,12 @@ func overlaysByBlock(m *manifest.Manifest) map[int][]manifest.Overlay {
 //
 // With base (the backup the target is known to hold), blocks the same in
 // base and m are skipped without reading the target.
-func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest, out *os.File, stats *RestoreStats, report func(Phase, int64, int64)) (update, error) {
+//
+// out is read; the changes go to w, which is out itself for in-place mode
+// and a journal for staged mode.
+func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest, out *os.File, w io.WriterAt, stats *RestoreStats, report func(Phase, int64, int64)) (update, error) {
 	h := r.Hasher()
-	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
+	bs := int64(m.BlockSize)
 	overlays := overlaysByBlock(m)
 	var baseOverlays map[int][]manifest.Overlay
 	if base != nil {
@@ -261,7 +283,6 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest
 			return u, err
 		}
 	}
-	zeros := make([]byte, bs)
 	cur := make([]byte, bs)
 	want := u.want
 	report(PhaseUpdating, 0, m.DiskSize)
@@ -297,52 +318,12 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest
 			continue
 		}
 
-		// What the block must hold: the full's block, with newer extents over it.
-		var desired []byte
-		if ref.Zero {
-			desired = make([]byte, length)
-		} else {
-			data, err := r.GetBlock(ctx, ref.Hash)
-			if err != nil {
-				return u, err
-			}
-			if int64(len(data)) != length {
-				return u, fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
-			}
-			desired = data
-			stats.BlocksRead++
-		}
-		for _, ov := range ovs {
-			eo := int64(ov.Index)*es - off
-			el := min(es, length-eo)
-			if eo < 0 || el <= 0 {
-				return u, fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
-			}
-			if h.Ref(have[eo : eo+el]).Equal(ov.Ref) {
-				copy(desired[eo:eo+el], have[eo:eo+el])
-				stats.ExtentsSame++
-				continue
-			}
-			if ov.Ref.Zero {
-				copy(desired[eo:eo+el], zeros[:el])
-				continue
-			}
-			loc, ok := idx[ov.Ref.Hash]
-			if !ok {
-				return u, fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
-			}
-			data, err := r.GetExtent(ctx, loc, ov.Ref.Hash)
-			if err != nil {
-				return u, err
-			}
-			if int64(len(data)) != el {
-				return u, fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), el)
-			}
-			copy(desired[eo:eo+el], data)
-			stats.ExtentsRead++
+		desired, err := desiredBlock(ctx, r, m, i, ovs, have, idx, stats)
+		if err != nil {
+			return u, err
 		}
 		before := stats.Writes
-		if err := writeDiff(r, out, off, have, desired, writeGrain, stats); err != nil {
+		if err := writeDiff(r, w, off, have, desired, writeGrain, stats); err != nil {
 			return u, err
 		}
 		want[i], u.known[i] = h.Ref(desired), true
@@ -351,6 +332,64 @@ func updateInPlace(ctx context.Context, r *repo.Repo, m, base *manifest.Manifest
 		report(PhaseUpdating, done, m.DiskSize)
 	}
 	return u, nil
+}
+
+// desiredBlock works out what block i must hold: the full's block with
+// the newer extents laid over it. Newer extents already in have (the
+// target's current bytes) are taken from there instead of being fetched;
+// with have nil, everything is fetched.
+func desiredBlock(ctx context.Context, r *repo.Repo, m *manifest.Manifest, i int, ovs []manifest.Overlay, have []byte, idx map[extent.Hash]repo.Location, stats *RestoreStats) ([]byte, error) {
+	h := r.Hasher()
+	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
+	off := int64(i) * bs
+	length := min(bs, m.DiskSize-off)
+	ref := m.Blocks[i]
+	zeros := make([]byte, es)
+	// What the block must hold: the full's block, with newer extents over it.
+	var desired []byte
+	if ref.Zero {
+		desired = make([]byte, length)
+	} else {
+		data, err := r.GetBlock(ctx, ref.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) != length {
+			return nil, fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
+		}
+		desired = data
+		stats.BlocksRead++
+	}
+	for _, ov := range ovs {
+		eo := int64(ov.Index)*es - off
+		el := min(es, length-eo)
+		if eo < 0 || el <= 0 {
+			return nil, fmt.Errorf("extent %d lies outside block %d", ov.Index, i)
+		}
+		if have != nil && h.Ref(have[eo:eo+el]).Equal(ov.Ref) {
+			copy(desired[eo:eo+el], have[eo:eo+el])
+			stats.ExtentsSame++
+			continue
+		}
+		if ov.Ref.Zero {
+			copy(desired[eo:eo+el], zeros[:el])
+			continue
+		}
+		loc, ok := idx[ov.Ref.Hash]
+		if !ok {
+			return nil, fmt.Errorf("extent %d (%s) is missing from chain %s", ov.Index, ov.Ref.Hash, m.Chain)
+		}
+		data, err := r.GetExtent(ctx, loc, ov.Ref.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) != el {
+			return nil, fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), el)
+		}
+		copy(desired[eo:eo+el], data)
+		stats.ExtentsRead++
+	}
+	return desired, nil
 }
 
 // copyChanged makes out match src, the complete restore, writing only the
@@ -399,7 +438,7 @@ const writeGrain = 4 << 10
 // writeDiff writes the pieces of desired that differ from have, the
 // target's current bytes at off, comparing grain bytes at a time.
 // Neighbouring changed pieces go out as one write.
-func writeDiff(r *repo.Repo, out *os.File, off int64, have, desired []byte, grain int64, stats *RestoreStats) error {
+func writeDiff(r *repo.Repo, out io.WriterAt, off int64, have, desired []byte, grain int64, stats *RestoreStats) error {
 	n := int64(len(desired))
 	runStart := int64(-1)
 	flush := func(end int64) error {

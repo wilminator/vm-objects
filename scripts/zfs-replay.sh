@@ -41,6 +41,11 @@ Options:
   --volsize SIZE, --volblocksize SIZE
                     instead of --like
   --sparse          create it sparse (no reservation)
+  --staged DIR      write each step with "restore --mode staged": the
+                    changes wait in a journal in DIR (on another dataset
+                    than the zvol) until the whole result is checked, and
+                    only then go into the zvol. Each step reads the zvol
+                    once; --verify doesn't apply (every step is checked)
   --verify every|end
                     every (default): after each step, read the whole zvol
                     back once, checking every block and its sha256 against
@@ -59,7 +64,7 @@ Needs a vmobj with restore --base.
 EOF
 }
 
-work="" repo="" key="" vm="" names_arg="" zvol="" like="" volsize="" volblock="" sparse=false resume=false vmobj=vmobj verify=every
+work="" repo="" key="" vm="" names_arg="" zvol="" like="" volsize="" volblock="" sparse=false resume=false vmobj=vmobj verify=every staged=""
 while [ $# -gt 0 ]; do
   case $1 in
     --work) work=$2; shift 2 ;;
@@ -74,6 +79,7 @@ while [ $# -gt 0 ]; do
     --sparse) sparse=true; shift ;;
     --resume) resume=true; shift ;;
     --verify) verify=$2; shift 2 ;;
+    --staged) staged=$2; shift 2 ;;
     --vmobj) vmobj=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -85,6 +91,10 @@ step() { printf '\n== %s\n' "$*"; }
 
 [ -n "$zvol" ] || die "--zvol is required (see --help)"
 case $verify in every|end) ;; *) die "--verify every or end" ;; esac
+if [ -n "$staged" ]; then
+  [ -d "$staged" ] || die "--staged $staged: no such folder"
+  staged=$(cd "$staged" && pwd)
+fi
 command -v "$vmobj" >/dev/null || die "vmobj not found: $vmobj"
 vmobj=$(command -v "$vmobj")
 "$vmobj" restore -h 2>&1 | grep -q -- '-base' || die "$vmobj has no restore --base; use a newer vmobj"
@@ -153,10 +163,14 @@ for i in "${!snaps[@]}"; do
     continue
   fi
   step "$snap ($name)"
-  args=(--mode in-place --check)
-  [ -n "$prev" ] && args+=(--base "$prev")
   full=true
-  if [ "$verify" = end ] && [ "$i" -lt "$last" ]; then args+=(--check-written); full=false; fi
+  if [ -n "$staged" ]; then
+    args=(--mode staged --journal "$staged/$(basename "$zvol").vmobj-journal")
+  else
+    args=(--mode in-place --check)
+    if [ "$verify" = end ] && [ "$i" -lt "$last" ]; then args+=(--check-written); full=false; fi
+  fi
+  [ -n "$prev" ] && args+=(--base "$prev")
   if $full && [ ${#hashes[@]} -gt 0 ]; then args+=(--expect-sha256 "${hashes[$i]}"); fi
   "$vmobj" restore --repo "$repo" --key-file "$key" --vm "$vm" --manifest "$name" --output "$dev" \
     "${args[@]}" --progress lines | sed 's/^/   /'

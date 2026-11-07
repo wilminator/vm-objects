@@ -41,6 +41,10 @@ type RestoreOptions struct {
 	// target really does hold Base: a block that differs from Base but is
 	// the same in both backups is left wrong (a full --check catches it).
 	Base string
+	// Journal (staged mode) is where the changes wait until they are
+	// proven. Default for a file target: next to it, as NAME.vmobj-journal.
+	// A block device needs one given, on another filesystem.
+	Journal string
 	// CheckWritten, with Check, reads back only the blocks this restore
 	// wrote, instead of the whole target. No SHA-256 is computed then.
 	CheckWritten bool
@@ -66,6 +70,7 @@ const (
 	PhaseChanges                     // vmobj copy: newer extents (a restore merges them as each block is written)
 	PhaseUpdating                    // copy and in-place: comparing the target and writing what differs
 	PhaseCheckingTarget              // --check: reading the target back
+	PhaseApplying                    // staged: writing the journal into the target
 )
 
 // RestoreStats summarise a restore.
@@ -94,6 +99,14 @@ type RestoreStats struct {
 	// how many bytes the check read. CheckWritten reads only what was written.
 	SHA256       string
 	CheckedBytes int64
+
+	// Staged mode.
+	JournalBytes int64 // bytes of changes the journal held
+	JournalFile  int64 // the journal file's size (sealed, compressed)
+	Repaired     int   // blocks the check found wrong in the target and fetched whole
+	Applied      int64 // bytes written to the target from the journal
+	Finished     bool  // an interrupted apply was finished from an existing journal
+	Discarded    bool  // an unfinished journal from an earlier run was thrown away
 }
 
 // ErrIncomplete means a restore point is missing pieces; nothing was written.
@@ -139,7 +152,7 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 
 	stats := &RestoreStats{DiskBytes: m.DiskSize}
 	switch o.Mode {
-	case ModeCopy, ModeInPlace:
+	case ModeCopy, ModeInPlace, ModeStaged:
 		if err := restoreUpdate(ctx, o, m, stats, report); err != nil {
 			return nil, err
 		}
@@ -438,7 +451,7 @@ func Verify(ctx context.Context, r *repo.Repo, vm, name string, deep bool) (*Ver
 }
 
 // timedWriteAt writes to the restore target, timed as "restore write".
-func timedWriteAt(r *repo.Repo, out *os.File, p []byte, off int64) (int, error) {
+func timedWriteAt(r *repo.Repo, out io.WriterAt, p []byte, off int64) (int, error) {
 	done := r.Metrics.Start(metrics.OutputWrite)
 	n, err := out.WriteAt(p, off)
 	done(int64(n))

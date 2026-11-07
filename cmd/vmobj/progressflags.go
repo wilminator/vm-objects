@@ -127,6 +127,9 @@ func restoreProgress(pc progress.Config, dest, scratch string) (func(target stri
 			case engine.PhaseCheckingTarget:
 				name = label + " (check)"
 				say("Reading %s back to check it...\n", label)
+			case engine.PhaseApplying:
+				name = label + " (apply)"
+				say("Applying %s of checked changes to %s...\n", units.Format(total), label)
 			default:
 				say("Writing %s to %s...\n", units.Format(total), label)
 			}
