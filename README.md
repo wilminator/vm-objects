@@ -6,9 +6,9 @@ extents that changed. Everything is compressed and encrypted on the host
 before it is stored, and every restore point can be restored on its own.
 
 **Status: early development (0.1.0-dev).** It backs up raw disks to a local
-folder or an S3 bucket and restores them, with per-kind storage classes.
-Object Lock, host plugins (ZFS, QEMU/libvirt) and VM definitions/TPM state
-come next. Don't
+folder or an S3 bucket and restores them, with per-kind storage classes,
+Object Lock and pruning. Host plugins (ZFS, QEMU/libvirt) and VM
+definitions/TPM state come next. Don't
 rely on it as your only backup yet.
 
 ## What works today
@@ -22,6 +22,7 @@ rely on it as your only backup yet.
 | `vmobj list` | Lists restore points. |
 | `vmobj restore` | Writes a restore point to a raw image file (sparse) or a block device. |
 | `vmobj profiles` | Lists the storage profiles. |
+| `vmobj prune` | Removes backups past their keep-until date and data nothing else uses. Reports only, unless `--apply`. |
 | `vmobj verify` | Checks a restore point's pieces are present; `--deep` also decrypts and hash-checks each one. |
 
 Sources are raw image files or block devices, for example a ZFS zvol
@@ -104,6 +105,21 @@ restore never wait on the archive. Restoring from Glacier Flexible Retrieval
 or Deep Archive is two steps: `vmobj restore ... --request-restore` starts
 the retrieval and reports the expected wait, and the same restore command
 run later does the restore.
+
+### Object Lock
+
+`vmobj init --object-lock` on a bucket created with Object Lock makes every
+object write-once: each one is locked in Governance mode for as long as the
+backups that use it must be kept. Each run extends locks it relies on when
+they would run out too soon, and fulls upload very old blocks again rather
+than leaning on them forever. vmobj never sends the governance-bypass
+header, so give its credentials no `s3:BypassGovernanceRetention`
+permission: then neither vmobj nor anyone holding its keys can delete a
+locked backup early.
+
+`vmobj prune` deletes backups past their keep-until date. It always keeps
+each VM's newest backup, never touches objects written in the last 48
+hours, and leaves locked objects for a later run.
 
 ## How it stores data
 

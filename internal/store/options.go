@@ -25,6 +25,10 @@ type PutOptions struct {
 	// Class is the storage class ("DEEP_ARCHIVE", ...). Empty means the
 	// backend's default, which is Standard on S3.
 	Class string
+	// LockUntil, when set, locks the object in Governance mode until then:
+	// it can't be deleted or overwritten-in-place, and its lock can't be
+	// shortened, without a bypass permission vmobj never uses.
+	LockUntil time.Time
 }
 
 // OptionPutter stores objects with PutOptions.
@@ -44,6 +48,10 @@ type ObjectInfo struct {
 	Restoring bool
 	// RestoredUntil is when a finished restore's temporary copy expires.
 	RestoredUntil time.Time
+	// LockUntil is the Object Lock retain-until date; zero when unlocked.
+	LockUntil time.Time
+	// VersionID identifies this version in a versioned bucket.
+	VersionID string
 }
 
 // Readable reports whether the object can be downloaded now.
@@ -63,6 +71,40 @@ type Restorer interface {
 	// already running is not an error.
 	RequestRestore(ctx context.Context, key string, days int, tier string) error
 }
+
+// Locker manages Object Lock on the current version of objects.
+type Locker interface {
+	// LockingEnabled reports whether the bucket has Object Lock turned on.
+	LockingEnabled(ctx context.Context) (bool, error)
+	// ExtendLock moves an object's lock later. It never shortens a lock:
+	// asking for an earlier date than the current one is an error.
+	ExtendLock(ctx context.Context, key string, until time.Time) error
+}
+
+// Version is one stored version of a key in a versioned bucket.
+type Version struct {
+	Key          string
+	VersionID    string
+	Latest       bool
+	DeleteMarker bool
+	Modified     time.Time
+	Size         int64
+}
+
+// Versioned gives access to every version of every key. Buckets with
+// Object Lock are always versioned: a plain delete only hides an object
+// behind a delete marker, and the data stays until each version is
+// deleted by ID once its lock has run out.
+type Versioned interface {
+	ListVersions(ctx context.Context, prefix string) ([]Version, error)
+	StatVersion(ctx context.Context, key, versionID string) (ObjectInfo, error)
+	// DeleteVersion removes one version permanently. A locked version is
+	// refused with ErrLocked; vmobj never asks to bypass a lock.
+	DeleteVersion(ctx context.Context, key, versionID string) error
+}
+
+// ErrLocked means an object version is protected by Object Lock.
+var ErrLocked = errors.New("object version is locked")
 
 // ErrArchived is returned when reading an archived object that hasn't been
 // restored yet.

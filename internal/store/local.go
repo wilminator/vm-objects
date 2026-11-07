@@ -139,3 +139,20 @@ func (l *Local) Delete(_ context.Context, key string) error {
 	}
 	return nil
 }
+
+// Stat reports a file's size and modification time. Local folders have no
+// storage classes, so every object is readable.
+func (l *Local) Stat(_ context.Context, key string) (ObjectInfo, error) {
+	p, err := l.path(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	fi, err := os.Stat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return ObjectInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Size: fi.Size(), Modified: fi.ModTime()}, nil
+}

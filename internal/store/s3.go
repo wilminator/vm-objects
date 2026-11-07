@@ -40,6 +40,10 @@ type S3API interface {
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	RestoreObject(ctx context.Context, in *s3.RestoreObjectInput, opts ...func(*s3.Options)) (*s3.RestoreObjectOutput, error)
+	// Object Lock and versions (s3_lock.go).
+	PutObjectRetention(ctx context.Context, in *s3.PutObjectRetentionInput, opts ...func(*s3.Options)) (*s3.PutObjectRetentionOutput, error)
+	GetObjectLockConfiguration(ctx context.Context, in *s3.GetObjectLockConfigurationInput, opts ...func(*s3.Options)) (*s3.GetObjectLockConfigurationOutput, error)
+	ListObjectVersions(ctx context.Context, in *s3.ListObjectVersionsInput, opts ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error)
 }
 
 // S3 keeps objects in an S3 bucket (AWS, or a compatible service such as
@@ -105,6 +109,10 @@ func (s *S3) PutWith(ctx context.Context, key string, data []byte, opts PutOptio
 	if opts.Class != "" && opts.Class != string(types.StorageClassStandard) {
 		in.StorageClass = types.StorageClass(opts.Class)
 	}
+	if !opts.LockUntil.IsZero() {
+		in.ObjectLockMode = types.ObjectLockModeGovernance
+		in.ObjectLockRetainUntilDate = aws.Time(opts.LockUntil.UTC())
+	}
 	if _, err := s.api.PutObject(ctx, in); err != nil {
 		if apiCode(err) == "InvalidStorageClass" {
 			return fmt.Errorf("s3 put %s: this service does not support storage class %s "+
@@ -128,20 +136,7 @@ func (s *S3) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 		}
 		return ObjectInfo{}, fmt.Errorf("s3 head %s: %w", key, err)
 	}
-	info := ObjectInfo{
-		Size:     aws.ToInt64(out.ContentLength),
-		Modified: aws.ToTime(out.LastModified),
-		Class:    string(out.StorageClass),
-	}
-	switch out.StorageClass {
-	case types.StorageClassGlacier, types.StorageClassDeepArchive:
-		info.Archived = true
-	case types.StorageClassIntelligentTiering:
-		// Only Intelligent-Tiering's opt-in archive tiers need a restore.
-		info.Archived = out.ArchiveStatus != ""
-	}
-	info.Restoring, info.RestoredUntil = parseRestore(aws.ToString(out.Restore))
-	return info, nil
+	return headInfo(out), nil
 }
 
 // parseRestore reads S3's x-amz-restore header, which looks like

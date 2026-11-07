@@ -43,6 +43,9 @@ func PackKey(chain, id string) string { return "packs/" + chain + "/" + id + ".p
 // TOCKey names a pack's table of contents.
 func TOCKey(chain, id string) string { return "packs/" + chain + "/" + id + ".toc" }
 
+// TOCForPack returns the TOC key that belongs to a pack key.
+func TOCForPack(packKey string) string { return strings.TrimSuffix(packKey, ".pack") + ".toc" }
+
 // PackWriter collects extents and writes them out as packs.
 type PackWriter struct {
 	repo    *Repo
@@ -100,7 +103,9 @@ func (w *PackWriter) Flush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := w.repo.Backend.Put(ctx, tocKey, sealedTOC); err != nil {
+	// The TOC stays in the default class but shares the pack's lock: a
+	// pack is useless without its TOC.
+	if err := store.PutWith(ctx, w.repo.Backend, tocKey, sealedTOC, store.PutOptions{LockUntil: w.opts.LockUntil}); err != nil {
 		return err
 	}
 	for _, e := range w.entries {
@@ -120,9 +125,19 @@ func (r *Repo) ChainIndex(ctx context.Context, chain string) (map[extent.Hash]Lo
 	if err != nil {
 		return nil, err
 	}
+	// A TOC whose pack is missing (an interrupted prune, or a deletion
+	// outside vmobj) is ignored, so nothing is ever reused from a pack
+	// that isn't there. The pack check needs no extra requests: both come
+	// from the same listing.
+	packs := map[string]bool{}
+	for _, k := range keys {
+		if strings.HasSuffix(k, ".pack") {
+			packs[k] = true
+		}
+	}
 	idx := map[extent.Hash]Location{}
 	for _, k := range keys {
-		if !strings.HasSuffix(k, ".toc") {
+		if !strings.HasSuffix(k, ".toc") || !packs[strings.TrimSuffix(k, ".toc")+".pack"] {
 			continue
 		}
 		sealed, err := r.Backend.Get(ctx, k)
