@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -189,40 +190,104 @@ func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (so
 	return source.Open(spec, format)
 }
 
-// progress wraps a source and prints how far a scan has got every few
-// seconds. Go note: atomic.Int64 can be updated from the scanning
-// goroutine and read from the printing goroutine without a lock.
-type progress struct {
-	source.Source
-	read atomic.Int64
+// meter prints how far a long job has got every few seconds: percent,
+// bytes and average speed. Go note: atomic.Int64 can be updated from the
+// working goroutine and read from the printing goroutine without a lock.
+type meter struct {
+	done, total atomic.Int64
+	stop        chan struct{}
+	stopped     sync.Once
 }
 
-func (p *progress) ReadAt(b []byte, off int64) (int, error) {
-	n, err := p.Source.ReadAt(b, off)
-	p.read.Add(int64(n))
-	return n, err
-}
-
-func withProgress(src source.Source) (*progress, func()) {
-	p := &progress{Source: src}
-	done := make(chan struct{})
+func startMeter(total int64) *meter {
+	m := &meter{stop: make(chan struct{})}
+	m.total.Store(total)
 	start := time.Now()
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
 			select {
-			case <-done:
+			case <-m.stop:
 				return
 			case <-t.C:
-				n := p.read.Load()
+				n, tot := m.done.Load(), m.total.Load()
+				pct := 0.0
+				if tot > 0 {
+					pct = 100 * float64(n) / float64(tot)
+				}
 				rate := float64(n) / time.Since(start).Seconds()
 				fmt.Fprintf(os.Stderr, "  %5.1f%%  %s of %s  (%s/s)\n",
-					100*float64(n)/float64(src.Size()), units.Format(n), units.Format(src.Size()), units.Format(int64(rate)))
+					pct, units.Format(n), units.Format(tot), units.Format(int64(rate)))
 			}
 		}
 	}()
-	return p, func() { close(done) }
+	return m
+}
+
+// Stop ends the printing; safe to call more than once.
+func (m *meter) Stop() { m.stopped.Do(func() { close(m.stop) }) }
+
+// progress wraps a source and counts what a scan has read.
+type progress struct {
+	source.Source
+	m *meter
+}
+
+func (p *progress) ReadAt(b []byte, off int64) (int, error) {
+	n, err := p.Source.ReadAt(b, off)
+	p.m.done.Add(int64(n))
+	return n, err
+}
+
+func withProgress(src source.Source) (*progress, func()) {
+	m := startMeter(src.Size())
+	return &progress{Source: src, m: m}, m.Stop
+}
+
+// restoreProgress prints what a restore is doing: a line when it starts
+// checking the backup, writing the disk and applying later changes
+// (naming the disk, if given), and the meter while it writes. Call the returned func when the
+// restore ends.
+func restoreProgress(dest string) (func(target string, p engine.Phase, done, total int64), func()) {
+	var (
+		mu      sync.Mutex
+		m       *meter
+		current string
+		phase   engine.Phase
+	)
+	finish := func() {
+		if m != nil {
+			m.Stop()
+			m = nil
+		}
+	}
+	report := func(target string, p engine.Phase, done, total int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		label := dest
+		if target != "" {
+			label = "disk " + target
+		}
+		switch {
+		case p == engine.PhaseChecking:
+			finish()
+			fmt.Fprintf(os.Stderr, "Checking that the backup for %s is complete...\n", label)
+		case p != phase || target != current || m == nil:
+			finish()
+			phase, current = p, target
+			if p == engine.PhaseChanges {
+				fmt.Fprintf(os.Stderr, "Applying %s of later changes to %s...\n", units.Format(total), label)
+			} else {
+				fmt.Fprintf(os.Stderr, "Writing %s to %s...\n", units.Format(total), label)
+			}
+			m = startMeter(total)
+			m.done.Store(done)
+		default:
+			m.done.Store(done)
+		}
+	}
+	return report, func() { mu.Lock(); finish(); mu.Unlock() }
 }
 
 // ---- commands ----
@@ -517,7 +582,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force})
+	report, stopReport := restoreProgress(*out)
+	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
+		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
+	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {
 		return explainNotReady(ctx, r, nr.Readiness, *request, tier, *days)
@@ -846,7 +914,9 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName})
+	report, stopReport := restoreProgress(*to)
+	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
+	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {
 		return explainNotReady(ctx, r, nr.Readiness, *request, tier, *days)

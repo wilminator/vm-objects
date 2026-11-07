@@ -345,6 +345,9 @@ type RestoreVMOptions struct {
 	// can be defined next to the original. Without it, defining the result
 	// replaces the original VM's definition on a host that still has it.
 	NewName string
+	// Progress, when set, reports each disk's restore as in
+	// RestoreOptions.Progress, with the disk's target name (vda, hda...).
+	Progress func(target string, phase Phase, done, total int64)
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -411,7 +414,12 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	changes := vmdef.Changes{Disks: map[string]vmdef.DiskChange{}}
 	for _, d := range rec.Disks {
 		out := filepath.Join(dir, name+"-"+d.Target+".raw")
-		if _, err := Restore(ctx, RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}); err != nil {
+		ro := RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}
+		if o.Progress != nil {
+			target := d.Target
+			ro.Progress = func(p Phase, done, total int64) { o.Progress(target, p, done, total) }
+		}
+		if _, err := Restore(ctx, ro); err != nil {
 			return nil, fmt.Errorf("disk %s: %w", d.Target, err)
 		}
 		st.Disks[d.Target] = out

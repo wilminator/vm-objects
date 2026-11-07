@@ -30,7 +30,23 @@ type RestoreOptions struct {
 	Manifest string
 	Output   string // a raw image file, or a block device such as a zvol
 	Force    bool   // allow replacing an existing regular file
+	// Progress, when set, is told what the restore is doing: once with
+	// PhaseChecking before the backup is checked, then with PhaseWriting
+	// as the disk is written (done and total count bytes of the disk), then,
+	// for an incremental or differential, with PhaseChanges as the newer
+	// extents are laid over it (bytes of those extents). In each writing
+	// phase done reaches total at the end.
+	Progress func(phase Phase, done, total int64)
 }
+
+// Phase names a stage of a restore, for progress output.
+type Phase int
+
+const (
+	PhaseChecking Phase = iota // checking the backup is complete and readable
+	PhaseWriting               // writing the disk
+	PhaseChanges               // laying newer extents over it
+)
 
 // RestoreStats summarise a restore.
 type RestoreStats struct {
@@ -56,10 +72,15 @@ var ErrIncomplete = errors.New("restore point is incomplete")
 //   - Every piece is decrypted and its hash checked before it is written.
 func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 	r := o.Repo
+	report := o.Progress
+	if report == nil {
+		report = func(Phase, int64, int64) {}
+	}
 	m, err := r.GetManifest(ctx, o.VM, o.Manifest)
 	if err != nil {
 		return nil, err
 	}
+	report(PhaseChecking, 0, 0)
 	vs, err := Verify(ctx, r, o.VM, o.Manifest, false)
 	if err != nil {
 		return nil, err
@@ -81,7 +102,7 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 		return nil, err
 	}
 	stats := &RestoreStats{DiskBytes: m.DiskSize}
-	if err := writeDisk(ctx, r, m, t.f, t.sparse, stats); err != nil {
+	if err := writeDisk(ctx, r, m, t.f, t.sparse, stats, report); err != nil {
 		t.abort()
 		return nil, err
 	}
@@ -91,8 +112,11 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 	return stats, nil
 }
 
-func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, sparse bool, stats *RestoreStats) error {
+func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, sparse bool, stats *RestoreStats, report func(Phase, int64, int64)) error {
 	zeros := make([]byte, m.BlockSize)
+
+	phase, total, done := PhaseWriting, m.DiskSize, int64(0)
+	report(phase, 0, total)
 
 	// 1. Base blocks.
 	for i, ref := range m.Blocks {
@@ -108,6 +132,8 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 					return err
 				}
 			}
+			done += length
+			report(phase, done, total)
 			continue
 		}
 		data, err := r.GetBlock(ctx, ref.Hash)
@@ -121,6 +147,8 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 			return err
 		}
 		stats.BlocksRead++
+		done += length
+		report(phase, done, total)
 	}
 
 	// 2. Newer extents laid over the base.
@@ -131,6 +159,12 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 	if err != nil {
 		return err
 	}
+	phase, total, done = PhaseChanges, 0, 0
+	for _, ov := range m.Overlay {
+		off := int64(ov.Index) * int64(m.ExtentSize)
+		total += min(int64(m.ExtentSize), m.DiskSize-off)
+	}
+	report(phase, 0, total)
 	for _, ov := range m.Overlay {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -141,6 +175,8 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 			if _, err := out.WriteAt(zeros[:length], off); err != nil {
 				return err
 			}
+			done += length
+			report(phase, done, total)
 			continue
 		}
 		loc, ok := idx[ov.Ref.Hash]
@@ -158,6 +194,8 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 			return err
 		}
 		stats.ExtentsRead++
+		done += length
+		report(phase, done, total)
 	}
 	return nil
 }
