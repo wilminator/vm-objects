@@ -25,7 +25,10 @@ work=$(mktemp -d)
 cleanup() { zfs destroy -r "$src" 2>/dev/null || true; zfs destroy -r "$dst" 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT
 step() { printf '\n== %s\n' "$*"; }
-wait_dev() { for _ in $(seq 100); do [ -e "$1" ] && return; sleep 0.2; done; echo "FAIL: $1 never appeared"; exit 1; }
+settle() { command -v udevadm >/dev/null && udevadm settle 2>/dev/null; true; }
+wait_dev() { settle; for _ in $(seq 100); do [ -e "$1" ] && return; sleep 0.2; done; echo "FAIL: $1 never appeared"; exit 1; }
+# The comparison clones reuse their names, so wait for each old link to go.
+wait_gone() { settle; for _ in $(seq 100); do [ ! -e "$1" ] && return; sleep 0.2; done; echo "FAIL: $1 is still there"; exit 1; }
 
 step "a zvol with three snapshots"
 zfs create -V 64M -o volblocksize=16K "$src"
@@ -55,6 +58,7 @@ for s in first second third fourth; do
   wait_dev "/dev/zvol/$parent/cmp-a"; wait_dev "/dev/zvol/$parent/cmp-b"
   if cmp -s "/dev/zvol/$parent/cmp-a" "/dev/zvol/$parent/cmp-b"; then same=yes; else same=no; fi
   zfs destroy "$parent/cmp-a"; zfs destroy "$parent/cmp-b"
+  wait_gone "/dev/zvol/$parent/cmp-a"; wait_gone "/dev/zvol/$parent/cmp-b"
   [ "$same" = yes ] || { echo "FAIL: @$s differs from the original"; exit 1; }
   echo "   @$s identical; data written for it: original $((a / 1024)) KiB, replay $((b / 1024)) KiB"
   # Later snapshots must stay near the size of what changed, not the disk.

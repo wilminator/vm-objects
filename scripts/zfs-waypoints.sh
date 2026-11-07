@@ -37,6 +37,23 @@
 set -uo pipefail
 
 usage() { sed -n '12,14p' "$0" | sed 's/^# //' >&2; exit 2; }
+
+# The clone is destroyed and made again under the same name for each
+# snapshot. udev updates /dev/zvol links in the background, so wait for the
+# old link to go before cloning, and for the new one after: otherwise a fast
+# machine can read the previous clone through a stale link.
+settle() { command -v udevadm >/dev/null && udevadm settle 2>/dev/null; true; }
+make_clone() { # SNAPSHOT CLONE DEV
+  local _
+  settle
+  for _ in $(seq 50); do [ ! -e "$3" ] && break; sleep 0.2; done
+  [ ! -e "$3" ] || { echo "$3 still exists before cloning" >&2; return 1; }
+  zfs clone -o readonly=on "$1" "$2"
+  settle
+  for _ in $(seq 150); do [ -e "$3" ] && break; sleep 0.2; done
+  [ -e "$3" ] || { echo "$3 never appeared" >&2; return 1; }
+}
+drop_clone() { zfs destroy "$1" && settle; }
 [ $# -ge 2 ] || usage
 cmd=$1; shift
 
@@ -48,7 +65,10 @@ backup() {
   ! zfs list "$clone" >/dev/null 2>&1 || { echo "$clone already exists; remove it first" >&2; exit 1; }
   mapfile -t snaps < <(zfs list -H -t snapshot -o name -s creation -d 1 "$zvol" | sed 's/.*@//')
   [ "${#snaps[@]}" -ge 2 ] || { echo "$zvol needs at least two snapshots (has ${#snaps[@]})" >&2; exit 1; }
-  trap 'zfs destroy "$clone" 2>/dev/null || true' EXIT
+  # The clone's name goes into the trap now: the function's variables are
+  # gone by the time the script exits.
+  # shellcheck disable=SC2064
+  trap "zfs destroy '$clone' 2>/dev/null || true" EXIT
   mkdir -p "$work"
   "$vmobj" key init --key-file "$work/test.key"
   "$vmobj" init --repo "$work/repo" --key-file "$work/test.key"
@@ -56,15 +76,14 @@ backup() {
   local type=full
   for snap in "${snaps[@]}"; do
     echo "== $snap ($type)"
-    zfs clone -o readonly=on "$zvol@$snap" "$clone"
-    for _ in $(seq 30); do [ -e "$dev" ] && break; sleep 1; done
-    [ -e "$dev" ] || { echo "$dev never appeared" >&2; exit 1; }
+    make_clone "$zvol@$snap" "$clone" "$dev"
     echo "$snap $(sha256sum "$dev" | cut -d' ' -f1)" | tee -a "$work/hashes.txt"
     "$vmobj" backup --repo "$work/repo" --key-file "$work/test.key" --source "$dev" --format raw \
       --vm waypoints --type "$type" --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
-    zfs destroy "$clone"
+    drop_clone "$clone"
     type=incremental
   done
+  trap - EXIT
   echo "Backed up ${#snaps[@]} snapshots. Next: $0 verify $work"
 }
 
@@ -78,18 +97,18 @@ add() {
   ! grep -q "^$snap " "$work/hashes.txt" || { echo "$snap is already in $work/hashes.txt" >&2; exit 1; }
   zfs list "$snapshot" >/dev/null || exit 1
   ! zfs list "$clone" >/dev/null 2>&1 || { echo "$clone already exists; remove it first" >&2; exit 1; }
-  trap 'zfs destroy "$clone" 2>/dev/null || true' EXIT
+  # shellcheck disable=SC2064
+  trap "zfs destroy '$clone' 2>/dev/null || true" EXIT
   echo "== $snap (incremental, after $(tail -n1 "$work/hashes.txt" | cut -d' ' -f1))"
-  zfs clone -o readonly=on "$snapshot" "$clone"
-  for _ in $(seq 30); do [ -e "$dev" ] && break; sleep 1; done
-  [ -e "$dev" ] || { echo "$dev never appeared" >&2; exit 1; }
+  make_clone "$snapshot" "$clone" "$dev"
   local hash
   hash=$(sha256sum "$dev" | cut -d' ' -f1)
   "$vmobj" backup --repo "$work/repo" --key-file "$work/test.key" --source "$dev" --format raw \
     --vm waypoints --type incremental --state-dir "$work/state" --progress none 2>&1 | tee -a "$work/backups.log"
   # Recorded only once the backup succeeded, so hashes.txt and the backups stay in step.
   echo "$snap $hash" | tee -a "$work/hashes.txt"
-  zfs destroy "$clone"
+  drop_clone "$clone"
+  trap - EXIT
 }
 
 verify() {
