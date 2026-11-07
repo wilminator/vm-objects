@@ -150,6 +150,7 @@ func (o BackupOptions) scanOptions() scan.Options {
 		ExtentSize: o.Repo.Config.ExtentSize,
 		Workers:    o.Workers,
 		Hasher:     o.Repo.Hasher(),
+		Metrics:    o.Repo.Metrics,
 	}
 }
 

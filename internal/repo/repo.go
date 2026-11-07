@@ -34,6 +34,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/hashing"
 	"github.com/wilminator/vm-objects/internal/keys"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/metrics"
 	"github.com/wilminator/vm-objects/internal/seal"
 	"github.com/wilminator/vm-objects/internal/store"
 )
@@ -114,6 +115,9 @@ func (c Config) mac(key [32]byte) (string, error) {
 type Repo struct {
 	Backend store.Backend
 	Config  Config
+	// Metrics, when set, records how long sealing, opening and storage
+	// operations take (vmobj --metrics). Nil records nothing.
+	Metrics *metrics.Recorder
 	sealer  *seal.Sealer
 	hasher  hashing.Hasher
 }
@@ -236,16 +240,52 @@ func BlockKey(h extent.Hash) string {
 
 // PutBlock seals and stores one base block with the given storage options.
 func (r *Repo) PutBlock(ctx context.Context, h extent.Hash, data []byte, opts store.PutOptions) (int, error) {
-	sealed, err := r.sealer.Seal(h[:], data)
+	sealed, err := r.seal(h[:], data)
 	if err != nil {
 		return 0, err
 	}
-	return len(sealed), store.PutWith(ctx, r.Backend, BlockKey(h), sealed, opts)
+	return len(sealed), r.put(ctx, BlockKey(h), sealed, opts)
+}
+
+// seal, put, get and getRange are the sealer and backend calls, timed.
+func (r *Repo) seal(label, data []byte) ([]byte, error) {
+	done := r.Metrics.Start(metrics.Seal)
+	sealed, err := r.sealer.Seal(label, data)
+	done(int64(len(data)))
+	return sealed, err
+}
+
+func (r *Repo) put(ctx context.Context, key string, data []byte, opts store.PutOptions) error {
+	done := r.Metrics.Start(metrics.StoreWrite)
+	err := store.PutWith(ctx, r.Backend, key, data, opts)
+	done(int64(len(data)))
+	return err
+}
+
+func (r *Repo) get(ctx context.Context, key string) ([]byte, error) {
+	done := r.Metrics.Start(metrics.StoreRead)
+	data, err := r.Backend.Get(ctx, key)
+	done(int64(len(data)))
+	return data, err
+}
+
+func (r *Repo) getRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	done := r.Metrics.Start(metrics.StoreRead)
+	data, err := r.Backend.GetRange(ctx, key, off, n)
+	done(int64(len(data)))
+	return data, err
+}
+
+func (r *Repo) list(ctx context.Context, prefix string) ([]string, error) {
+	done := r.Metrics.Start(metrics.StoreList)
+	keys, err := r.Backend.List(ctx, prefix)
+	done(0)
+	return keys, err
 }
 
 // GetBlock fetches a base block and checks it really has hash h.
 func (r *Repo) GetBlock(ctx context.Context, h extent.Hash) ([]byte, error) {
-	sealed, err := r.Backend.Get(ctx, BlockKey(h))
+	sealed, err := r.get(ctx, BlockKey(h))
 	if err != nil {
 		return nil, fmt.Errorf("block %s: %w", h, err)
 	}
@@ -255,7 +295,7 @@ func (r *Repo) GetBlock(ctx context.Context, h extent.Hash) ([]byte, error) {
 // BlockSet lists every stored base block. One listing is much cheaper than
 // asking about each block separately, especially on S3.
 func (r *Repo) BlockSet(ctx context.Context) (map[extent.Hash]bool, error) {
-	keys, err := r.Backend.List(ctx, "blocks/")
+	keys, err := r.list(ctx, "blocks/")
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +311,8 @@ func (r *Repo) BlockSet(ctx context.Context) (map[extent.Hash]bool, error) {
 }
 
 func (r *Repo) openContent(h extent.Hash, sealed []byte) ([]byte, error) {
+	done := r.Metrics.Start(metrics.Open)
+	defer func() { done(int64(len(sealed))) }()
 	data, err := r.sealer.Open(h[:], sealed)
 	if err != nil {
 		return nil, fmt.Errorf("object %s: %w", h, err)
@@ -360,7 +402,7 @@ func (r *Repo) ListVMs(ctx context.Context) ([]string, error) {
 // they decrypt to content with hash h. Copying between repositories that
 // share a key moves these bytes as they are.
 func (r *Repo) GetSealedBlock(ctx context.Context, h extent.Hash) ([]byte, error) {
-	sealed, err := r.Backend.Get(ctx, BlockKey(h))
+	sealed, err := r.get(ctx, BlockKey(h))
 	if err != nil {
 		return nil, fmt.Errorf("block %s: %w", h, err)
 	}
@@ -373,5 +415,5 @@ func (r *Repo) GetSealedBlock(ctx context.Context, h extent.Hash) ([]byte, error
 // PutSealedBlock stores bytes from GetSealedBlock of a repository with the
 // same key. The caller must have checked the keys match.
 func (r *Repo) PutSealedBlock(ctx context.Context, h extent.Hash, sealed []byte, opts store.PutOptions) error {
-	return store.PutWith(ctx, r.Backend, BlockKey(h), sealed, opts)
+	return r.put(ctx, BlockKey(h), sealed, opts)
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wilminator/vm-objects/internal/engine"
+	"github.com/wilminator/vm-objects/internal/metrics"
 	"github.com/wilminator/vm-objects/internal/progress"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/units"
@@ -159,3 +160,18 @@ Examples:
 json prints one object per update: label, done, total, percent,
 bytes_per_sec, elapsed_s, remaining_s (once known) and finished.
 `
+
+// runMetrics records stage timings for this run when --metrics is given;
+// nil otherwise (and then records nothing). There is one per process: a
+// command opens its repositories after its flags are parsed.
+var runMetrics *metrics.Recorder
+
+func addMetricsFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("metrics", false, "print where the time went (by stage: read, hash, compress+encrypt, storage...) at the end")
+}
+
+func startMetrics(on bool) {
+	if on {
+		runMetrics = metrics.New()
+	}
+}
