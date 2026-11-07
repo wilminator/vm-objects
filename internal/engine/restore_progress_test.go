@@ -49,8 +49,8 @@ func TestRestoreReportsProgress(t *testing.T) {
 		name string
 		want []Phase
 	}{
-		{names[0], []Phase{PhaseChecking, PhaseWriting}},               // full
-		{names[2], []Phase{PhaseChecking, PhaseWriting, PhaseChanges}}, // incremental
+		{names[0], []Phase{PhaseChecking, PhaseWriting}}, // full
+		{names[2], []Phase{PhaseChecking, PhaseWriting}}, // incremental: newer extents merged as each block is written
 	} {
 		log := newProgressLog(t)
 		out := filepath.Join(h.dir, "progress-"+tc.name+".raw")
@@ -68,10 +68,8 @@ func TestRestoreReportsProgress(t *testing.T) {
 		if log.total[PhaseWriting] != m.DiskSize || log.done[PhaseWriting] != m.DiskSize {
 			t.Fatalf("%s: disk phase ended at %d of %d, disk is %d", tc.name, log.done[PhaseWriting], log.total[PhaseWriting], m.DiskSize)
 		}
-		if len(m.Overlay) > 0 {
-			if got := log.total[PhaseChanges]; got != int64(len(m.Overlay))*int64(m.ExtentSize) || log.done[PhaseChanges] != got {
-				t.Fatalf("%s: changes phase ended at %d of %d for %d extents", tc.name, log.done[PhaseChanges], got, len(m.Overlay))
-			}
+		if len(m.Overlay) == 0 && tc.name == names[2] {
+			t.Fatalf("%s: the scenario's incremental has no newer extents", tc.name)
 		}
 	}
 }

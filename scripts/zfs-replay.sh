@@ -41,17 +41,25 @@ Options:
   --volsize SIZE, --volblocksize SIZE
                     instead of --like
   --sparse          create it sparse (no reservation)
+  --verify every|end
+                    every (default): after each step, read the whole zvol
+                    back once, checking every block and its sha256 against
+                    the original snapshot's. end: after each step read back
+                    only what was written, and check the whole zvol once,
+                    after the last step (much faster; the snapshots in
+                    between are then trusted, not proven)
   --resume          continue a replay that stopped: skip the snapshots
                     the new zvol already has
   --vmobj PATH      vmobj binary (default: vmobj on PATH)
   -h, --help        this text
 
-Run as root. Each step reads the whole zvol three times (compare, check,
-sha256), so a 100 GiB disk takes a few minutes per snapshot on SSDs.
+Run as root. With --verify every, each step reads the whole zvol once;
+the first step, and the first after --resume, also compare the whole zvol.
+Needs a vmobj with restore --base.
 EOF
 }
 
-work="" repo="" key="" vm="" names_arg="" zvol="" like="" volsize="" volblock="" sparse=false resume=false vmobj=vmobj
+work="" repo="" key="" vm="" names_arg="" zvol="" like="" volsize="" volblock="" sparse=false resume=false vmobj=vmobj verify=every
 while [ $# -gt 0 ]; do
   case $1 in
     --work) work=$2; shift 2 ;;
@@ -65,6 +73,7 @@ while [ $# -gt 0 ]; do
     --volblocksize) volblock=$2; shift 2 ;;
     --sparse) sparse=true; shift ;;
     --resume) resume=true; shift ;;
+    --verify) verify=$2; shift 2 ;;
     --vmobj) vmobj=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -75,8 +84,10 @@ die() { echo "zfs-replay: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
 [ -n "$zvol" ] || die "--zvol is required (see --help)"
+case $verify in every|end) ;; *) die "--verify every or end" ;; esac
 command -v "$vmobj" >/dev/null || die "vmobj not found: $vmobj"
 vmobj=$(command -v "$vmobj")
+"$vmobj" restore -h 2>&1 | grep -q -- '-base' || die "$vmobj has no restore --base; use a newer vmobj"
 compression=""
 
 # ---- the backups and the snapshot names they become --------------------------
@@ -129,6 +140,11 @@ for _ in $(seq 100); do [ -e "$dev" ] && break; sleep 0.2; done
 
 # ---- replay -------------------------------------------------------------------
 
+# The target holds the previous step's backup only once a step of this run
+# has finished; the first step (and the first after --resume, which may
+# follow a step that stopped part-way) compares the whole zvol instead.
+prev=""
+last=$(( ${#snaps[@]} - 1 ))
 for i in "${!snaps[@]}"; do
   snap=${snaps[$i]} name=${manifests[$i]}
   if zfs list "$zvol@$snap" >/dev/null 2>&1; then
@@ -137,16 +153,18 @@ for i in "${!snaps[@]}"; do
     continue
   fi
   step "$snap ($name)"
+  args=(--mode in-place --check)
+  [ -n "$prev" ] && args+=(--base "$prev")
+  full=true
+  if [ "$verify" = end ] && [ "$i" -lt "$last" ]; then args+=(--check-written); full=false; fi
+  if $full && [ ${#hashes[@]} -gt 0 ]; then args+=(--expect-sha256 "${hashes[$i]}"); fi
   "$vmobj" restore --repo "$repo" --key-file "$key" --vm "$vm" --manifest "$name" --output "$dev" \
-    --mode in-place --check --progress lines | sed 's/^/   /'
-  [ "${PIPESTATUS[0]}" -eq 0 ] || die "the restore of $name failed; fix the cause, then run again with --resume"
-  if [ ${#hashes[@]} -gt 0 ]; then
-    got=$(sha256sum "$dev" | cut -d' ' -f1)
-    [ "$got" = "${hashes[$i]}" ] || die "$zvol after $name has sha256 $got, but the snapshot $snap had ${hashes[$i]}. Nothing was snapshotted; the zvol is left as it is."
-    echo "   sha256 matches the original @$snap"
-  fi
+    "${args[@]}" --progress lines | sed 's/^/   /'
+  [ "${PIPESTATUS[0]}" -eq 0 ] || die "the restore of $name failed (or its sha256 differs from the original @$snap); nothing was snapshotted. Fix the cause, then run again with --resume"
+  if $full && [ ${#hashes[@]} -gt 0 ]; then echo "   sha256 matches the original @$snap"; fi
   zfs snapshot "$zvol@$snap" || die "zfs snapshot $zvol@$snap failed"
   echo "   snapshot $zvol@$snap taken"
+  prev=$name
 done
 
 step "result"

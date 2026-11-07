@@ -22,7 +22,7 @@ vmobj=$(realpath "${2:-$(command -v vmobj)}")
 here=$(cd "$(dirname "$0")" && pwd)
 src="$parent/replay-src" dst="$parent/replay-dst"
 work=$(mktemp -d)
-cleanup() { zfs destroy -r "$src" 2>/dev/null || true; zfs destroy -r "$dst" 2>/dev/null || true; rm -rf "$work"; }
+cleanup() { for d in "$src" "$dst" "$dst-end"; do zfs destroy -r "$d" 2>/dev/null || true; done; rm -rf "$work"; }
 trap cleanup EXIT
 step() { printf '\n== %s\n' "$*"; }
 settle() { command -v udevadm >/dev/null && udevadm settle 2>/dev/null; true; }
@@ -66,6 +66,13 @@ for s in first second third fourth; do
     echo "FAIL: the replayed @$s wrote far more than the original"; exit 1
   fi
 done
+
+step "replay again with --verify end"
+"$here/zfs-replay.sh" --work "$work/wp" --zvol "$dst-end" --like "$src" --vmobj "$vmobj" --verify end
+for s in first second third fourth; do
+  zfs list "$dst-end@$s" >/dev/null || { echo "FAIL: --verify end lost @$s"; exit 1; }
+done
+echo "   ok: all four snapshots, the last one checked whole"
 
 step "resume skips what's done"
 "$here/zfs-replay.sh" --work "$work/wp" --zvol "$dst" --like "$src" --vmobj "$vmobj" --resume | grep -c "already there, skipped" | grep -qx 4 \
