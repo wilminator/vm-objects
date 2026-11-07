@@ -77,6 +77,14 @@ jobs:
           docker run --rm vmobj:ci version | grep -qx 'vmobj ci'
           docker image ls vmobj:ci
 
+      - name: Install the binary out of the image
+        run: |
+          mkdir inst
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/inst":/out vmobj:ci install /out
+          test "$(stat -c %a inst/vmobj)" = 755
+          ./inst/vmobj version | grep -qx 'vmobj ci'
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/inst":/out vmobj:ci install /out | grep -q 'nothing to do'
+
   # Real ZFS: a throwaway pool in a file on the runner. Skipped (with a
   # notice) if the runner's kernel has no ZFS module.
   zfs:

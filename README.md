@@ -227,9 +227,22 @@ docker run --rm vmobj version
 
 ### Getting the binary out of an image
 
-The image doubles as an installer. It has no shell, so copy the file out
-with `docker cp` from a container that is created but never started. This
-puts `vmobj` in the current folder, built for the machine you run it on:
+The image doubles as an installer: `vmobj install` copies the binary into
+a folder you mount. This puts `vmobj` in the current folder, built for the
+machine you run it on:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/out vmobj install /out
+```
+
+`--user` makes the file yours (the image otherwise runs as an unprivileged
+user that can't write to your folder). The copy is written under a
+temporary name and renamed into place with mode 0755, so it can safely
+replace a vmobj that is running; installing the same version again changes
+nothing.
+
+Images made before `install` existed have no shell to run `cp`, so for
+those copy the file out of a container that is created but never started:
 
 ```bash
 id=$(docker create vmobj) && docker cp "$id":/vmobj ./vmobj && docker rm "$id"
