@@ -26,9 +26,14 @@ type VMRecord struct {
 	Profile     string    `json:"profile,omitempty"`
 	RetainUntil time.Time `json:"retainUntil,omitzero"`
 
+	// Platform is the module that described the VM: libvirt, qnap or
+	// truenas. Empty in records made before modules existed: libvirt.
+	Platform   string `json:"platform,omitempty"`
 	DomainName string `json:"domainName"`
 	UUID       string `json:"uuid"`
-	Definition []byte `json:"definition"` // libvirt XML, as dumped
+	Definition []byte `json:"definition"` // the platform's definition, as read
+	// DefinitionType names Definition's format; empty means libvirt XML.
+	DefinitionType string `json:"definitionType,omitempty"`
 	// Consistency says how the disks were captured: "shut off",
 	// "snapshot" (crash-consistent) or "quiesced snapshot".
 	Consistency string   `json:"consistency"`

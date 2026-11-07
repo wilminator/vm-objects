@@ -26,6 +26,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/measure"
+	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/scan"
@@ -753,6 +754,29 @@ func cmdPrune(ctx context.Context, args []string) error {
 	return nil
 }
 
+// newPlatform builds the platform module for --platform, with any
+// --virsh, --connect and --swtpm-dir overrides.
+func newPlatform(name, virshPath, connect, swtpmDir string) (platform.Platform, error) {
+	name, err := platform.Check(name)
+	if err != nil {
+		return nil, err
+	}
+	switch name {
+	case "qnap":
+		if virshPath == "" {
+			virshPath = platform.QNAPVirsh
+		}
+		return platform.NewQNAP(libvirt.Virsh{Path: virshPath, Connect: connect}, swtpmDir), nil
+	case "truenas":
+		return nil, errors.New("the TrueNAS module isn't finished yet (milestone 8); until it is, back up a TrueNAS VM's disks " +
+			"with vmobj backup --source zfs:POOL/ZVOL")
+	}
+	if virshPath == "" {
+		virshPath = "virsh"
+	}
+	return platform.NewLibvirt(libvirt.Virsh{Path: virshPath, Connect: connect}, swtpmDir), nil
+}
+
 func cmdBackupVM(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("backup-vm", flag.ExitOnError)
 	dir := fs.String("repo", "", "repository: a folder path or s3://...")
@@ -765,8 +789,9 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	stateDir := fs.String("state-dir", "", "where this host keeps per-disk state")
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
 	quiesce := fs.Bool("quiesce", false, "freeze the guest's filesystems (QEMU guest agent) while a running VM is snapshotted")
-	swtpmDir := fs.String("swtpm-dir", engine.DefaultSwtpmDir, "where libvirt keeps TPM state (QNAP: /QVS/var/lib/libvirt/swtpm)")
-	virshPath := fs.String("virsh", "virsh", "virsh program (QNAP: /QVS/usr/bin/virsh)")
+	platformName := fs.String("platform", "auto", "what runs the VM: auto (detect), libvirt, qnap or truenas")
+	swtpmDir := fs.String("swtpm-dir", "", "where libvirt keeps TPM state (default: the platform's; libvirt "+engine.DefaultSwtpmDir+")")
+	virshPath := fs.String("virsh", "", "virsh program (default: the platform's; libvirt: virsh on PATH)")
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
@@ -782,6 +807,10 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		return err
 	}
 	k, err := manifest.ParseKind(*kind)
+	if err != nil {
+		return err
+	}
+	plat, err := newPlatform(*platformName, *virshPath, *connect, *swtpmDir)
 	if err != nil {
 		return err
 	}
@@ -805,8 +834,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	start := time.Now()
 	st, err := engine.BackupVM(ctx, engine.BackupVMOptions{
 		Repo: r, Domain: *domain, VM: *vm, Kind: k, Profile: &prof, Class: class, Workers: *workers,
-		StateDir: *stateDir, Quiesce: *quiesce, SwtpmDir: *swtpmDir,
-		Virsh: libvirt.Virsh{Path: *virshPath, Connect: *connect},
+		StateDir: *stateDir, Quiesce: *quiesce, Platform: plat,
 		Progress: func(target string, s source.Source) (source.Source, func()) {
 			fmt.Fprintf(os.Stderr, "Disk %s (%s)...\n", target, units.Format(s.Size()))
 			return withProgress(pc, "disk "+target, s)

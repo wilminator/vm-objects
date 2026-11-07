@@ -20,6 +20,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/atomicfile"
 	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/source"
@@ -39,8 +40,11 @@ type BackupVMOptions struct {
 	StateDir string // per-disk state files live here
 	Now      func() time.Time
 
-	Virsh libvirt.Runner
-	ZFS   source.ZFSRunner // nil: the real zfs command
+	// Platform describes the VM. When nil, the generic libvirt module is
+	// built from Virsh and SwtpmDir.
+	Platform platform.Platform
+	Virsh    libvirt.Runner
+	ZFS      source.ZFSRunner // nil: the real zfs command
 	// ZFSDevDir is where zvol device nodes appear (default /dev/zvol).
 	ZFSDevDir string
 	// Quiesce freezes the guest's filesystems (through the QEMU guest
@@ -53,7 +57,15 @@ type BackupVMOptions struct {
 }
 
 // DefaultSwtpmDir is where libvirt keeps emulated TPM state.
-const DefaultSwtpmDir = "/var/lib/libvirt/swtpm"
+const DefaultSwtpmDir = platform.DefaultSwtpmDir
+
+// platform returns the module that describes the VM.
+func (o BackupVMOptions) platform() platform.Platform {
+	if o.Platform != nil {
+		return o.Platform
+	}
+	return platform.NewLibvirt(o.Virsh, o.SwtpmDir)
+}
 
 // BackupVMStats summarise a whole-VM backup.
 type BackupVMStats struct {
@@ -77,20 +89,15 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	if o.SwtpmDir == "" {
-		o.SwtpmDir = DefaultSwtpmDir
-	}
-	state, err := libvirt.DomainState(ctx, o.Virsh, o.Domain)
+	plat := o.platform()
+	dom, err := plat.Describe(ctx, o.Domain)
 	if err != nil {
 		return nil, err
 	}
-	xmlDef, err := libvirt.Definition(ctx, o.Virsh, o.Domain)
-	if err != nil {
-		return nil, err
-	}
-	dom, err := vmdef.Parse(xmlDef)
-	if err != nil {
-		return nil, err
+	if o.Quiesce {
+		if _, ok := plat.(platform.Quiescer); !ok {
+			return nil, fmt.Errorf("--quiesce: the %s platform module can't freeze a guest", plat.Name())
+		}
 	}
 	if o.VM == "" {
 		o.VM = dom.Name
@@ -98,7 +105,7 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	if err := manifest.CheckVMName(o.VM); err != nil {
 		return nil, fmt.Errorf("VM name: %w (use --vm to choose another)", err)
 	}
-	live := state != libvirt.ShutOff
+	live := dom.Running
 	var disks []vmdef.Disk
 	stats := &BackupVMStats{Disks: map[string]*BackupStats{}, Skipped: dom.Skipped}
 	for _, d := range dom.Disks {
@@ -138,10 +145,7 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 			}
 		}
 	}
-	files, err := vmFiles(dom, o.SwtpmDir)
-	if err != nil {
-		return nil, err
-	}
+	files := dom.Files
 
 	// Capture the disks.
 	started := o.Now().UTC()
@@ -149,7 +153,7 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	snaps := map[string]string{}
 	if live {
 		stats.Consistency = "snapshot"
-		if snaps, err = snapshotVM(ctx, o, zvols, started); err != nil {
+		if snaps, err = snapshotVM(ctx, o, plat, zvols, started); err != nil {
 			return nil, err
 		}
 		if o.Quiesce {
@@ -170,7 +174,8 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 
 	rec := &manifest.VMRecord{
 		Format: manifest.Format, VM: o.VM, Kind: o.Kind, Created: started,
-		DomainName: dom.Name, UUID: dom.UUID, Definition: xmlDef,
+		Platform: plat.Name(), DomainName: dom.Name, UUID: dom.UUID,
+		Definition: dom.Definition, DefinitionType: dom.DefinitionType,
 		Consistency: stats.Consistency, Files: files, Skipped: stats.Skipped,
 	}
 	for _, d := range disks {
@@ -255,14 +260,14 @@ func (s *State) sizeOrZero() int64 {
 
 // snapshotVM snapshots a running VM's zvols in one atomic command, inside
 // a filesystem freeze when asked. The thaw always runs.
-func snapshotVM(ctx context.Context, o BackupVMOptions, zvols []string, now time.Time) (snaps map[string]string, err error) {
-	if o.Quiesce {
-		if err := libvirt.Freeze(ctx, o.Virsh, o.Domain); err != nil {
+func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, zvols []string, now time.Time) (snaps map[string]string, err error) {
+	if q, ok := plat.(platform.Quiescer); o.Quiesce && ok {
+		if err := q.Freeze(ctx, o.Domain); err != nil {
 			return nil, fmt.Errorf("freezing the guest's filesystems (is the QEMU guest agent running?): %w", err)
 		}
 		defer func() {
 			// Thaw even if the snapshot failed or ctx was cancelled.
-			if terr := libvirt.Thaw(context.WithoutCancel(ctx), o.Virsh, o.Domain); terr != nil && err == nil {
+			if terr := q.Thaw(context.WithoutCancel(ctx), o.Domain); terr != nil && err == nil {
 				err = fmt.Errorf("thawing the guest's filesystems: %w", terr)
 			}
 		}()
@@ -283,54 +288,6 @@ func openVMDisk(ctx context.Context, o BackupVMOptions, d vmdef.Disk, live bool,
 		return z, nil
 	}
 	return source.Open(d.Path, d.Format)
-}
-
-// vmFiles reads the NVRAM store and TPM state.
-func vmFiles(dom *vmdef.Domain, swtpmDir string) ([]manifest.VMFile, error) {
-	var files []manifest.VMFile
-	total := 0
-	add := func(f manifest.VMFile) error {
-		total += len(f.Data)
-		if total > manifest.MaxVMFiles {
-			return fmt.Errorf("the VM's NVRAM and TPM files exceed %d bytes", manifest.MaxVMFiles)
-		}
-		files = append(files, f)
-		return nil
-	}
-	if dom.NVRAM != "" {
-		data, err := os.ReadFile(dom.NVRAM)
-		if err != nil {
-			return nil, fmt.Errorf("reading the NVRAM store: %w", err)
-		}
-		if err := add(manifest.VMFile{Role: "nvram", Name: filepath.Base(dom.NVRAM), Mode: 0o600, Data: data}); err != nil {
-			return nil, err
-		}
-	}
-	if dom.TPM {
-		dir := filepath.Join(swtpmDir, dom.UUID)
-		err := filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if !e.Type().IsRegular() {
-				return nil
-			}
-			info, err := e.Info()
-			if err != nil {
-				return err
-			}
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return err
-			}
-			rel, _ := filepath.Rel(dir, p)
-			return add(manifest.VMFile{Role: "tpm", Name: filepath.ToSlash(rel), Mode: uint32(info.Mode().Perm()), Data: data})
-		})
-		if err != nil {
-			return nil, fmt.Errorf("reading the TPM state in %s (set --swtpm-dir if it lives elsewhere): %w", dir, err)
-		}
-	}
-	return files, nil
 }
 
 func uniqueRecordName(ctx context.Context, r *repo.Repo, vm string, now time.Time, k manifest.Kind) (string, error) {
@@ -510,9 +467,18 @@ func restoreNotes(rec *manifest.VMRecord, st *RestoreVMStats, name string, renam
 		} else {
 			b.WriteString("1. Put the TPM state where libvirt expects it:\n\n")
 		}
-		fmt.Fprintf(&b, "     mkdir -p %s/%s\n", DefaultSwtpmDir, uuid)
-		fmt.Fprintf(&b, "     cp -a %s/. %s/%s/\n", filepath.Join(filepath.Dir(st.Definition), "tpm"), DefaultSwtpmDir, uuid)
-		b.WriteString("     (QNAP keeps it under /QVS/var/lib/libvirt/swtpm instead.)\n\n")
+		// The record says which platform made it; libvirt's folder is the
+		// usual one, QNAP keeps its own.
+		swtpm := DefaultSwtpmDir
+		if rec.Platform == "qnap" {
+			swtpm = platform.QNAPSwtpmDir
+		}
+		fmt.Fprintf(&b, "     mkdir -p %s/%s\n", swtpm, uuid)
+		fmt.Fprintf(&b, "     cp -a %s/. %s/%s/\n", filepath.Join(filepath.Dir(st.Definition), "tpm"), swtpm, uuid)
+		if rec.Platform != "qnap" {
+			fmt.Fprintf(&b, "     (On QNAP it goes under %s instead.)\n", platform.QNAPSwtpmDir)
+		}
+		b.WriteString("\n")
 		if !renamed {
 			fmt.Fprintf(&b, "2. Define the VM:\n\n     virsh define %s\n\n", st.Definition)
 		}
