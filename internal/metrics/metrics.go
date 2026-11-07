@@ -36,9 +36,10 @@ const (
 	StoreList   = "storage list"     // listing keys
 	Open        = "decrypt+check"    // opening and checking one object
 	OutputWrite = "restore write"    // writing restored data to the target
+	TargetRead  = "target read"      // copy and in-place restores: reading what the target holds
 )
 
-var order = []string{SourceRead, Hash, Seal, StoreWrite, StoreRead, StoreList, Open, OutputWrite}
+var order = []string{SourceRead, Hash, Seal, StoreWrite, StoreRead, StoreList, Open, TargetRead, OutputWrite}
 
 // buckets holds latencies by powers of two of microseconds: bucket i
 // counts operations that took under 2^i µs (bucket 0: under 1 µs).

@@ -21,7 +21,7 @@ rely on it as your only backup yet.
 | `vmobj measure` | Read-only: hashes a disk and reports how much changed since the last run, at 64 KiB and 4 MiB. Needs no key or repository. |
 | `vmobj backup` | `--type full`, `incremental` or `differential`. |
 | `vmobj list` | Lists restore points. |
-| `vmobj restore` | Writes a restore point to a raw image file (sparse) or a block device. |
+| `vmobj restore` | Writes a restore point to a raw image file (sparse) or a block device; `--mode copy` or `in-place` updates an existing one, writing only what differs. |
 | `vmobj backup-vm` | Backs up a whole libvirt VM: every disk, the definition, UEFI NVRAM and TPM state. |
 | `vmobj vms` | Lists whole-VM backups. |
 | `vmobj restore-vm` | Writes a VM's disks, adjusted definition, NVRAM and TPM state into a folder, with instructions. Never changes libvirt. |
@@ -77,6 +77,29 @@ vmobj list --repo /mnt/backup/vmobj --key-file /root/vmobj.key --vm win11
 ```bash
 vmobj restore --repo /mnt/backup/vmobj --key-file /root/vmobj.key --vm win11 --manifest 20261030T193649Z-incremental --output /mnt/scratch/win11.raw
 ```
+
+### Restore modes
+
+`--mode` chooses how `restore` writes its target:
+
+| Mode | What it does | Target during the restore | Space |
+| --- | --- | --- | --- |
+| `rename` (default) | Writes a new file under a temporary name and renames it into place. A block device is written whole. | Never part-written | A full copy, beside the target |
+| `copy` | Restores to a scratch file, then updates the existing target, writing only the 4 KiB pieces that differ. The target keeps its inode, owner and permissions. | Part old, part new while it's updated | A full copy in `--scratch` |
+| `in-place` | Reads the existing target, hashes it with the repository key, and fetches and writes only what differs. | Part old, part new until it finishes; run it again to finish | None |
+
+`copy` and `in-place` need an existing target: a file (resized to the disk
+if needed) or a block device such as a zvol. `--check` reads the target
+back afterwards and compares every block. Rolling a disk back to last
+night with `in-place` writes only what changed since, and from S3 it
+downloads only that too:
+
+```bash
+vmobj restore --repo /mnt/backup/vmobj --key-file /root/vmobj.key --vm win11 --manifest 20261030T193649Z-incremental --output /dev/zvol/tank/vms/win11 --mode in-place --check
+```
+
+`scripts/zfs-replay.sh` uses this to rebuild a zvol and its named
+snapshots from a chain of backups, for moving a VM disk with its history.
 
 Measure how much a disk changes per day (run it daily):
 
