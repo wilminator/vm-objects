@@ -60,9 +60,9 @@ var Names = []string{"libvirt", "qnap", "truenas"}
 // Detect picks the platform this host runs, by what's installed.
 func Detect() string {
 	switch {
-	case exists(QNAPVirsh):
+	case exists(QNAPLibvirt.Virsh):
 		return "qnap"
-	case exists(TrueNASMidclt) && exists(TrueNASLibvirtSocket):
+	case exists(TrueNASMidclt) && exists(TrueNASLibvirt.Socket):
 		return "truenas"
 	}
 	return "libvirt"

@@ -23,7 +23,6 @@ import (
 	"github.com/wilminator/vm-objects/internal/engine"
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/keys"
-	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/measure"
 	"github.com/wilminator/vm-objects/internal/platform"
@@ -63,6 +62,7 @@ Usage:
   vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
   vmobj install     [--name vmobj] DIR
+  vmobj platforms   (the platform modules and the libvirt settings each uses)
   vmobj version
   vmobj help [progress]
 
@@ -151,6 +151,8 @@ func main() {
 		err = cmdCopy(ctx, args)
 	case "install":
 		err = cmdInstall(args)
+	case "platforms":
+		err = cmdPlatforms()
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
@@ -815,30 +817,8 @@ func cmdPrune(ctx context.Context, args []string) error {
 
 // newPlatform builds the platform module for --platform, with any
 // --virsh, --connect and --swtpm-dir overrides.
-func newPlatform(name, virshPath, connect, swtpmDir string) (platform.Platform, error) {
-	name, err := platform.Check(name)
-	if err != nil {
-		return nil, err
-	}
-	switch name {
-	case "qnap":
-		if virshPath == "" {
-			virshPath = platform.QNAPVirsh
-		}
-		return platform.NewQNAP(libvirt.Virsh{Path: virshPath, Connect: connect}, swtpmDir), nil
-	case "truenas":
-		if connect == "" {
-			connect = platform.TrueNASLibvirtURI
-		}
-		if virshPath == "" {
-			virshPath = "virsh"
-		}
-		return platform.NewTrueNAS(nil, libvirt.Virsh{Path: virshPath, Connect: connect}), nil
-	}
-	if virshPath == "" {
-		virshPath = "virsh"
-	}
-	return platform.NewLibvirt(libvirt.Virsh{Path: virshPath, Connect: connect}, swtpmDir), nil
+func newPlatform(name, virshPath, connect, socket, swtpmDir string) (platform.Platform, error) {
+	return platform.New(name, platform.LibvirtConfig{Virsh: virshPath, URI: connect, Socket: socket, SwtpmDir: swtpmDir})
 }
 
 func cmdBackupVM(ctx context.Context, args []string) error {
@@ -854,9 +834,10 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
 	quiesce := fs.Bool("quiesce", false, "freeze the guest's filesystems (QEMU guest agent) while a running VM is snapshotted")
 	platformName := fs.String("platform", "auto", "what runs the VM: auto (detect), libvirt, qnap or truenas")
-	swtpmDir := fs.String("swtpm-dir", "", "where libvirt keeps TPM state (default: the platform's; libvirt "+engine.DefaultSwtpmDir+")")
-	virshPath := fs.String("virsh", "", "virsh program (default: the platform's; libvirt: virsh on PATH)")
-	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system")
+	swtpmDir := fs.String("swtpm-dir", "", "where libvirt keeps TPM state (default: the platform's; see vmobj platforms)")
+	virshPath := fs.String("virsh", "", "virsh program (default: the platform's; see vmobj platforms)")
+	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system (default: the platform's)")
+	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	pf := addProgressFlags(fs)
@@ -874,7 +855,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	plat, err := newPlatform(*platformName, *virshPath, *connect, *swtpmDir)
+	plat, err := newPlatform(*platformName, *virshPath, *connect, *socket, *swtpmDir)
 	if err != nil {
 		return err
 	}
@@ -1188,4 +1169,32 @@ func describeVMFiles(nvram, tpm int) string {
 		parts = append(parts, "no TPM")
 	}
 	return strings.Join(parts, ", ")
+}
+
+// cmdPlatforms lists the platform modules and the libvirt settings each
+// supplies; backup-vm's --virsh, --connect, --libvirt-socket and
+// --swtpm-dir override them.
+func cmdPlatforms() error {
+	fmt.Printf("This host: %s\n\n", platform.Detect())
+	for _, n := range platform.Names {
+		c := platform.Appliances[n]
+		fmt.Printf("%s\n", n)
+		fmt.Printf("  virsh:      %s\n", c.Virsh)
+		conn := c.ConnectURI()
+		if conn == "" {
+			conn = "(virsh's default)"
+		}
+		fmt.Printf("  connect:    %s\n", conn)
+		fmt.Printf("  TPM state:  %s (layout %s)\n", c.SwtpmDir, c.TPMLayout)
+		nv := c.NVRAMDir
+		if nv == "" {
+			nv = "(as each VM's definition says)"
+		}
+		fmt.Printf("  NVRAM:      %s\n", nv)
+		if n == "truenas" {
+			fmt.Printf("  also:       %s (VM settings)\n", platform.TrueNASMidclt)
+		}
+		fmt.Println()
+	}
+	return nil
 }

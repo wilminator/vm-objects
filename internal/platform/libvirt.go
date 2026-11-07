@@ -28,11 +28,90 @@ const (
 	QNAPSwtpmDir = "/QVS/var/lib/libvirt/swtpm"
 )
 
+// LibvirtConfig says where one libvirt installation keeps its pieces. The
+// generic libvirt module takes it as given (with --virsh, --connect,
+// --libvirt-socket and --swtpm-dir); each appliance module supplies its
+// own (QNAPLibvirt, TrueNASLibvirt), and those flags override them.
+type LibvirtConfig struct {
+	Virsh  string // the virsh program
+	Socket string // libvirt's socket; "" for virsh's default connection
+	URI    string // a full libvirt URI; overrides Socket
+	// SwtpmDir holds emulated TPM state, one folder per VM UUID, for VMs
+	// whose definition doesn't name a folder of its own.
+	SwtpmDir string
+	// TPMLayout is how TPM state sits in its folder: "tpm2" (libvirt's:
+	// the files in a tpm2/ subfolder) or "flat" (TrueNAS's).
+	TPMLayout string
+	// NVRAMDir is where the platform keeps NVRAM stores; restore notes
+	// name it.
+	NVRAMDir string
+}
+
+// The libvirt settings of each platform vmobj knows.
+var (
+	DefaultLibvirt = LibvirtConfig{Virsh: "virsh", SwtpmDir: DefaultSwtpmDir, TPMLayout: "tpm2", NVRAMDir: "/var/lib/libvirt/qemu/nvram"}
+	QNAPLibvirt    = LibvirtConfig{Virsh: QNAPVirsh, SwtpmDir: QNAPSwtpmDir, TPMLayout: "tpm2"} // NVRAM: not yet seen on a QNAP; each definition names its store
+	TrueNASLibvirt = LibvirtConfig{Virsh: "virsh", Socket: TrueNASLibvirtSocket, SwtpmDir: "/var/db/system/vm/tpm", TPMLayout: "flat", NVRAMDir: "/var/db/system/vm/nvram"}
+)
+
+// Appliances maps each platform name to its libvirt settings.
+var Appliances = map[string]LibvirtConfig{"libvirt": DefaultLibvirt, "qnap": QNAPLibvirt, "truenas": TrueNASLibvirt}
+
+// ConnectURI is the libvirt URI virsh is given: URI, else one built from
+// Socket, else "" (virsh's default).
+func (c LibvirtConfig) ConnectURI() string {
+	switch {
+	case c.URI != "":
+		return c.URI
+	case c.Socket != "":
+		return "qemu+unix:///system?socket=" + c.Socket
+	}
+	return ""
+}
+
+// With returns c with every setting that over gives in place of c's.
+func (c LibvirtConfig) With(over LibvirtConfig) LibvirtConfig {
+	set := func(dst *string, v string) {
+		if v != "" {
+			*dst = v
+		}
+	}
+	set(&c.Virsh, over.Virsh)
+	set(&c.Socket, over.Socket)
+	set(&c.URI, over.URI)
+	set(&c.SwtpmDir, over.SwtpmDir)
+	set(&c.TPMLayout, over.TPMLayout)
+	set(&c.NVRAMDir, over.NVRAMDir)
+	return c
+}
+
+// Runner is virsh as these settings call it.
+func (c LibvirtConfig) Runner() libvirt.Virsh {
+	return libvirt.Virsh{Path: c.Virsh, Connect: c.ConnectURI()}
+}
+
+// New returns the module for a platform name (see Names), with its own
+// libvirt settings overridden by the ones over gives.
+func New(name string, over LibvirtConfig) (Platform, error) {
+	name, err := Check(name)
+	if err != nil {
+		return nil, err
+	}
+	cfg := Appliances[name].With(over)
+	if name == "truenas" {
+		t := NewTrueNAS(nil, cfg.Runner())
+		t.Config = cfg
+		return t, nil
+	}
+	return &Libvirt{Virsh: cfg.Runner(), SwtpmDir: cfg.SwtpmDir, Config: cfg, name: name}, nil
+}
+
 // Libvirt describes VMs through virsh. It is the generic libvirt module,
-// and, with QNAP's paths, the QNAP one.
+// and, with QNAP's settings, the QNAP one.
 type Libvirt struct {
 	Virsh    libvirt.Runner
 	SwtpmDir string // default DefaultSwtpmDir
+	Config   LibvirtConfig
 	name     string
 }
 
@@ -41,7 +120,8 @@ func NewLibvirt(virsh libvirt.Runner, swtpmDir string) *Libvirt {
 	if swtpmDir == "" {
 		swtpmDir = DefaultSwtpmDir
 	}
-	return &Libvirt{Virsh: virsh, SwtpmDir: swtpmDir, name: "libvirt"}
+	cfg := DefaultLibvirt.With(LibvirtConfig{SwtpmDir: swtpmDir})
+	return &Libvirt{Virsh: virsh, SwtpmDir: swtpmDir, Config: cfg, name: "libvirt"}
 }
 
 // NewQNAP returns the module for QNAP Virtualization Station: libvirt,
@@ -53,7 +133,8 @@ func NewQNAP(virsh libvirt.Runner, swtpmDir string) *Libvirt {
 	if swtpmDir == "" {
 		swtpmDir = QNAPSwtpmDir
 	}
-	return &Libvirt{Virsh: virsh, SwtpmDir: swtpmDir, name: "qnap"}
+	cfg := QNAPLibvirt.With(LibvirtConfig{SwtpmDir: swtpmDir})
+	return &Libvirt{Virsh: virsh, SwtpmDir: swtpmDir, Config: cfg, name: "qnap"}
 }
 
 func (l *Libvirt) Name() string {
