@@ -132,3 +132,40 @@ func TestCheck(t *testing.T) {
 		t.Fatalf("Check(auto) = %q, %v", got, err)
 	}
 }
+
+func TestLibvirtSettings(t *testing.T) {
+	if got := TrueNASLibvirt.ConnectURI(); got != TrueNASLibvirtURI {
+		t.Fatalf("TrueNAS URI %q", got)
+	}
+	if got := (LibvirtConfig{Socket: "/s", URI: "qemu:///x"}).ConnectURI(); got != "qemu:///x" {
+		t.Fatalf("URI should win over socket: %q", got)
+	}
+	if got := DefaultLibvirt.ConnectURI(); got != "" {
+		t.Fatalf("generic libvirt should use virsh's default, got %q", got)
+	}
+	c := QNAPLibvirt.With(LibvirtConfig{SwtpmDir: "/elsewhere"})
+	if c.Virsh != QNAPVirsh || c.SwtpmDir != "/elsewhere" {
+		t.Fatalf("override: %+v", c)
+	}
+
+	// The generic module with an appliance's socket given by hand.
+	p, err := New("libvirt", LibvirtConfig{Socket: "/run/other/libvirt-sock", Virsh: "/opt/bin/virsh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := p.(*Libvirt)
+	if v := l.Virsh.(libvirt.Virsh); v.Path != "/opt/bin/virsh" || v.Connect != "qemu+unix:///system?socket=/run/other/libvirt-sock" || l.SwtpmDir != DefaultSwtpmDir {
+		t.Fatalf("generic with overrides: %+v %+v", v, l)
+	}
+	p, err = New("truenas", LibvirtConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tn := p.(*TrueNAS)
+	if v := tn.Virsh.(libvirt.Virsh); v.Connect != TrueNASLibvirtURI || tn.Config.TPMLayout != "flat" {
+		t.Fatalf("truenas: %+v %+v", v, tn.Config)
+	}
+	if _, err := New("vmware", LibvirtConfig{}); err == nil {
+		t.Fatal("unknown platform accepted")
+	}
+}

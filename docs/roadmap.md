@@ -31,6 +31,14 @@ likely as their own project, using `vmobj` as the engine.
 
 ## Design rules the modules keep
 
+- **One libvirt module, many appliances.** The generic libvirt module
+  takes its settings as given: the virsh program, libvirt's socket or URI,
+  where TPM state and NVRAM live, and how TPM state is laid out. Appliance
+  modules (QNAP, TrueNAS) are those settings plus what the appliance adds
+  (TrueNAS's middleware). `vmobj platforms` lists them; `--virsh`,
+  `--connect`, `--libvirt-socket` and `--swtpm-dir` override them, so an
+  appliance vmobj doesn't know yet can be used through `--platform libvirt`.
+
 - **A module is a set of capabilities.** It says what it can do (quiesce
   a guest, track changed blocks, register a restored VM) and the engine
   uses what is there.

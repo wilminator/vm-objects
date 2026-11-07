@@ -66,6 +66,7 @@ func (m ExecMidclt) Call(ctx context.Context, method string, args ...string) ([]
 type TrueNAS struct {
 	Midclt Midclt
 	Virsh  libvirt.Runner // connected to TrueNAS's libvirt socket
+	Config LibvirtConfig  // TrueNASLibvirt unless overridden
 }
 
 // NewTrueNAS returns the TrueNAS module. A nil midclt runs
@@ -77,7 +78,7 @@ func NewTrueNAS(m Midclt, virsh libvirt.Runner) *TrueNAS {
 	if virsh == nil {
 		virsh = libvirt.Virsh{Connect: TrueNASLibvirtURI}
 	}
-	return &TrueNAS{Midclt: m, Virsh: virsh}
+	return &TrueNAS{Midclt: m, Virsh: virsh, Config: TrueNASLibvirt}
 }
 
 func (t *TrueNAS) Name() string { return "truenas" }
@@ -144,7 +145,7 @@ func (t *TrueNAS) Describe(ctx context.Context, vm string) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	lv := &Libvirt{Virsh: t.Virsh, SwtpmDir: DefaultSwtpmDir, name: "truenas"}
+	lv := &Libvirt{Virsh: t.Virsh, SwtpmDir: t.Config.SwtpmDir, Config: t.Config, name: "truenas"}
 	desc, err := lv.Describe(ctx, v.domain())
 	if err != nil {
 		return nil, err
