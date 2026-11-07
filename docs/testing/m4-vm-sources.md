@@ -35,7 +35,7 @@ while the VM runs is a useful check too.
 ### 1. Build the binary in WSL and copy it to the QNAP
 
 ```bash
-cd ~/vm-objects && git fetch && git checkout m4-vm-sources && make build-all
+cd ~/vm-objects && git pull && make build-all
 ```
 
 ```bash

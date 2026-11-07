@@ -47,7 +47,7 @@ over from WSL with `scp` if needed.
 ### 1. Copy the new binary over (from WSL)
 
 ```bash
-cd ~/vm-objects && git fetch && git checkout m6-copy && make build-all
+cd ~/vm-objects && git pull && make build-all
 ```
 
 ```bash

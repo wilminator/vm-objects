@@ -86,7 +86,7 @@ echo "OK: the copy restores the whole VM"
 step "restore under a new name"
 "$vmobj" restore-vm --repo repo --key-file k --vm e2e --record "${recs[0]}" --to out-copy --new-name e2e-copy
 grep -q "<name>e2e-copy</name>" out-copy/e2e-copy.xml
-! grep -q "<uuid>" out-copy/e2e-copy.xml
+if grep -q "<uuid>" out-copy/e2e-copy.xml; then echo "FAIL: the UUID was kept"; exit 1; fi
 echo "OK: renamed, UUID dropped"
 
 printf '\nPASS: whole-VM end-to-end checks\n'

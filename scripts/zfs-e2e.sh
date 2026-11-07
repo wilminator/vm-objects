@@ -35,7 +35,7 @@ dev="/dev/zvol/$vol"
 
 step "test zvol"
 zfs create -V 64M -o volblocksize=16K "$vol"
-for i in $(seq 50); do [ -e "$dev" ] && break; sleep 0.2; done
+for _ in $(seq 50); do [ -e "$dev" ] && break; sleep 0.2; done
 dd if=/dev/urandom of="$dev" bs=1M count=20 oflag=direct status=none
 dd if=/dev/urandom of="$dev" bs=1M seek=40 count=8 oflag=direct status=none
 sync

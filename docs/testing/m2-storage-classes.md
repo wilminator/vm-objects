@@ -22,7 +22,7 @@ Part B costs well under $1.
 Run from **WSL**, in the clone from milestone 1:
 
 ```bash
-cd ~/vm-objects && git fetch && git checkout m2-storage-classes && make build && make test
+cd ~/vm-objects && git pull && make build && make test
 ```
 
 ## A. QuObjects or MinIO (free)
@@ -58,9 +58,10 @@ Use the same bucket and `S3_OPTS` as milestone 1.
 
 ## B. Real AWS: archive, restore request, restore (under $1)
 
-Use the `vmobj-aws` profile and bucket from milestone 1. The IAM policy needs
-one more permission, `s3:RestoreObject`, so the first statement's Action
-becomes:
+Use the `vmobj-aws` profile and bucket from milestone 1. A bucket and user
+made by `scripts/aws/provision.sh` already have everything this part needs.
+For a user you set up by hand, the IAM policy needs one more permission,
+`s3:RestoreObject`, so the first statement's Action becomes:
 
 ```json
 "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:RestoreObject"]

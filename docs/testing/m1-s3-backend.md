@@ -24,12 +24,11 @@ echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
 go version
 ```
 
-Clone the repository and check out this milestone's branch:
+Clone the repository and build it:
 
 ```bash
 git clone https://github.com/wilminator/vm-objects.git ~/vm-objects
 cd ~/vm-objects
-git checkout m1-s3-backend
 make build && make test
 ```
 
@@ -131,9 +130,17 @@ names the step that failed, and that is what I need to see.
 
 ## 5. Optional: real AWS
 
-Only do this if you want to spend a few cents to confirm AWS itself. Create a
-bucket (for example `vmobj-test-<something unique>`) in your usual region, and
-an IAM user whose only permission is this policy:
+Only do this if you want to spend a few cents to confirm AWS itself.
+
+**The quick way:** `scripts/aws/provision.sh` creates the bucket, an IAM user
+with exactly the permissions milestones 1 to 3 need, and its credentials
+profile, and `scripts/aws/teardown.sh` removes them afterwards. See
+[Setting up AWS for vmobj](../aws.md#a-test-bucket). Use the bucket and
+profile it prints in place of `BUCKET` and `vmobj-aws` below, and skip to the
+two test commands.
+
+**By hand:** create a bucket (for example `vmobj-test-<something unique>`)
+in your usual region, and an IAM user whose only permission is this policy:
 
 ```json
 {
@@ -164,7 +171,7 @@ VMOBJ_TEST_S3='s3://BUCKET?region=us-west-2&profile=vmobj-aws' go test -count=1 
 scripts/e2e.sh "s3://BUCKET/e2e-$(date +%s)?region=us-west-2&profile=vmobj-aws" bin/vmobj
 ```
 
-Delete the bucket's contents afterwards.
+Delete the bucket's contents afterwards (`scripts/aws/teardown.sh` does it for a provisioned bucket).
 
 ## What to report back
 

@@ -47,7 +47,7 @@ QNAP keeps `virsh` and the TPM folder under `/QVS`, so the commands say so.
 ### 1. Copy the new binary over (from WSL)
 
 ```bash
-cd ~/vm-objects && git fetch && git checkout m5-whole-vm && make build-all
+cd ~/vm-objects && git pull && make build-all
 ```
 
 ```bash

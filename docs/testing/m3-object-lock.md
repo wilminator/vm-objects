@@ -32,7 +32,7 @@ run on a locked repository.
 Run from **WSL**:
 
 ```bash
-cd ~/vm-objects && git fetch && git checkout m3-object-lock && make build && make test
+cd ~/vm-objects && git pull && make build && make test
 ```
 
 ## A. QuObjects or MinIO
@@ -81,6 +81,13 @@ instead *appear* to work by adding a "delete marker". If so, check that the
 object's earlier version is still listed when the page shows versions.
 
 ## B. Real AWS (pennies)
+
+`scripts/aws/provision.sh` does steps 1 and 2 for you: its buckets have
+Object Lock on and no default retention, and its user has exactly the
+policy below, with the governance bypass explicitly denied. See
+[Setting up AWS for vmobj](../aws.md#a-test-bucket), then start at step 3.
+`scripts/aws/teardown.sh` removes the locked test objects afterwards, using
+your administrator's bypass permission.
 
 1. Create a **new** bucket, `vmobj-locked-<something unique>`, in your usual
    region. In the console, under *Advanced settings*, turn **Object Lock**
