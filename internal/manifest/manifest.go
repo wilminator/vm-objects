@@ -60,6 +60,12 @@ type Manifest struct {
 	ExtentSize extent.Length `json:"extentSize"`
 	Blocks     []extent.Ref  `json:"blocks"`
 	Overlay    []Overlay     `json:"overlay,omitempty"`
+
+	// Storage policy this run was made under. Empty in manifests written
+	// before profiles existed, and for repositories without classes.
+	Profile     string    `json:"profile,omitempty"`
+	DataClass   string    `json:"dataClass,omitempty"`  // class of the blocks or packs this run wrote
+	RetainUntil time.Time `json:"retainUntil,omitzero"` // keep restorable until at least this time
 }
 
 // NewName builds a sortable manifest name such as "20261030T202000Z-full".

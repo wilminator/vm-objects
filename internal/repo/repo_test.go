@@ -93,7 +93,7 @@ func TestBlockRoundTripAndHashCheck(t *testing.T) {
 	r, _ := Init(ctx, b, k, DefaultConfig())
 	data := []byte("block contents")
 	h := r.Hasher().Sum(data)
-	if _, err := r.PutBlock(ctx, h, data); err != nil {
+	if _, err := r.PutBlock(ctx, h, data, store.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.GetBlock(ctx, h)

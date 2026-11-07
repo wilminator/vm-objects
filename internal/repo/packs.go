@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/wilminator/vm-objects/internal/extent"
+	"github.com/wilminator/vm-objects/internal/store"
 )
 
 // Packs hold the small extents of incremental and differential runs. Each
@@ -46,6 +47,7 @@ func TOCKey(chain, id string) string { return "packs/" + chain + "/" + id + ".to
 type PackWriter struct {
 	repo    *Repo
 	chain   string
+	opts    store.PutOptions // for packs; TOCs always use the default class
 	buf     bytes.Buffer
 	entries []TOCEntry
 	// Written counts sealed bytes stored, Packs counts packs written.
@@ -56,9 +58,11 @@ type PackWriter struct {
 	Index map[extent.Hash]Location
 }
 
-// NewPackWriter starts writing packs for a chain.
-func (r *Repo) NewPackWriter(chain string) *PackWriter {
-	return &PackWriter{repo: r, chain: chain, Index: map[extent.Hash]Location{}}
+// NewPackWriter starts writing packs for a chain. Packs are stored with
+// opts; their TOCs go to the default (Standard) class, because the next
+// incremental and every restore plan must read them without waiting.
+func (r *Repo) NewPackWriter(chain string, opts store.PutOptions) *PackWriter {
+	return &PackWriter{repo: r, chain: chain, opts: opts, Index: map[extent.Hash]Location{}}
 }
 
 // Add seals one extent into the current pack, writing the pack out when it
@@ -84,7 +88,7 @@ func (w *PackWriter) Flush(ctx context.Context) error {
 	}
 	id := NewID()
 	packKey := PackKey(w.chain, id)
-	if err := w.repo.Backend.Put(ctx, packKey, w.buf.Bytes()); err != nil {
+	if err := store.PutWith(ctx, w.repo.Backend, packKey, w.buf.Bytes(), w.opts); err != nil {
 		return err
 	}
 	toc, err := json.Marshal(w.entries)

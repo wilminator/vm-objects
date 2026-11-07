@@ -117,6 +117,9 @@ jobs:
         env:
           VMOBJ_TEST_S3: s3://vmobj-ci/conformance?endpoint=http://127.0.0.1:9000
       - name: End-to-end against S3
+        # MinIO, like most self-hosted services, only has Standard storage.
+        env:
+          E2E_BACKUP_ARGS: --profile standard
         run: |
           make build
           scripts/e2e.sh "s3://vmobj-ci/e2e-$GITHUB_RUN_ID?endpoint=$ENDPOINT" bin/vmobj

@@ -15,9 +15,11 @@ import (
 
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/scan"
 	"github.com/wilminator/vm-objects/internal/source"
+	"github.com/wilminator/vm-objects/internal/store"
 )
 
 // BackupOptions describe one backup run.
@@ -29,6 +31,34 @@ type BackupOptions struct {
 	StatePath string // per-VM state file on this host
 	Workers   int
 	Now       func() time.Time // for tests; defaults to time.Now
+
+	// Profile sets this run's storage class and retention. Nil means no
+	// profile: data goes to the backend's default class and the manifest
+	// records no retention.
+	Profile *policy.Profile
+	// Class, when set, overrides the profile's class for this run's data.
+	Class policy.Class
+}
+
+// placement works out where this run's data goes and how long it is kept.
+func (o BackupOptions) placement(started time.Time) (store.PutOptions, *manifest.Manifest) {
+	m := &manifest.Manifest{}
+	class := o.Class
+	if o.Profile != nil {
+		rule := o.Profile.Rule(o.Kind)
+		if class == "" {
+			class = rule.Class
+		}
+		m.Profile = o.Profile.Name
+		m.RetainUntil = started.Add(rule.Retain)
+	}
+	// Record a class only where the storage really has classes, so a local
+	// folder's manifests don't claim Deep Archive.
+	if _, ok := o.Repo.Backend.(store.OptionPutter); !ok {
+		class = ""
+	}
+	m.DataClass = string(class)
+	return store.PutOptions{Class: string(class)}, m
 }
 
 // BackupStats summarise a run.
@@ -128,6 +158,7 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 	if err != nil {
 		return nil, err
 	}
+	put, policyFields := o.placement(started)
 	stats := &BackupStats{DiskBytes: o.Source.Size()}
 	size := o.Source.Size()
 	blocks := make([]extent.Ref, 0, scan.BlockCount(size, r.Config.BlockSize))
@@ -142,7 +173,7 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 		case have[b.Ref.Hash]:
 			stats.BlocksReused++
 		default:
-			n, err := r.PutBlock(ctx, b.Ref.Hash, b.Data)
+			n, err := r.PutBlock(ctx, b.Ref.Hash, b.Data, put)
 			if err != nil {
 				return err
 			}
@@ -165,7 +196,8 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 		Format: manifest.Format, VM: o.VM, Name: name, Kind: manifest.Full,
 		Created: started, Chain: repo.NewID(), Base: name,
 		DiskSize: size, BlockSize: r.Config.BlockSize, ExtentSize: r.Config.ExtentSize,
-		Blocks: blocks,
+		Blocks:  blocks,
+		Profile: policyFields.Profile, DataClass: policyFields.DataClass, RetainUntil: policyFields.RetainUntil,
 	}
 	if prev != nil {
 		m.Parent = prev.LastManifest
@@ -200,7 +232,8 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 			known[h] = true
 		}
 	}
-	pw := r.NewPackWriter(st.Chain)
+	put, policyFields := o.placement(started)
+	pw := r.NewPackWriter(st.Chain, put)
 	extSize := int64(r.Config.ExtentSize)
 	current := make([]extent.Ref, 0, len(st.Base))
 	var overlay []manifest.Overlay
@@ -251,6 +284,7 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 		Created: started, Chain: st.Chain, Base: st.BaseManifest, Parent: st.LastManifest,
 		DiskSize: st.DiskSize, BlockSize: st.BlockSize, ExtentSize: st.ExtentSize,
 		Blocks: st.Blocks, Overlay: overlay,
+		Profile: policyFields.Profile, DataClass: policyFields.DataClass, RetainUntil: policyFields.RetainUntil,
 	}
 	if err := r.PutManifest(ctx, m); err != nil {
 		return nil, err

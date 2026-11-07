@@ -166,6 +166,24 @@ func Run(t *testing.T, newBackend func(t *testing.T) store.Backend) {
 		}
 	})
 
+	t.Run("StatAndExplicitStandard", func(t *testing.T) {
+		b := newBackend(t)
+		// Explicit Standard must work everywhere, including services that
+		// know no other class.
+		must(t, store.PutWith(ctx, b, "s/obj", []byte("12345"), store.PutOptions{Class: "STANDARD"}))
+		info, err := store.Stat(ctx, b, "s/obj")
+		must(t, err)
+		if !info.Readable() || info.Archived {
+			t.Fatalf("Standard object reported unreadable: %+v", info)
+		}
+		if _, ok := b.(store.Statter); ok && info.Size != 5 {
+			t.Fatalf("Stat size = %d, want 5", info.Size)
+		}
+		if _, err := store.Stat(ctx, b, "s/missing"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("Stat missing: %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("CancelledContext", func(t *testing.T) {
 		b := newBackend(t)
 		cctx, cancel := context.WithCancel(ctx)

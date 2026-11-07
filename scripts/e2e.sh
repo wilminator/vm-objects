@@ -15,10 +15,14 @@
 # in between, restores every one, and checks each restore is byte-identical
 # to the disk at the time of its backup. All scratch files go in a temporary
 # folder that is removed at the end; the repository is left for inspection.
+#
+# E2E_BACKUP_ARGS adds options to every backup, for example
+#   E2E_BACKUP_ARGS="--profile standard"   for services that only know Standard.
 set -euo pipefail
 
 repo=${1:?usage: e2e.sh REPO [VMOBJ_BINARY]}
 vmobj=${2:-vmobj}
+read -ra extra <<< "${E2E_BACKUP_ARGS:-}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -39,17 +43,17 @@ step "full backup"
 truncate -s 40M "$disk"
 for m in 0 3 7 12 20 33; do scribble "$m"; done
 cp "$disk" "$work/want-full.raw"
-"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type full --state-dir "$state"
+"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type full --state-dir "$state" "${extra[@]}"
 
 step "incremental backup"
 scribble 5; scribble 21
 cp "$disk" "$work/want-inc.raw"
-"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type incremental --state-dir "$state"
+"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type incremental --state-dir "$state" "${extra[@]}"
 
 step "differential backup"
 scribble 38
 cp "$disk" "$work/want-diff.raw"
-"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type differential --state-dir "$state"
+"$vmobj" backup --repo "$repo" --key-file "$key" --source "$disk" --vm e2e --type differential --state-dir "$state" "${extra[@]}"
 
 step "list"
 "$vmobj" list --repo "$repo" --key-file "$key" --vm e2e

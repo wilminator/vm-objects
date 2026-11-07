@@ -19,6 +19,7 @@ import (
 
 	"github.com/wilminator/vm-objects/internal/keys"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/store"
@@ -34,6 +35,9 @@ type harness struct {
 	img   string
 	state string
 	clock time.Time
+	// Storage policy passed to each backup; nil means none.
+	profile *policy.Profile
+	class   policy.Class
 }
 
 func newHarness(t *testing.T) *harness {
@@ -92,18 +96,25 @@ func (h *harness) write(data []byte) {
 
 func (h *harness) backup(kind manifest.Kind) *BackupStats {
 	h.t.Helper()
+	st, err := h.tryBackup(kind)
+	if err != nil {
+		h.t.Fatalf("%s backup: %v", kind, err)
+	}
+	return st
+}
+
+// tryBackup runs a backup one hour after the previous one.
+func (h *harness) tryBackup(kind manifest.Kind) (*BackupStats, error) {
+	h.t.Helper()
 	src, err := source.OpenRaw(h.img)
 	if err != nil {
 		h.t.Fatal(err)
 	}
 	defer src.Close()
 	h.clock = h.clock.Add(time.Hour)
-	st, err := Backup(h.ctx, BackupOptions{Repo: h.repo, Source: src, VM: "win11",
-		Kind: kind, StatePath: h.state, Workers: 4, Now: func() time.Time { return h.clock }})
-	if err != nil {
-		h.t.Fatalf("%s backup: %v", kind, err)
-	}
-	return st
+	return Backup(h.ctx, BackupOptions{Repo: h.repo, Source: src, VM: "win11",
+		Kind: kind, StatePath: h.state, Workers: 4, Now: func() time.Time { return h.clock },
+		Profile: h.profile, Class: h.class})
 }
 
 // tamper flips the last bit of a stored object. It goes through the

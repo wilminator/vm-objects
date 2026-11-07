@@ -200,13 +200,13 @@ func BlockKey(h extent.Hash) string {
 	return "blocks/" + s[:2] + "/" + s
 }
 
-// PutBlock seals and stores one base block.
-func (r *Repo) PutBlock(ctx context.Context, h extent.Hash, data []byte) (int, error) {
+// PutBlock seals and stores one base block with the given storage options.
+func (r *Repo) PutBlock(ctx context.Context, h extent.Hash, data []byte, opts store.PutOptions) (int, error) {
 	sealed, err := r.sealer.Seal(h[:], data)
 	if err != nil {
 		return 0, err
 	}
-	return len(sealed), r.Backend.Put(ctx, BlockKey(h), sealed)
+	return len(sealed), store.PutWith(ctx, r.Backend, BlockKey(h), sealed, opts)
 }
 
 // GetBlock fetches a base block and checks it really has hash h.
