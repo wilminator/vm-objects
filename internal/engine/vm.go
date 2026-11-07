@@ -385,8 +385,14 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	}
 	st := &RestoreVMStats{Disks: map[string]string{}, Record: rec}
 	changes := vmdef.Changes{Disks: map[string]vmdef.DiskChange{}}
+	// QNAP Virtualization Station's disk picker lists only image names it
+	// knows, such as .img; raw disk data either way.
+	ext := ".raw"
+	if o.Target == "qnap" {
+		ext = ".img"
+	}
 	for _, d := range rec.Disks {
-		out := filepath.Join(dir, name+"-"+d.Target+".raw")
+		out := filepath.Join(dir, name+"-"+d.Target+ext)
 		ro := RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}
 		if o.Progress != nil {
 			target := d.Target

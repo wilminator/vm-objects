@@ -151,10 +151,10 @@ check_restore() {
   fi
   local d target src got
   for d in "${disks[@]}"; do
-    # Restored disks are named <VM>-<target>.raw; the VM's name there is
+    # Restored disks are named <VM>-<target>.raw (.img for QNAP); the VM's name there is
     # the platform's (TrueNAS's WinGames, not libvirt's 1_WinGames).
     target=${d%% *} src=${d#* }
-    got=$(find "$out" -maxdepth 1 -name "*-$target.raw" | head -n1)
+    got=$(find "$out" -maxdepth 1 \( -name "*-$target.raw" -o -name "*-$target.img" \) | head -n1)
     if [ -z "$got" ] || [ ! -f "$got" ]; then bad "disk $target wasn't restored"; continue; fi
     case $src in
       *.qcow2|*.qcow)
@@ -175,7 +175,7 @@ check_restore() {
   if [ -n "$def" ]; then
     local bad_def=0
     for d in "${disks[@]}"; do
-      grep -q "$out/[^/'\"]*-${d%% *}.raw" "$def" || { bad "the definition doesn't point disk ${d%% *} at its restored file"; bad_def=1; }
+      grep -Eq "$out/[^/'\"]*-${d%% *}\.(raw|img)" "$def" || { bad "the definition doesn't point disk ${d%% *} at its restored file"; bad_def=1; }
     done
     if grep -q "<backingStore" "$def"; then bad "the definition still has a <backingStore> chain"; bad_def=1; fi
     [ $bad_def -eq 0 ] && ok "definition points every disk at its restored file, with no backing chain"
