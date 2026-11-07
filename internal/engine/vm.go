@@ -520,9 +520,18 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 			fmt.Fprintf(&b, "     mkdir -p %s\n", tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
 			fmt.Fprintf(&b, "     cp -a %s/. %s/\n\n", filepath.Join(dir, "tpm"), tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
 		}
-		b.WriteString("3. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
-		b.WriteString("   over the new VM's (its path is the <nvram> line of `virsh dumpxml`) while\n")
-		b.WriteString("   it is stopped.\n\n")
+		nvram := ""
+		for _, f := range rec.Files {
+			if f.Role == "nvram" {
+				nvram = filepath.Join(dir, f.Name)
+			}
+		}
+		if nvram != "" {
+			b.WriteString("3. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
+			b.WriteString("   over the new VM's while it is stopped. Its path is the <nvram> line of\n")
+			fmt.Fprintf(&b, "   `%s dumpxml <UUID>`:\n\n", platform.QNAPVirsh)
+			fmt.Fprintf(&b, "     cp %s <that path>\n\n", nvram)
+		}
 		if from == "truenas" {
 			b.WriteString("Windows activation is tied to the original's hardware identity (its SMBIOS\n")
 			fmt.Fprintf(&b, "line is in %s, command_line_args). Virtualization Station may not let\n", config)
