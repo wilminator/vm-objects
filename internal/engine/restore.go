@@ -314,6 +314,9 @@ func Verify(ctx context.Context, r *repo.Repo, vm, name string, deep bool) (*Ver
 	vs := &VerifyStats{Deep: deep}
 	checked := map[extent.Hash]bool{}
 	for i, ref := range m.Blocks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if ref.Zero {
 			continue
 		}
@@ -332,6 +335,9 @@ func Verify(ctx context.Context, r *repo.Repo, vm, name string, deep bool) (*Ver
 		}
 	}
 	for _, ov := range m.Overlay {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if ov.Ref.Zero {
 			continue
 		}
