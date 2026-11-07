@@ -71,15 +71,49 @@ type ZFSOptions struct {
 	Now          func() time.Time
 	// DeviceWait is how long to wait for the clone's device node.
 	DeviceWait time.Duration
+	// Snapshot, when set, is an existing snapshot of the zvol to read
+	// (from SnapshotZvols). OpenZFS then takes none of its own, but still
+	// destroys this one on Close unless KeepSnapshot is set.
+	Snapshot string
+}
+
+// SnapshotZvols snapshots several zvols in one zfs command, which ZFS
+// does atomically: every disk of a VM is captured at the same instant.
+// It returns the snapshot name per zvol.
+func SnapshotZvols(ctx context.Context, r ZFSRunner, now time.Time, datasets ...string) (map[string]string, error) {
+	if r == nil {
+		r = ExecZFS{}
+	}
+	stamp := now.UTC().Format("20060102T150405Z")
+	names := map[string]string{}
+	args := []string{"snapshot"}
+	for _, ds := range datasets {
+		if err := checkZvolName(ds); err != nil {
+			return nil, err
+		}
+		names[ds] = ds + "@vmobj-" + stamp
+		args = append(args, names[ds])
+	}
+	if _, err := r.Run(ctx, args...); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+func checkZvolName(dataset string) error {
+	if !zfsName.MatchString(dataset) || strings.Contains(dataset, "//") || strings.HasSuffix(dataset, "/") ||
+		strings.Contains(dataset, "..") || !strings.Contains(dataset, "/") {
+		return fmt.Errorf("%q is not a zvol name like pool/vms/win11", dataset)
+	}
+	return nil
 }
 
 var zfsName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]*$`)
 
 // OpenZFS snapshots a zvol and opens the snapshot for reading.
 func OpenZFS(ctx context.Context, dataset string, o ZFSOptions) (*ZFS, error) {
-	if !zfsName.MatchString(dataset) || strings.Contains(dataset, "//") || strings.HasSuffix(dataset, "/") ||
-		strings.Contains(dataset, "..") || !strings.Contains(dataset, "/") {
-		return nil, fmt.Errorf("%q is not a zvol name like pool/vms/win11", dataset)
+	if err := checkZvolName(dataset); err != nil {
+		return nil, err
 	}
 	if o.Runner == nil {
 		o.Runner = ExecZFS{}
@@ -103,7 +137,15 @@ func OpenZFS(ctx context.Context, dataset string, o ZFSOptions) (*ZFS, error) {
 
 	stamp := o.Now().UTC().Format("20060102T150405Z")
 	z := &ZFS{z: o.Runner, snapshot: dataset + "@vmobj-" + stamp, clone: dataset + "-vmobj-" + stamp, keep: o.KeepSnapshot}
-	if _, err := o.Runner.Run(ctx, "snapshot", z.snapshot); err != nil {
+	if o.Snapshot != "" {
+		// Only snapshots that vmobj names may be adopted, so Close can
+		// never destroy someone else's snapshot.
+		snapStamp, ok := strings.CutPrefix(o.Snapshot, dataset+"@vmobj-")
+		if !ok || len(snapStamp) != len(stamp) {
+			return nil, fmt.Errorf("%s is not a vmobj snapshot of %s", o.Snapshot, dataset)
+		}
+		z.snapshot, z.clone = o.Snapshot, dataset+"-vmobj-"+snapStamp
+	} else if _, err := o.Runner.Run(ctx, "snapshot", z.snapshot); err != nil {
 		return nil, err
 	}
 	// From here on, undo on failure.

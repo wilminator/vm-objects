@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/engine"
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/keys"
+	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/measure"
 	"github.com/wilminator/vm-objects/internal/policy"
@@ -47,6 +49,11 @@ Usage:
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
+  vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
+                    [--vm NAME] [--profile NAME] [--quiesce] [--virsh PATH] [--connect URI] [--swtpm-dir DIR]
+  vmobj vms         --repo REPO --key-file PATH [--vm NAME]
+  vmobj restore-vm  --repo REPO --key-file PATH --vm NAME --record NAME --to DIR [--new-name NAME]
+                    [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
   vmobj profiles
   vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
@@ -62,6 +69,13 @@ DISK is a disk image file (raw or qcow2, with its backing chain), a block
 device, or zfs:POOL/ZVOL to snapshot a zvol and back up the snapshot. Files
 named *.qcow2 are read as qcow2 and anything else as raw; --format raw|qcow2
 overrides that. vmobj never decides the format from a disk's contents.
+
+backup-vm backs up a whole libvirt VM: every disk, its definition, its UEFI
+NVRAM and its TPM state. A running VM's zvol disks are snapshotted together
+(--quiesce freezes the guest's filesystems through the guest agent first);
+a running VM with disk image files is refused, so shut it down first.
+restore-vm writes the disks, an adjusted definition and the NVRAM/TPM files
+into a folder, with instructions; it never changes libvirt itself.
 
 Profiles pick a storage class and retention for each kind of backup (see
 "vmobj profiles"). The default is disaster-recovery. Self-hosted S3 services
@@ -98,6 +112,12 @@ func main() {
 		err = cmdProfiles()
 	case "prune":
 		err = cmdPrune(ctx, args)
+	case "backup-vm":
+		err = cmdBackupVM(ctx, args)
+	case "restore-vm":
+		err = cmdRestoreVM(ctx, args)
+	case "vms":
+		err = cmdVMs(ctx, args)
 	case "version":
 		fmt.Println("vmobj", version)
 	case "help", "-h", "--help":
@@ -638,5 +658,158 @@ func cmdPrune(ctx context.Context, args []string) error {
 	} else {
 		fmt.Println("Nothing was deleted. Run again with --apply to delete.")
 	}
+	return nil
+}
+
+func cmdBackupVM(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("backup-vm", flag.ExitOnError)
+	dir := fs.String("repo", "", "repository: a folder path or s3://...")
+	keyFile := fs.String("key-file", "", "key file")
+	domain := fs.String("domain", "", "libvirt domain name or UUID")
+	vm := fs.String("vm", "", "name in the repository (default: the domain's name)")
+	kind := fs.String("type", "", "full, incremental or differential")
+	profileName := fs.String("profile", policy.DefaultProfile, "storage profile (see vmobj profiles)")
+	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
+	stateDir := fs.String("state-dir", "", "where this host keeps per-disk state")
+	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
+	quiesce := fs.Bool("quiesce", false, "freeze the guest's filesystems (QEMU guest agent) while a running VM is snapshotted")
+	swtpmDir := fs.String("swtpm-dir", engine.DefaultSwtpmDir, "where libvirt keeps TPM state (QNAP: /QVS/var/lib/libvirt/swtpm)")
+	virshPath := fs.String("virsh", "virsh", "virsh program (QNAP: /QVS/usr/bin/virsh)")
+	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system")
+	fs.Parse(args)
+	if err := require(fs, "repo", "key-file", "domain", "type"); err != nil {
+		return err
+	}
+	k, err := manifest.ParseKind(*kind)
+	if err != nil {
+		return err
+	}
+	prof, err := policy.Lookup(*profileName)
+	if err != nil {
+		return err
+	}
+	var class policy.Class
+	if *classFlag != "" {
+		if class, err = policy.ParseClass(*classFlag); err != nil {
+			return err
+		}
+	}
+	r, err := openRepo(ctx, *dir, *keyFile)
+	if err != nil {
+		return err
+	}
+	if *stateDir == "" {
+		*stateDir = filepath.Join(defaultStateDir(), r.Config.RepoID)
+	}
+	start := time.Now()
+	st, err := engine.BackupVM(ctx, engine.BackupVMOptions{
+		Repo: r, Domain: *domain, VM: *vm, Kind: k, Profile: &prof, Class: class, Workers: *workers,
+		StateDir: *stateDir, Quiesce: *quiesce, SwtpmDir: *swtpmDir,
+		Virsh: libvirt.Virsh{Path: *virshPath, Connect: *connect},
+		Progress: func(target string, s source.Source) (source.Source, func()) {
+			fmt.Fprintf(os.Stderr, "Disk %s (%s)...\n", target, units.Format(s.Size()))
+			return withProgress(s)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("VM record: %s (%s)\n", st.Record, st.Consistency)
+	var targets []string
+	for t := range st.Disks {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	for _, t := range targets {
+		d := st.Disks[t]
+		fmt.Printf("  %-6s %s, %s written\n", t, d.Manifest, units.Format(d.BytesWritten))
+	}
+	fmt.Printf("Files:     %d (NVRAM and TPM state, inside the record)\n", st.Files)
+	for _, s := range st.Skipped {
+		fmt.Printf("Skipped:   %s\n", s)
+	}
+	fmt.Printf("Took:      %s\n", time.Since(start).Round(time.Second))
+	return nil
+}
+
+func cmdVMs(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("vms", flag.ExitOnError)
+	dir := fs.String("repo", "", "repository: a folder path or s3://...")
+	keyFile := fs.String("key-file", "", "key file")
+	vm := fs.String("vm", "", "only this VM")
+	fs.Parse(args)
+	if err := require(fs, "repo", "key-file"); err != nil {
+		return err
+	}
+	r, err := openRepo(ctx, *dir, *keyFile)
+	if err != nil {
+		return err
+	}
+	vms := []string{*vm}
+	if *vm == "" {
+		if vms, err = r.ListRecordVMs(ctx); err != nil {
+			return err
+		}
+	}
+	for _, v := range vms {
+		names, err := r.ListVMRecords(ctx, v)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s:\n", v)
+		for _, n := range names {
+			rec, err := r.GetVMRecord(ctx, v, n)
+			if err != nil {
+				return err
+			}
+			var disks []string
+			for _, d := range rec.Disks {
+				disks = append(disks, d.Target)
+			}
+			keep := "-"
+			if !rec.RetainUntil.IsZero() {
+				keep = rec.RetainUntil.Local().Format("2006-01-02")
+			}
+			fmt.Printf("  %-36s %-18s disks %-12s keep until %s\n", n, rec.Consistency, strings.Join(disks, ","), keep)
+		}
+	}
+	return nil
+}
+
+func cmdRestoreVM(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("restore-vm", flag.ExitOnError)
+	dir := fs.String("repo", "", "repository: a folder path or s3://...")
+	keyFile := fs.String("key-file", "", "key file")
+	vm := fs.String("vm", "", "VM name (see vmobj vms)")
+	record := fs.String("record", "", "VM record to restore (see vmobj vms)")
+	to := fs.String("to", "", "folder to restore into (created; must be empty)")
+	newName := fs.String("new-name", "", "rename the VM and drop its UUID, to run it next to the original")
+	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
+	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
+	days := fs.Int("days", 7, "days the restored copies stay readable")
+	fs.Parse(args)
+	if err := require(fs, "repo", "key-file", "vm", "record", "to"); err != nil {
+		return err
+	}
+	tier, err := policy.ParseTier(*tierFlag)
+	if err != nil {
+		return err
+	}
+	r, err := openRepo(ctx, *dir, *keyFile)
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName})
+	var nr *engine.NotReadyError
+	if errors.As(err, &nr) {
+		return explainNotReady(ctx, r, nr.Readiness, *request, tier, *days)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Restored %s (%s) into %s in %s.\n", st.Record.DomainName, st.Record.Name, *to, time.Since(start).Round(time.Second))
+	fmt.Printf("Definition: %s\n", st.Definition)
+	fmt.Println("Nothing was registered with libvirt. Read RESTORE.txt in that folder for the next steps.")
 	return nil
 }
