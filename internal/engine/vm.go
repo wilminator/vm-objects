@@ -60,7 +60,9 @@ type BackupVMStats struct {
 	Record      string
 	Consistency string
 	Disks       map[string]*BackupStats // by target
-	Files       int
+	Files       int                     // NVRAMFiles + TPMFiles
+	NVRAMFiles  int
+	TPMFiles    int
 	Skipped     []string
 }
 
@@ -221,6 +223,14 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 		return nil, err
 	}
 	stats.Record, stats.Files = name, len(files)
+	for _, f := range files {
+		switch f.Role {
+		case "nvram":
+			stats.NVRAMFiles++
+		case "tpm":
+			stats.TPMFiles++
+		}
+	}
 	return stats, nil
 }
 

@@ -178,6 +178,7 @@ func Rewrite(data []byte, ch Changes) ([]byte, error) {
 		diskTag tagSpan // the <disk> start tag
 		driver  tagSpan
 		source  tagSpan
+		backing tagSpan // the disk's <backingStore>...</backingStore>, if any
 		target  string
 		found   = map[string]bool{}
 		nvram   bool
@@ -202,11 +203,13 @@ func Rewrite(data []byte, ch Changes) ([]byte, error) {
 			path := strings.Join(stack, "/")
 			switch {
 			case path == "domain/devices/disk":
-				inDisk, diskTag, driver, source, target = attr(t, "device", "disk") == "disk", span, tagSpan{}, tagSpan{}, ""
+				inDisk, diskTag, driver, source, backing, target = attr(t, "device", "disk") == "disk", span, tagSpan{}, tagSpan{}, tagSpan{}, ""
 			case inDisk && path == "domain/devices/disk/driver":
 				driver = span
 			case inDisk && path == "domain/devices/disk/source":
 				source = span
+			case inDisk && path == "domain/devices/disk/backingStore":
+				backing.start = span.start
 			case inDisk && path == "domain/devices/disk/target":
 				target = attr(t, "dev", "")
 			case path == "domain/os/nvram":
@@ -235,9 +238,12 @@ func Rewrite(data []byte, ch Changes) ([]byte, error) {
 					edits = append(edits, edit{uuidAt, span.end, ""})
 				}
 			}
+			if inDisk && path == "domain/devices/disk/backingStore" {
+				backing.end = span.end
+			}
 			if path == "domain/devices/disk" && inDisk {
 				if c, ok := ch.Disks[target]; ok {
-					es, err := diskEdits(data, diskTag, driver, source, c)
+					es, err := diskEdits(data, diskTag, driver, source, backing, c)
 					if err != nil {
 						return nil, fmt.Errorf("disk %s: %w", target, err)
 					}
@@ -270,7 +276,7 @@ type tagSpan struct{ start, end int }
 
 func (s tagSpan) ok() bool { return s.end > s.start }
 
-func diskEdits(data []byte, disk, driver, source tagSpan, c DiskChange) ([]edit, error) {
+func diskEdits(data []byte, disk, driver, source, backing tagSpan, c DiskChange) ([]edit, error) {
 	if !source.ok() {
 		return nil, errors.New("has no <source> element")
 	}
@@ -307,6 +313,20 @@ func diskEdits(data []byte, disk, driver, source tagSpan, c DiskChange) ([]edit,
 			return nil, err
 		}
 		edits = append(edits, e)
+	}
+	// A restored disk is one standalone image, so the old backing chain
+	// (qcow2 layers that the restore has already flattened) must go: left
+	// in, it describes files the new disk does not use. The line it sat
+	// on goes with it.
+	if backing.ok() {
+		start := backing.start
+		for start > 0 && (data[start-1] == ' ' || data[start-1] == '\t') {
+			start--
+		}
+		if start > 0 && data[start-1] == '\n' {
+			start--
+		}
+		edits = append(edits, edit{start, backing.end, ""})
 	}
 	return edits, nil
 }
