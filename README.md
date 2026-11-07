@@ -175,6 +175,25 @@ locked backup early.
 each VM's newest backup, never touches objects written in the last 48
 hours, and leaves locked objects for a later run.
 
+## Progress output
+
+`measure`, `backup`, `backup-vm`, `restore` and `restore-vm` show progress
+on standard error. On a terminal it is one status line rewritten in place;
+in a log or a cron job, a new line every 5 seconds. Choose with
+`--progress line|lines|dots|json|none`, and shape the line with a template:
+
+```bash
+vmobj restore ... --progress-format '%P %p of %S (%s), %r left'
+```
+
+```text
+10.2% 1.70 GiB of 16.67 GiB (432.70 MiB/s), 35s left
+```
+
+`{unit}` fixes a unit, binary (`{MiB}`, powers of 1024, the default) or
+decimal (`{MB}`, powers of 1000); the unit you write is the unit printed.
+`vmobj help progress` lists every code, unit and mode.
+
 ## How it stores data
 
 - **Content IDs** are keyed BLAKE3 hashes, so the storage owner can't tell
