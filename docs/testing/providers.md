@@ -34,7 +34,7 @@ PASS/FAIL table.
 The engine's own S3 tests run against any bucket too (they need Go):
 
 ```bash
-VMOBJ_TEST_S3='s3://BUCKET/conformance?endpoint=...&region=...&profile=...' VMOBJ_TEST_S3_LOCKS=1 go test ./internal/store/ -run Conformance -v
+VMOBJ_TEST_S3='s3://BUCKET/conformance?endpoint=...&region=...&profile=...' VMOBJ_TEST_S3_LOCKS=1 go test ./internal/store/ -run 'TestS3(Conformance|Locks)$' -v
 ```
 
 ## Archive classes
