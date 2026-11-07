@@ -83,8 +83,10 @@ step "the VM"
 state=$("${vsh[@]}" domstate "$domain" 2>&1) || die "virsh can't see $domain: $state"
 [ "$state" = "shut off" ] || die "$domain is '$state'. Shut it down first: its disks must not change during the test."
 uuid=$("${vsh[@]}" domuuid "$domain" | tr -d '[:space:]')
-name=$("${vsh[@]}" domname "$domain" | tr -d '\n')
 xml=$("${vsh[@]}" dumpxml --inactive "$domain")
+# The name from the definition: "virsh domname" takes only an ID or UUID.
+name=$(sed -n 's:.*<name>\(.*\)</name>.*:\1:p' <<<"$xml" | head -n1)
+[ -n "$name" ] || die "couldn't read the name of $domain from its definition"
 echo "   $name ($uuid), shut off"
 
 # Disks: "file disk vda /path" or "block disk vdb /dev/...". CD-ROMs are skipped.
