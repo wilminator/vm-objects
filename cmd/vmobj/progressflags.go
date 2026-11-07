@@ -127,7 +127,7 @@ func restoreProgress(pc progress.Config, dest string) (func(target string, p eng
 	return report, func() { mu.Lock(); finish(); mu.Unlock() }
 }
 
-const progressHelp = `Progress options (measure, backup, backup-vm, restore, restore-vm):
+const progressHelp = `Progress options (measure, backup, backup-vm, restore, restore-vm, copy):
 
   --progress MODE           auto (default): one line rewritten in place on a
                             terminal, a new line every 5s otherwise (logs, cron)
@@ -174,4 +174,41 @@ func startMetrics(on bool) {
 	if on {
 		runMetrics = metrics.New()
 	}
+}
+
+// copyProgress shows each backup being copied: a line as it starts its
+// base blocks and its later changes, and progress while it copies.
+func copyProgress(pc progress.Config) (func(name string, p engine.Phase, done, total int64), func()) {
+	var (
+		mu      sync.Mutex
+		t       *progress.Task
+		current string
+		phase   engine.Phase
+	)
+	finish := func() {
+		if t != nil {
+			t.Finish()
+			t = nil
+		}
+	}
+	report := func(name string, p engine.Phase, done, total int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if t == nil || name != current || p != phase {
+			finish()
+			current, phase = name, p
+			label := name
+			if pc.Mode != progress.None && pc.Mode != progress.JSON {
+				if p == engine.PhaseChanges {
+					label = name + " (later changes)"
+					fmt.Fprintf(os.Stderr, "Copying %s: %s of later changes...\n", name, units.Format(total))
+				} else {
+					fmt.Fprintf(os.Stderr, "Copying %s: %s disk...\n", name, units.Format(total))
+				}
+			}
+			t = pc.Start(label, total)
+		}
+		t.Set(done)
+	}
+	return report, func() { mu.Lock(); finish(); mu.Unlock() }
 }

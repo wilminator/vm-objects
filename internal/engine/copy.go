@@ -46,6 +46,11 @@ type CopyOptions struct {
 	Profile *policy.Profile
 	Class   policy.Class
 	Now     func() time.Time
+	// Progress, when set, is told how far each backup's copy has got:
+	// PhaseWriting over its base blocks (bytes of disk covered), then
+	// PhaseChanges over its newer extents, as in RestoreOptions. name is
+	// "vm/manifest".
+	Progress func(name string, phase Phase, done, total int64)
 }
 
 // CopyStats summarise a copy.
@@ -145,15 +150,30 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 	translateExt := map[extent.Hash]extent.Hash{} // extents
 	var reused []string
 
+	report := func(Phase, int64, int64) {}
+	if o.Progress != nil {
+		label := vm + "/" + name
+		report = func(p Phase, done, total int64) { o.Progress(label, p, done, total) }
+	}
+
 	// Base blocks.
 	have, err := o.To.BlockSet(ctx)
 	if err != nil {
 		return err
 	}
-	for _, ref := range m.Blocks {
+	var done int64
+	report(PhaseWriting, 0, m.DiskSize)
+	for i, ref := range m.Blocks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		off := int64(i) * int64(m.BlockSize)
+		done = min(off+int64(m.BlockSize), m.DiskSize)
 		if ref.Zero {
+			report(PhaseWriting, done, m.DiskSize)
 			continue
 		}
+		report(PhaseWriting, off, m.DiskSize)
 		if _, done := translate[ref.Hash]; done {
 			continue
 		}
@@ -193,6 +213,7 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 		have[translate[ref.Hash]] = true
 		st.BlocksCopied++
 	}
+	report(PhaseWriting, m.DiskSize, m.DiskSize)
 
 	// Overlay extents, into packs of the same chain at the destination.
 	overlay := make([]manifest.Overlay, len(m.Overlay))
@@ -207,7 +228,13 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 		}
 		pw := o.To.NewPackWriter(m.Chain, put)
 		reusedPacks := map[string]bool{}
+		changes := int64(len(m.Overlay)) * int64(m.ExtentSize)
+		report(PhaseChanges, 0, changes)
 		for i, ov := range m.Overlay {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			report(PhaseChanges, int64(i)*int64(m.ExtentSize), changes)
 			overlay[i] = ov
 			if ov.Ref.Zero {
 				continue
@@ -239,6 +266,7 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 		if err := pw.Flush(ctx); err != nil {
 			return err
 		}
+		report(PhaseChanges, changes, changes)
 		st.BytesWritten += pw.Written
 		for p := range reusedPacks {
 			reused = append(reused, p, repo.TOCForPack(p))

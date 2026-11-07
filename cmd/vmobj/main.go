@@ -63,7 +63,7 @@ Usage:
   vmobj version
   vmobj help [progress]
 
-measure, backup, backup-vm, restore and restore-vm also take --progress,
+measure, backup, backup-vm, restore, restore-vm and copy also take --progress,
 --progress-format and related options; see "vmobj help progress".
 
 REPO is a folder path, or an S3 bucket:
@@ -104,10 +104,19 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	// Ctrl-C cancels the context; work stops cleanly between blocks, and
-	// no manifest is written for an unfinished run.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first Ctrl-C (or SIGTERM) cancels the context: work stops cleanly
+	// at the next block, and no manifest is written for an unfinished run.
+	// A second one quits at once, as if vmobj had not caught the first.
+	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		fmt.Fprintln(os.Stderr, "\nStopping after the current block; press Ctrl+C again to quit now.")
+		stop()
+		signal.Reset(os.Interrupt, syscall.SIGTERM)
+	}()
 
 	var err error
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
@@ -155,6 +164,10 @@ func main() {
 	// stage is often why.
 	runMetrics.Report(os.Stderr)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "vmobj: stopped before finishing. Nothing was recorded for the unfinished run; any pieces it already stored are reused next time or removed by prune.")
+			os.Exit(130)
+		}
 		fmt.Fprintln(os.Stderr, "vmobj:", err)
 		os.Exit(1)
 	}
@@ -928,9 +941,14 @@ func cmdCopy(ctx context.Context, args []string) error {
 	record := fs.String("record", "", "copy only this whole-VM backup of --vm")
 	profileName := fs.String("profile", policy.DefaultProfile, "storage profile at the destination")
 	classFlag := fs.String("class", "", "storage class at the destination, overriding the profile")
+	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
 	startMetrics(*metricsOn)
+	pc, perr := pf.config()
+	if perr != nil {
+		return perr
+	}
 	if err := require(fs, "from", "to", "key-file"); err != nil {
 		return err
 	}
@@ -961,7 +979,9 @@ func cmdCopy(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	o := engine.CopyOptions{From: src, To: dst, Profile: &prof, Class: class}
+	report, stopReport := copyProgress(pc)
+	defer stopReport()
+	o := engine.CopyOptions{From: src, To: dst, Profile: &prof, Class: class, Progress: report}
 	start := time.Now()
 	st := &engine.CopyStats{}
 	switch {
@@ -972,6 +992,7 @@ func cmdCopy(ctx context.Context, args []string) error {
 	default:
 		st, err = engine.CopyAll(ctx, o, *vm)
 	}
+	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {
 		fmt.Println("The source backup is in archive storage; restore it there first (vmobj restore --request-restore).")
