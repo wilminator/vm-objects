@@ -88,6 +88,38 @@ A plain restore also became one pass: each block is written once, with its
 newer extents merged in memory, and a full block that newer extents cover
 entirely isn't fetched.
 
+## Staged restores (built second)
+
+`restore --mode staged` updates an existing file or device without
+touching it until the result is proven:
+
+1. The target is opened read-only. The blocks that differ (all of them, or
+   with `--base` only those that differ between the two backups) are
+   compared, and the 4 KiB pieces to change go to a journal, each record
+   sealed with the repository's key (compressed, encrypted, and bound to
+   its place in the journal).
+2. Every block of target-plus-journal is checked against the backup, and
+   the whole disk's SHA-256 computed (`--expect-sha256` compares it).
+   Blocks that are wrong, for example because the target wasn't what
+   `--base` said, are fetched whole into the journal and checked again.
+3. Only then is the journal committed (synced, with a commit record),
+   applied, read back and removed.
+
+Interrupted while applying, the same command finishes from the committed
+journal. An uncommitted journal is discarded: the target was never
+touched. A journal for a different restore is refused, and a damaged
+journal fails its seal. With `--base`, the room the journal may need is
+checked before anything is fetched; the journal's filesystem keeps 256 MiB
+free and a restore stops cleanly, target untouched, if it runs low.
+
+Changes are written twice (journal, then target); the target is read once
+to compare (only the differing blocks with `--base`) and once to check.
+`zfs-replay.sh --staged DIR` uses it.
+
+Later: reuse an uncommitted journal's fetched pieces on a rerun (they are
+discarded today), and keep pieces as fetched (still compressed) rather
+than re-compressing.
+
 ## First step: how Virtualization Station stores snapshots
 
 QNAP stores VM snapshots as deltas. Which kind decides how `Recreate`
