@@ -38,13 +38,19 @@ const usage = `vmobj - block-level backups of virtual machine disks
 
 Usage:
   vmobj key init    --key-file PATH
-  vmobj init        --repo DIR --key-file PATH [--block-size 4MiB] [--extent-size 64KiB]
+  vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB]
   vmobj measure     --source DISK [--name NAME] [--state-dir DIR]
-  vmobj backup      --repo DIR --key-file PATH --source DISK --vm NAME --type full|incremental|differential
-  vmobj list        --repo DIR --key-file PATH [--vm NAME]
-  vmobj restore     --repo DIR --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
-  vmobj verify      --repo DIR --key-file PATH --vm NAME --manifest NAME [--deep]
+  vmobj backup      --repo REPO --key-file PATH --source DISK --vm NAME --type full|incremental|differential
+  vmobj list        --repo REPO --key-file PATH [--vm NAME]
+  vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
+  vmobj verify      --repo REPO --key-file PATH --vm NAME --manifest NAME [--deep]
   vmobj version
+
+REPO is a folder path, or an S3 bucket:
+  s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|false]
+  endpoint= points at an S3-compatible service such as QNAP QuObjects or MinIO.
+  Credentials come from the AWS environment variables or ~/.aws/credentials
+  (choose a section with profile=), never from the address.
 
 DISK is a raw image file or a block device (for example a zvol snapshot).
 `
@@ -116,7 +122,7 @@ func openRepo(ctx context.Context, dir, keyFile string) (*repo.Repo, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := store.NewLocal(dir)
+	b, err := store.Open(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +187,7 @@ func cmdKey(args []string) error {
 
 func cmdInit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	dir := fs.String("repo", "", "repository folder")
+	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	blockSize := fs.String("block-size", "4MiB", "base block size")
 	extentSize := fs.String("extent-size", "64KiB", "incremental extent size")
@@ -205,7 +211,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		}
 		*s.out = v
 	}
-	b, err := store.NewLocal(*dir)
+	b, err := store.Open(ctx, *dir)
 	if err != nil {
 		return err
 	}
@@ -293,7 +299,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 
 func cmdBackup(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
-	dir := fs.String("repo", "", "repository folder")
+	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	src := fs.String("source", "", "raw disk image or block device (use a snapshot)")
 	vm := fs.String("vm", "", "VM name")
@@ -345,7 +351,7 @@ func cmdBackup(ctx context.Context, args []string) error {
 
 func cmdList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	dir := fs.String("repo", "", "repository folder")
+	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	vm := fs.String("vm", "", "only this VM")
 	fs.Parse(args)
@@ -377,7 +383,7 @@ func cmdList(ctx context.Context, args []string) error {
 
 func cmdRestore(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
-	dir := fs.String("repo", "", "repository folder")
+	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	vm := fs.String("vm", "", "VM name")
 	name := fs.String("manifest", "", "manifest to restore (see vmobj list)")
@@ -403,7 +409,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 
 func cmdVerify(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	dir := fs.String("repo", "", "repository folder")
+	dir := fs.String("repo", "", "repository: a folder path or s3://BUCKET[/PREFIX]?region=...")
 	keyFile := fs.String("key-file", "", "key file")
 	vm := fs.String("vm", "", "VM name")
 	name := fs.String("manifest", "", "manifest to check")

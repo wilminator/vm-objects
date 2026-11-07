@@ -46,6 +46,11 @@ jobs:
       - name: Build static binaries
         run: make build-all
 
+      - name: End-to-end against a local folder
+        run: |
+          make build
+          scripts/e2e.sh "$RUNNER_TEMP/e2e-repo" bin/vmobj
+
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -67,3 +72,54 @@ jobs:
           docker build --build-arg VERSION=ci -t vmobj:ci .
           docker run --rm vmobj:ci version | grep -qx 'vmobj ci'
           docker image ls vmobj:ci
+
+  # The same checks against a real S3 API. MinIO runs in a throwaway
+  # container on the runner; the credentials below exist only inside it.
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: vmobj-ci
+      AWS_SECRET_ACCESS_KEY: vmobj-ci-not-a-secret
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # MinIO's community edition is now published as source only (no
+      # images or binaries since October 2025), so build the last release
+      # from source and cache the binary between runs.
+      - name: Cache the MinIO build
+        id: minio-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/minio-bin
+          key: minio-RELEASE.2025-10-15T17-29-55Z-${{ runner.os }}-${{ runner.arch }}
+      - name: Build MinIO
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        run: |
+          GOBIN="$HOME/minio-bin" go install github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z \
+            || { echo "::error::building MinIO from source failed"; exit 1; }
+      - name: Start MinIO
+        run: |
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            nohup "$HOME/minio-bin/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          for i in $(seq 60); do curl -sf "$ENDPOINT/minio/health/live" >/dev/null && break; sleep 1; done
+          curl -sf "$ENDPOINT/minio/health/live" >/dev/null || { echo "::error::MinIO did not start: $(tail -3 "$RUNNER_TEMP/minio.log" | tr '\n' ' ')"; exit 1; }
+      - name: Create the test bucket
+        run: go run ./scripts/mkbucket "s3://vmobj-ci?endpoint=$ENDPOINT" || { echo "::error::could not create the test bucket"; exit 1; }
+      - name: Backend conformance tests
+        run: go test -count=1 -v -run 'Conformance' ./internal/store/
+        env:
+          VMOBJ_TEST_S3: s3://vmobj-ci/conformance?endpoint=http://127.0.0.1:9000
+      - name: End-to-end against S3
+        run: |
+          make build
+          scripts/e2e.sh "s3://vmobj-ci/e2e-$GITHUB_RUN_ID?endpoint=$ENDPOINT" bin/vmobj
+      - name: MinIO log on failure
+        if: failure()
+        run: tail -50 "$RUNNER_TEMP/minio.log" || true
