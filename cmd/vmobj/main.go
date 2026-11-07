@@ -58,7 +58,10 @@ REPO is a folder path, or an S3 bucket:
   Credentials come from the AWS environment variables or ~/.aws/credentials
   (choose a section with profile=), never from the address.
 
-DISK is a raw image file or a block device (for example a zvol snapshot).
+DISK is a disk image file (raw or qcow2, with its backing chain), a block
+device, or zfs:POOL/ZVOL to snapshot a zvol and back up the snapshot. Files
+named *.qcow2 are read as qcow2 and anything else as raw; --format raw|qcow2
+overrides that. vmobj never decides the format from a disk's contents.
 
 Profiles pick a storage class and retention for each kind of backup (see
 "vmobj profiles"). The default is disaster-recovery. Self-hosted S3 services
@@ -141,6 +144,18 @@ func openRepo(ctx context.Context, dir, keyFile string) (*repo.Repo, error) {
 		return nil, err
 	}
 	return repo.Open(ctx, b, k)
+}
+
+// openSource opens --source: zfs:POOL/ZVOL snapshots a zvol, anything
+// else is a file or device in the given (or name-derived) format.
+func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (source.Source, error) {
+	if ds, ok := strings.CutPrefix(spec, "zfs:"); ok {
+		if format != "" && format != "raw" {
+			return nil, errors.New("--format does not apply to zfs: sources (zvols are raw)")
+		}
+		return source.OpenZFS(ctx, ds, source.ZFSOptions{KeepSnapshot: keepSnapshot})
+	}
+	return source.Open(spec, format)
 }
 
 // progress wraps a source and prints how far a scan has got every few
@@ -251,6 +266,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	blockSize := fs.String("block-size", "4MiB", "large block size to report")
 	extentSize := fs.String("extent-size", "64KiB", "small extent size to report")
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
+	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
 	fs.Parse(args)
 	if err := require(fs, "source"); err != nil {
 		return err
@@ -264,7 +280,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 		return err
 	}
 	if *name == "" {
-		*name = filepath.Base(*src)
+		*name = strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(filepath.Base(strings.TrimPrefix(*src, "zfs:")))
 	}
 	if err := manifest.CheckVMName(*name); err != nil {
 		return fmt.Errorf("--name: %w", err)
@@ -274,7 +290,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	}
 	path := filepath.Join(*stateDir, *name+".hashes")
 
-	disk, err := source.OpenRaw(*src)
+	disk, err := openSource(ctx, *src, *format, false)
 	if err != nil {
 		return err
 	}
@@ -327,6 +343,8 @@ func cmdBackup(ctx context.Context, args []string) error {
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
 	profileName := fs.String("profile", policy.DefaultProfile, "storage profile (see vmobj profiles)")
 	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
+	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
+	keepSnap := fs.Bool("keep-snapshot", false, "with zfs:, keep the snapshot the backup was read from")
 	fs.Parse(args)
 	if err := require(fs, "repo", "key-file", "source", "vm", "type"); err != nil {
 		return err
@@ -352,11 +370,14 @@ func cmdBackup(ctx context.Context, args []string) error {
 	if *stateDir == "" {
 		*stateDir = filepath.Join(defaultStateDir(), r.Config.RepoID)
 	}
-	disk, err := source.OpenRaw(*src)
+	disk, err := openSource(ctx, *src, *format, *keepSnap)
 	if err != nil {
 		return err
 	}
 	defer disk.Close()
+	if z, ok := disk.(*source.ZFS); ok {
+		fmt.Fprintf(os.Stderr, "Reading from snapshot %s\n", z.Snapshot())
+	}
 	p, stopProgress := withProgress(disk)
 	fmt.Fprintf(os.Stderr, "%s backup of %s (%s)...\n", k, *vm, units.Format(disk.Size()))
 	start := time.Now()

@@ -7,8 +7,9 @@ before it is stored, and every restore point can be restored on its own.
 
 **Status: early development (0.1.0-dev).** It backs up raw disks to a local
 folder or an S3 bucket and restores them, with per-kind storage classes,
-Object Lock and pruning. Host plugins (ZFS, QEMU/libvirt) and VM
-definitions/TPM state come next. Don't
+Object Lock and pruning. It reads raw disks, qcow2 images (with backing
+chains) and ZFS zvols through snapshots. VM definitions and TPM state come
+next. Don't
 rely on it as your only backup yet.
 
 ## What works today
@@ -25,9 +26,21 @@ rely on it as your only backup yet.
 | `vmobj prune` | Removes backups past their keep-until date and data nothing else uses. Reports only, unless `--apply`. |
 | `vmobj verify` | Checks a restore point's pieces are present; `--deep` also decrypts and hash-checks each one. |
 
-Sources are raw image files or block devices, for example a ZFS zvol
-snapshot (`/dev/zvol/tank/vms/win11@snap`). For qcow2, expose the disk as
-raw first (`qemu-nbd`) or convert it with `qemu-img convert -O raw`.
+Sources:
+
+- **Raw image files and block devices.**
+- **qcow2 images**, read directly with their backing chains (compressed and
+  zero clusters included). No QEMU tools or root needed. Images open in a
+  running VM are marked dirty and refused: shut the VM down, or back up a
+  snapshot.
+- **`zfs:POOL/ZVOL`** snapshots the zvol, reads the snapshot through a
+  temporary read-only clone, then removes both (`--keep-snapshot` keeps the
+  snapshot).
+
+Files named `*.qcow2` or `*.qcow` are read as qcow2 and everything else as
+raw; `--format` overrides. The format is never guessed from a disk's
+contents, so a guest can't make the host read files of its choosing by
+writing a fake qcow2 header into its own disk.
 
 ## Quick start
 
