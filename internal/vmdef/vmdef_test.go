@@ -160,3 +160,58 @@ func TestRewriteNewNameDropsUUID(t *testing.T) {
 		t.Fatalf("rename:\n%s", out)
 	}
 }
+
+// A restored disk is a single raw file, so its old backing chain must be
+// dropped, nested layers and all. (Found in milestone 5 testing on the
+// QNAP: the restored definition kept the qcow2 chain's <backingStore>.)
+func TestRewriteDropsBackingChain(t *testing.T) {
+	const chained = `<domain type='kvm'>
+  <name>WinGames</name>
+  <uuid>7240004c-9f00-4aca-8577-8987c8073490</uuid>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='writeback'/>
+      <source file='/share/VMs/WinGames/WinGames/image0.1793869200' startupPolicy='optional'/>
+      <backingStore type='file'>
+        <format type='qcow2'/>
+        <source file='/share/VMs/WinGames/WinGames/image0.1793610000'/>
+        <backingStore type='file'>
+          <format type='qcow2'/>
+          <source file='/share/VMs/WinGames/WinGames/image0.img'/>
+          <backingStore/>
+        </backingStore>
+      </backingStore>
+      <target dev='hda' bus='ide'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/share/VMs/data.qcow2'/>
+      <backingStore/>
+      <target dev='hdb' bus='ide'/>
+    </disk>
+  </devices>
+</domain>
+`
+	out, err := Rewrite([]byte(chained), Changes{Disks: map[string]DiskChange{
+		"hda": {Path: "/restore/WinGames-hda.raw", Format: "raw"},
+		"hdb": {Path: "/restore/WinGames-hdb.raw", Format: "raw"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "backingStore") || strings.Contains(s, "image0.") || strings.Contains(s, "<format") {
+		t.Fatalf("backing chain left in:\n%s", s)
+	}
+	want := `    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='writeback'/>
+      <source file='/restore/WinGames-hda.raw' startupPolicy='optional'/>
+      <target dev='hda' bus='ide'/>
+    </disk>`
+	if !strings.Contains(s, want) {
+		t.Fatalf("hda not rewritten cleanly:\n%s", s)
+	}
+	if !strings.Contains(s, "<source file='/restore/WinGames-hdb.raw'/>\n      <target dev='hdb'") {
+		t.Fatalf("hdb's empty <backingStore/> not removed cleanly:\n%s", s)
+	}
+}

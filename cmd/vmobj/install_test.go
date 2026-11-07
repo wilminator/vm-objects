@@ -98,3 +98,19 @@ func TestInstallSelfRefusals(t *testing.T) {
 		t.Error("install over a folder was allowed")
 	}
 }
+
+func TestDescribeVMFiles(t *testing.T) {
+	for _, tc := range []struct {
+		nvram, tpm int
+		want       string
+	}{
+		{0, 2, "TPM state (2 files), no NVRAM"},
+		{1, 2, "NVRAM (1 file), TPM state (2 files)"},
+		{1, 0, "NVRAM (1 file), no TPM"},
+		{0, 0, "none (no NVRAM or TPM state)"},
+	} {
+		if got := describeVMFiles(tc.nvram, tc.tpm); got != tc.want {
+			t.Errorf("%d nvram, %d tpm: %q, want %q", tc.nvram, tc.tpm, got, tc.want)
+		}
+	}
+}

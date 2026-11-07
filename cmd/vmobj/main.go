@@ -747,7 +747,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		d := st.Disks[t]
 		fmt.Printf("  %-6s %s, %s written\n", t, d.Manifest, units.Format(d.BytesWritten))
 	}
-	fmt.Printf("Files:     %d (NVRAM and TPM state, inside the record)\n", st.Files)
+	fmt.Printf("Files:     %s (inside the record)\n", describeVMFiles(st.NVRAMFiles, st.TPMFiles))
 	for _, s := range st.Skipped {
 		fmt.Printf("Skipped:   %s\n", s)
 	}
@@ -970,4 +970,31 @@ func cmdCopy(ctx context.Context, args []string) error {
 		fmt.Printf("Skipped:   %s\n", s)
 	}
 	return nil
+}
+
+// describeVMFiles names the files a whole-VM backup kept, for example
+// "TPM state (2 files), no NVRAM".
+func describeVMFiles(nvram, tpm int) string {
+	plural := func(n int) string {
+		if n == 1 {
+			return "1 file"
+		}
+		return fmt.Sprintf("%d files", n)
+	}
+	var parts []string
+	if nvram > 0 {
+		parts = append(parts, "NVRAM ("+plural(nvram)+")")
+	}
+	if tpm > 0 {
+		parts = append(parts, "TPM state ("+plural(tpm)+")")
+	}
+	switch {
+	case nvram == 0 && tpm == 0:
+		return "none (no NVRAM or TPM state)"
+	case nvram == 0:
+		parts = append(parts, "no NVRAM")
+	case tpm == 0:
+		parts = append(parts, "no TPM")
+	}
+	return strings.Join(parts, ", ")
 }

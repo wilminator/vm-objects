@@ -105,15 +105,17 @@ qemu-img compare PATH_TO_THE_VMS_DISK.qcow2 /share/VMs/wingames-restore/WinGames
 And look over the adjusted definition and the instructions:
 
 ```bash
-diff <(/QVS/usr/bin/virsh dumpxml --inactive DOMAIN_NAME_OR_UUID) /share/VMs/wingames-restore/WinGames.xml
+/QVS/usr/bin/virsh dumpxml --inactive DOMAIN_NAME_OR_UUID > /tmp/vm-now.xml && diff /tmp/vm-now.xml /share/VMs/wingames-restore/WinGames.xml; rm -f /tmp/vm-now.xml
 ```
 
 ```bash
 cat /share/VMs/wingames-restore/RESTORE.txt
 ```
 
-The `diff` should show only the disk source paths (and the driver type
-changing to `raw`). Expect `RESTORE.txt` to warn that defining this XML
+The `diff` should show only the disk source paths, the driver type
+changing to `raw`, and the `<backingStore>` chain removed. (The QNAP's
+shell is BusyBox `sh`, so the current definition goes to a file first:
+`<(...)` only works in bash.) Expect `RESTORE.txt` to warn that defining this XML
 would replace the original VM.
 
 **Don't `virsh define` anything on the QNAP.** QVS manages its VMs itself,
