@@ -68,7 +68,7 @@ for name in "${names[@]}"; do
   case "$name" in
     *-full) want=full ;;
     *-incremental) want=inc ;;
-    *-differential) want=diff ;;
+    *-differential) want="diff" ;;
     *) echo "FAIL: unexpected backup name $name"; exit 1 ;;
   esac
   "$vmobj" verify --repo "$repo" --key-file "$key" --vm e2e --manifest "$name" --deep
@@ -88,7 +88,7 @@ copy="$work/copy-repo"
 "$vmobj" copy --from "$repo" --to "$copy" --key-file "$key" --profile standard | tee "$work/copy.txt"
 grep -q "Copied:    3 backups" "$work/copy.txt" || { echo "FAIL: copy did not copy the 3 backups"; exit 1; }
 for name in "${names[@]}"; do
-  case "$name" in *-full) want=full ;; *-incremental) want=inc ;; *-differential) want=diff ;; esac
+  case "$name" in *-full) want=full ;; *-incremental) want=inc ;; *-differential) want="diff" ;; esac
   "$vmobj" restore --repo "$copy" --key-file "$key" --vm e2e --manifest "$name" --output "$work/copy-$want.raw"
   cmp "$work/want-$want.raw" "$work/copy-$want.raw"
 done

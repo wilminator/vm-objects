@@ -175,6 +175,24 @@ locked backup early.
 each VM's newest backup, never touches objects written in the last 48
 hours, and leaves locked objects for a later run.
 
+### Setting up AWS
+
+`scripts/aws/provision.sh` creates a bucket with Object Lock and an IAM
+user that can use only that bucket, and writes its key into a credentials
+profile; `scripts/aws/teardown.sh` removes them. See
+[docs/aws.md](docs/aws.md), for test buckets and for real backups.
+
+## Checking it yourself
+
+- `scripts/hardening.sh` damages repositories, kills and stops runs, fills
+  the disk, and checks vmobj refuses clearly and recovers.
+- `scripts/validate-vm.sh --domain NAME --work DIR` backs up one of your
+  own (shut-down) VMs, copies it, restores it twice and compares every
+  disk, the NVRAM and the TPM state with the original.
+
+[docs/testing](docs/testing/README.md) has the full test plan and what has
+passed so far.
+
 ## Progress output
 
 `measure`, `backup`, `backup-vm`, `restore` and `restore-vm` show progress
