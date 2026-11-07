@@ -151,6 +151,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
 	}
+	// Report the timings even when the command failed: a slow or stuck
+	// stage is often why.
+	runMetrics.Report(os.Stderr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vmobj:", err)
 		os.Exit(1)
@@ -188,7 +191,11 @@ func openRepo(ctx context.Context, dir, keyFile string) (*repo.Repo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return repo.Open(ctx, b, k)
+	r, err := repo.Open(ctx, b, k)
+	if r != nil {
+		r.Metrics = runMetrics
+	}
+	return r, err
 }
 
 // openSource opens --source: zfs:POOL/ZVOL snapshots a zvol, anything
@@ -277,7 +284,9 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
 	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
 	pf := addProgressFlags(fs)
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
@@ -312,7 +321,7 @@ func cmdMeasure(ctx context.Context, args []string) error {
 	p, stopProgress := withProgress(pc, *src, disk)
 	fmt.Fprintf(os.Stderr, "Measuring %s (%s)...\n", *src, units.Format(disk.Size()))
 	start := time.Now()
-	cur, err := measure.Run(ctx, p, scan.Options{BlockSize: extent.Length(bs), ExtentSize: extent.Length(es), Workers: *workers})
+	cur, err := measure.Run(ctx, p, scan.Options{BlockSize: extent.Length(bs), ExtentSize: extent.Length(es), Workers: *workers, Metrics: runMetrics})
 	stopProgress()
 	if err != nil {
 		return err
@@ -362,7 +371,9 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	pf := addProgressFlags(fs)
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
@@ -493,7 +504,9 @@ func cmdRestore(ctx context.Context, args []string) error {
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
 	pf := addProgressFlags(fs)
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
@@ -533,7 +546,9 @@ func cmdVerify(ctx context.Context, args []string) error {
 	vm := fs.String("vm", "", "VM name")
 	name := fs.String("manifest", "", "manifest to check")
 	deep := fs.Bool("deep", false, "download and check every piece")
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	if err := require(fs, "repo", "key-file", "vm", "manifest"); err != nil {
 		return err
 	}
@@ -695,7 +710,9 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	pf := addProgressFlags(fs)
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
@@ -835,7 +852,9 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
 	pf := addProgressFlags(fs)
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
@@ -909,7 +928,9 @@ func cmdCopy(ctx context.Context, args []string) error {
 	record := fs.String("record", "", "copy only this whole-VM backup of --vm")
 	profileName := fs.String("profile", policy.DefaultProfile, "storage profile at the destination")
 	classFlag := fs.String("class", "", "storage class at the destination, overriding the profile")
+	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
+	startMetrics(*metricsOn)
 	if err := require(fs, "from", "to", "key-file"); err != nil {
 		return err
 	}

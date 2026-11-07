@@ -19,6 +19,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/atomicfile"
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/metrics"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/store"
 )
@@ -128,7 +129,7 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 		if ref.Zero {
 			stats.ZeroBlocks++
 			if !sparse {
-				if _, err := out.WriteAt(zeros[:length], off); err != nil {
+				if _, err := timedWriteAt(r, out, zeros[:length], off); err != nil {
 					return err
 				}
 			}
@@ -143,7 +144,7 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 		if int64(len(data)) != length {
 			return fmt.Errorf("block %d has %d bytes, want %d", i, len(data), length)
 		}
-		if _, err := out.WriteAt(data, off); err != nil {
+		if _, err := timedWriteAt(r, out, data, off); err != nil {
 			return err
 		}
 		stats.BlocksRead++
@@ -172,7 +173,7 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 		off := int64(ov.Index) * int64(m.ExtentSize)
 		length := min(int64(m.ExtentSize), m.DiskSize-off)
 		if ov.Ref.Zero {
-			if _, err := out.WriteAt(zeros[:length], off); err != nil {
+			if _, err := timedWriteAt(r, out, zeros[:length], off); err != nil {
 				return err
 			}
 			done += length
@@ -190,7 +191,7 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 		if int64(len(data)) != length {
 			return fmt.Errorf("extent %d has %d bytes, want %d", ov.Index, len(data), length)
 		}
-		if _, err := out.WriteAt(data, off); err != nil {
+		if _, err := timedWriteAt(r, out, data, off); err != nil {
 			return err
 		}
 		stats.ExtentsRead++
@@ -348,4 +349,12 @@ func Verify(ctx context.Context, r *repo.Repo, vm, name string, deep bool) (*Ver
 		}
 	}
 	return vs, nil
+}
+
+// timedWriteAt writes to the restore target, timed as "restore write".
+func timedWriteAt(r *repo.Repo, out *os.File, p []byte, off int64) (int, error) {
+	done := r.Metrics.Start(metrics.OutputWrite)
+	n, err := out.WriteAt(p, off)
+	done(int64(n))
+	return n, err
 }

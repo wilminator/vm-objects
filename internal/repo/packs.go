@@ -71,7 +71,7 @@ func (r *Repo) NewPackWriter(chain string, opts store.PutOptions) *PackWriter {
 // Add seals one extent into the current pack, writing the pack out when it
 // reaches the repository's target size.
 func (w *PackWriter) Add(ctx context.Context, h extent.Hash, data []byte) error {
-	sealed, err := w.repo.sealer.Seal(h[:], data)
+	sealed, err := w.repo.seal(h[:], data)
 	if err != nil {
 		return err
 	}
@@ -91,7 +91,7 @@ func (w *PackWriter) Flush(ctx context.Context) error {
 	}
 	id := NewID()
 	packKey := PackKey(w.chain, id)
-	if err := store.PutWith(ctx, w.repo.Backend, packKey, w.buf.Bytes(), w.opts); err != nil {
+	if err := w.repo.put(ctx, packKey, w.buf.Bytes(), w.opts); err != nil {
 		return err
 	}
 	toc, err := json.Marshal(w.entries)
@@ -105,7 +105,7 @@ func (w *PackWriter) Flush(ctx context.Context) error {
 	}
 	// The TOC stays in the default class but shares the pack's lock: a
 	// pack is useless without its TOC.
-	if err := store.PutWith(ctx, w.repo.Backend, tocKey, sealedTOC, store.PutOptions{LockUntil: w.opts.LockUntil}); err != nil {
+	if err := w.repo.put(ctx, tocKey, sealedTOC, store.PutOptions{LockUntil: w.opts.LockUntil}); err != nil {
 		return err
 	}
 	for _, e := range w.entries {
@@ -121,7 +121,7 @@ func (w *PackWriter) Flush(ctx context.Context) error {
 // ChainIndex reads every TOC in a chain and maps extent hashes to their
 // locations.
 func (r *Repo) ChainIndex(ctx context.Context, chain string) (map[extent.Hash]Location, error) {
-	keys, err := r.Backend.List(ctx, "packs/"+chain+"/")
+	keys, err := r.list(ctx, "packs/"+chain+"/")
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func (r *Repo) ChainIndex(ctx context.Context, chain string) (map[extent.Hash]Lo
 		if !strings.HasSuffix(k, ".toc") || !packs[strings.TrimSuffix(k, ".toc")+".pack"] {
 			continue
 		}
-		sealed, err := r.Backend.Get(ctx, k)
+		sealed, err := r.get(ctx, k)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +162,7 @@ func (r *Repo) ChainIndex(ctx context.Context, chain string) (map[extent.Hash]Lo
 
 // GetExtent fetches one extent from a pack and checks its hash.
 func (r *Repo) GetExtent(ctx context.Context, loc Location, h extent.Hash) ([]byte, error) {
-	sealed, err := r.Backend.GetRange(ctx, loc.Pack, loc.Offset, loc.Length)
+	sealed, err := r.getRange(ctx, loc.Pack, loc.Offset, loc.Length)
 	if err != nil {
 		return nil, fmt.Errorf("extent %s in %s: %w", h, loc.Pack, err)
 	}

@@ -18,6 +18,7 @@ import (
 
 	"github.com/wilminator/vm-objects/internal/extent"
 	"github.com/wilminator/vm-objects/internal/hashing"
+	"github.com/wilminator/vm-objects/internal/metrics"
 	"github.com/wilminator/vm-objects/internal/source"
 )
 
@@ -27,6 +28,7 @@ type Options struct {
 	ExtentSize extent.Length // small extents inside each block, for example 64 KiB
 	Workers    int           // blocks hashed at the same time; 0 means one per CPU
 	Hasher     hashing.Hasher
+	Metrics    *metrics.Recorder // times reads and hashing; nil records nothing
 }
 
 // Block is the result for one block, in disk order.
@@ -95,7 +97,10 @@ func Run(ctx context.Context, src source.Source, opts Options, fn func(Block) er
 			off := int64(idx) * int64(opts.BlockSize)
 			length := min(int64(opts.BlockSize), size-off)
 			buf := bufs[i][:length]
-			if err := readFull(src, buf, off); err != nil {
+			done := opts.Metrics.Start(metrics.SourceRead)
+			err := readFull(src, buf, off)
+			done(length)
+			if err != nil {
 				return fmt.Errorf("reading block %d at offset %d: %w", idx, off, err)
 			}
 			batch[i] = Block{Index: idx, Offset: extent.Offset(off), Length: extent.Length(length), Data: buf}
@@ -123,6 +128,7 @@ func Run(ctx context.Context, src source.Source, opts Options, fn func(Block) er
 }
 
 func hashBlock(b *Block, opts Options) {
+	defer opts.Metrics.Start(metrics.Hash)(int64(b.Length))
 	b.Ref = opts.Hasher.Ref(b.Data)
 	count := int((int64(b.Length) + int64(opts.ExtentSize) - 1) / int64(opts.ExtentSize))
 	b.Extents = make([]extent.Ref, count)
