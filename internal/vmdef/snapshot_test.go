@@ -56,3 +56,34 @@ func TestParseSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// A record written for QNAP reads back as what went in, and ends with the
+// four elements in the form Virtualization Station writes them.
+func TestQNAPRecord(t *testing.T) {
+	r := QNAPRecord{Epoch: 1794103287, Parent: 1794000000, DisplayName: "before <update>", Description: "a & b",
+		Overlays: map[string]string{"vda": "/share/VMs/t/vm-vda.1794103287"}, LocalOffset: -28800}
+	data, err := r.Marshal([]byte("<domain type='kvm'><name>vm</name></domain>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := ParseSnapshot(data)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, data)
+	}
+	if s.Name != "1794103287" || s.DisplayName != "before <update>" || s.Description != "a & b" ||
+		s.Created.Unix() != 1794103287 || s.Overlays["vda"] != "/share/VMs/t/vm-vda.1794103287" {
+		t.Fatalf("%+v", s)
+	}
+	tail := "<displayname>before &lt;update&gt;</displayname><creationLocaltime>1794074487</creationLocaltime><lockSnapshot>unlock</lockSnapshot><createdBy>user</createdBy></domainsnapshot>\n"
+	if !strings.HasSuffix(string(data), tail) {
+		t.Fatalf("tail:\n%s", data)
+	}
+	for _, want := range []string{"<parent>\n    <name>1794000000</name>", "<domain type='kvm'>"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("missing %q:\n%s", want, data)
+		}
+	}
+	if _, err := (QNAPRecord{Epoch: 1, DisplayName: "x"}).Marshal(nil); err == nil {
+		t.Fatal("a record without disks was written")
+	}
+}

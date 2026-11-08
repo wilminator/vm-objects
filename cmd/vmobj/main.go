@@ -62,6 +62,7 @@ Usage:
   vmobj restore-history --repo REPO --key-file PATH --vm NAME --zvol POOL/NEW
                     [--like POOL/OLD | --volsize SIZE] [--resume] [--staged DIR]
                     [--verify every|end] [--list]
+  vmobj qnap-snapshots --plan DIR/qnap-snapshots.json --definition .UUID.meta/UUID.xml [--apply]
   vmobj copy        --from REPO --to REPO --key-file PATH [--to-key-file PATH] [--vm NAME]
                     [--manifest NAME | --record NAME] [--profile NAME] [--class CLASS]
   vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
@@ -160,6 +161,8 @@ func main() {
 		err = cmdRestoreVM(ctx, args)
 	case "restore-history":
 		err = cmdRestoreHistory(ctx, args)
+	case "qnap-snapshots":
+		err = cmdQNAPSnapshots(ctx, args)
 	case "vms":
 		err = cmdVMs(ctx, args)
 	case "copy":
@@ -1128,6 +1131,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	to := fs.String("to", "", "folder to restore into (created; must be empty)")
 	newName := fs.String("new-name", "", "rename the VM and drop its UUID, to run it next to the original")
 	targetFlag := fs.String("platform", "auto", "where the VM will run next, for RESTORE.txt: auto (this host), libvirt, qnap or truenas")
+	history := fs.Bool("history", false, "with --platform qnap: restore each disk's snapshot history as Virtualization Station's overlay chain (see RESTORE.txt, then vmobj qnap-snapshots)")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
@@ -1156,7 +1160,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	}
 	start := time.Now()
 	report, stopReport := restoreProgress(pc, *to, "")
-	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report})
+	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report, History: *history})
 	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {

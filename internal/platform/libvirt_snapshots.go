@@ -125,8 +125,12 @@ func ExternalSnapshots(d vmdef.Disk, records []*vmdef.Snapshot, platformName str
 			return nil, fmt.Errorf("snapshot %s: its overlay %s has no backing file", rec.Name, overlay)
 		}
 		layer := chain[k+1]
+		name := rec.Name
+		if rec.DisplayName != "" {
+			name = rec.DisplayName // QNAP: the name shown in its UI, not the epoch
+		}
 		out = append(out, DiskSnapshot{
-			Info: manifest.Snapshot{Name: rec.Name, Created: rec.Created, Description: rec.Description, Platform: platformName},
+			Info: manifest.Snapshot{Name: name, Created: rec.Created, Description: rec.Description, Platform: platformName},
 			Open: func(context.Context) (source.Source, error) { return source.Open(layer.Path, layer.Format) },
 		})
 	}
