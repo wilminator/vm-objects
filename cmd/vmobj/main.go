@@ -44,7 +44,9 @@ Usage:
   vmobj init        --repo REPO --key-file PATH [--block-size 4MiB] [--extent-size 64KiB] [--object-lock]
   vmobj measure     --source DISK [--name NAME] [--state-dir DIR]
   vmobj backup      --repo REPO --key-file PATH --source DISK --vm NAME --type full|incremental|differential
-                    [--profile NAME] [--class CLASS] [--copy-to REPO ...]
+                    [--profile NAME] [--class CLASS] [--copy-to REPO ...] [--hash]
+  vmobj backup      --history --repo REPO --key-file PATH --source zfs:POOL/ZVOL --vm NAME
+                    [--type KIND (then the current state too)] [--hash]
   vmobj list        --repo REPO --key-file PATH [--vm NAME] [--long]
   vmobj restore     --repo REPO --key-file PATH --vm NAME --manifest NAME --output PATH [--force]
                     [--mode rename|copy|in-place|staged] [--scratch DIR] [--journal PATH]
@@ -57,6 +59,9 @@ Usage:
   vmobj vms         --repo REPO --key-file PATH [--vm NAME]
   vmobj restore-vm  --repo REPO --key-file PATH --vm NAME --record NAME --to DIR [--new-name NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
+  vmobj restore-history --repo REPO --key-file PATH --vm NAME --zvol POOL/NEW
+                    [--like POOL/OLD | --volsize SIZE] [--resume] [--staged DIR]
+                    [--verify every|end] [--list]
   vmobj copy        --from REPO --to REPO --key-file PATH [--to-key-file PATH] [--vm NAME]
                     [--manifest NAME | --record NAME] [--profile NAME] [--class CLASS]
   vmobj prune       --repo REPO --key-file PATH [--apply] [--keep-last 1] [--grace 48h]
@@ -77,7 +82,8 @@ REPO is a folder path, or an S3 bucket:
   (choose a section with profile=), never from the address.
 
 DISK is a disk image file (raw or qcow2, with its backing chain), a block
-device, or zfs:POOL/ZVOL to snapshot a zvol and back up the snapshot. Files
+device, zfs:POOL/ZVOL to snapshot a zvol and back up the snapshot, or
+zfs:POOL/ZVOL@SNAP to back up one of the zvol's own snapshots (kept). Files
 named *.qcow2 are read as qcow2 and anything else as raw; --format raw|qcow2
 overrides that. vmobj never decides the format from a disk's contents.
 
@@ -91,6 +97,12 @@ into a folder, with instructions; it never changes libvirt itself.
 install copies this vmobj binary into a folder, for example out of the
 container image: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/out
 ghcr.io/wilminator/vmobj install /out
+
+Snapshot history: backup --history --source zfs:POOL/ZVOL backs up the
+zvol's named snapshots the repository lacks, oldest first, with each one's
+name and date (--hash adds a SHA-256 that proves each step on restore).
+restore-history rebuilds them in a new zvol, each as a real snapshot that
+holds only what changed, with the original date in vmobj:created.
 
 copy moves backups between repositories, sending only what the destination
 lacks; run it again any time. The destination applies its own --profile
@@ -146,6 +158,8 @@ func main() {
 		err = cmdBackupVM(ctx, args)
 	case "restore-vm":
 		err = cmdRestoreVM(ctx, args)
+	case "restore-history":
+		err = cmdRestoreHistory(ctx, args)
 	case "vms":
 		err = cmdVMs(ctx, args)
 	case "copy":
@@ -223,6 +237,10 @@ func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (so
 	if ds, ok := strings.CutPrefix(spec, "zfs:"); ok {
 		if format != "" && format != "raw" {
 			return nil, errors.New("--format does not apply to zfs: sources (zvols are raw)")
+		}
+		if zvol, _, isSnap := strings.Cut(ds, "@"); isSnap {
+			// One of the zvol's own snapshots: read it, never destroy it.
+			return source.OpenZFS(ctx, zvol, source.ZFSOptions{Existing: ds})
 		}
 		return source.OpenZFS(ctx, ds, source.ZFSOptions{KeepSnapshot: keepSnapshot})
 	}
@@ -387,6 +405,8 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
 	format := fs.String("format", "", "disk format: raw or qcow2 (default: from the file name)")
 	keepSnap := fs.Bool("keep-snapshot", false, "with zfs:, keep the snapshot the backup was read from")
+	history := fs.Bool("history", false, "with zfs:POOL/ZVOL, back up the zvol's named snapshots the repository lacks, oldest first (and then the current state, if --type is given)")
+	hash := fs.Bool("hash", false, "record the whole disk's SHA-256 in the backup (one extra read of the disk), so a restore's check can prove it")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	pf := addProgressFlags(fs)
@@ -397,12 +417,18 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	if perr != nil {
 		return perr
 	}
-	if err := require(fs, "repo", "key-file", "source", "vm", "type"); err != nil {
+	needed := []string{"repo", "key-file", "source", "vm", "type"}
+	if *history {
+		needed = needed[:4] // --type is optional: it adds a backup of the current state
+	}
+	if err := require(fs, needed...); err != nil {
 		return err
 	}
-	k, err := manifest.ParseKind(*kind)
-	if err != nil {
-		return err
+	var k manifest.Kind
+	if *kind != "" || !*history {
+		if k, err = manifest.ParseKind(*kind); err != nil {
+			return err
+		}
 	}
 	prof, err := policy.Lookup(*profileName)
 	if err != nil {
@@ -421,6 +447,17 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	if *stateDir == "" {
 		*stateDir = filepath.Join(defaultStateDir(), r.Config.RepoID)
 	}
+	base := engine.BackupOptions{
+		Repo: r, VM: *vm, Workers: *workers,
+		StatePath: filepath.Join(*stateDir, *vm+".state"),
+		Profile:   &prof, Class: class,
+	}
+	if *history {
+		if err := backupHistory(ctx, base, *src, *format, *hash, pc, copyTo, *keyFile); err != nil || k == "" {
+			return err
+		}
+		*src = strings.SplitN(*src, "@", 2)[0] // then the current state
+	}
 	disk, err := openSource(ctx, *src, *format, *keepSnap)
 	if err != nil {
 		return err
@@ -428,15 +465,24 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	defer disk.Close()
 	if z, ok := disk.(*source.ZFS); ok {
 		fmt.Fprintf(os.Stderr, "Reading from snapshot %s\n", z.Snapshot())
+		if snap, isOwn := existingSnapshot(*src); isOwn {
+			if base.Snapshot, err = zfsSnapshotInfo(ctx, snap); err != nil {
+				return err
+			}
+		}
+	}
+	if *hash {
+		fmt.Fprintf(os.Stderr, "Hashing %s (%s)...\n", *src, units.Format(disk.Size()))
+		if base.SHA256, err = engine.HashSource(ctx, disk, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "SHA-256:   %s\n", base.SHA256)
 	}
 	p, stopProgress := withProgress(pc, *src, disk)
 	fmt.Fprintf(os.Stderr, "%s backup of %s (%s)...\n", k, *vm, units.Format(disk.Size()))
 	start := time.Now()
-	st, err := engine.Backup(ctx, engine.BackupOptions{
-		Repo: r, Source: p, VM: *vm, Kind: k, Workers: *workers,
-		StatePath: filepath.Join(*stateDir, *vm+".state"),
-		Profile:   &prof, Class: class,
-	})
+	base.Source, base.Kind = p, k
+	st, err := engine.Backup(ctx, base)
 	stopProgress()
 	if err != nil {
 		return err
@@ -505,7 +551,11 @@ func cmdList(ctx context.Context, args []string) error {
 			if !m.RetainUntil.IsZero() {
 				keep = m.RetainUntil.Local().Format("2006-01-02")
 			}
-			fmt.Printf("  %-40s %-14s keep until %s  %s\n", n, className(m.DataClass), keep, units.Format(m.DiskSize))
+			snap := ""
+			if m.Snapshot != nil {
+				snap = "  @" + m.Snapshot.Name + " (" + m.Snapshot.Created.Local().Format("2006-01-02 15:04") + ")"
+			}
+			fmt.Printf("  %-40s %-14s keep until %s  %s%s\n", n, className(m.DataClass), keep, units.Format(m.DiskSize), snap)
 		}
 	}
 	return nil

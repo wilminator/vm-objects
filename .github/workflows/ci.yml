@@ -126,6 +126,9 @@ jobs:
       - name: "Rebuild a zvol's snapshots with zfs-replay.sh"
         if: steps.zfs.outputs.ok == 'true'
         run: sudo scripts/zfs-replay-e2e.sh vmobjci bin/vmobj
+      - name: "Snapshot history: backup --history and restore-history"
+        if: steps.zfs.outputs.ok == 'true'
+        run: sudo scripts/history-e2e.sh vmobjci bin/vmobj
 
   # The same checks against a real S3 API. MinIO runs in a throwaway
   # container on the runner; the credentials below exist only inside it.

@@ -69,6 +69,31 @@ type Manifest struct {
 	Profile     string    `json:"profile,omitempty"`
 	DataClass   string    `json:"dataClass,omitempty"`  // class of the blocks or packs this run wrote
 	RetainUntil time.Time `json:"retainUntil,omitzero"` // keep restorable until at least this time
+
+	// SHA256 is the whole disk's SHA-256, when the backup was made with
+	// --hash. A restore's --check compares against it.
+	SHA256 string `json:"sha256,omitempty"`
+	// Snapshot is set when this backup was read from one of the disk's own
+	// named snapshots (not one vmobj took for the run), so the history can
+	// be rebuilt as real snapshots on restore. See docs/design/m9-snapshot-history.md.
+	Snapshot *Snapshot `json:"snapshot,omitempty"`
+}
+
+// Snapshot describes a named snapshot a backup was read from. Older
+// vmobj versions ignore the field, so adding it keeps Format 1.
+type Snapshot struct {
+	Name string `json:"name"`
+	// Created is when the snapshot was first taken: on the original
+	// platform, not when it was backed up or last recreated.
+	Created     time.Time `json:"created"`
+	Description string    `json:"description,omitempty"`
+	Platform    string    `json:"platform,omitempty"` // where it was read: zfs, truenas, qnap, libvirt
+}
+
+// SameSnapshot reports whether two records describe the same snapshot:
+// the same name, taken at the same second.
+func SameSnapshot(a, b *Snapshot) bool {
+	return a != nil && b != nil && a.Name == b.Name && a.Created.Unix() == b.Created.Unix()
 }
 
 // NewName builds a sortable manifest name such as "20261030T202000Z-full".
@@ -121,6 +146,8 @@ func splitName(n string) (stamp, kind string, seq int, ok bool) {
 	return stamp, kind, seq, true
 }
 
+var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 var vmName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 // CheckVMName allows letters, digits, dot, dash and underscore, so a name
@@ -143,6 +170,12 @@ func (m *Manifest) Validate() error {
 	wantBlocks := int((m.DiskSize + int64(m.BlockSize) - 1) / int64(m.BlockSize))
 	if len(m.Blocks) != wantBlocks {
 		return fmt.Errorf("manifest %s lists %d blocks, want %d", m.Name, len(m.Blocks), wantBlocks)
+	}
+	if m.SHA256 != "" && !sha256Hex.MatchString(m.SHA256) {
+		return fmt.Errorf("manifest %s has a malformed sha256", m.Name)
+	}
+	if m.Snapshot != nil && (m.Snapshot.Name == "" || m.Snapshot.Created.IsZero()) {
+		return fmt.Errorf("manifest %s has a snapshot record without a name or date", m.Name)
 	}
 	extents := int((m.DiskSize + int64(m.ExtentSize) - 1) / int64(m.ExtentSize))
 	for _, o := range m.Overlay {
