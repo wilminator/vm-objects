@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/wilminator/vm-objects/internal/extent"
@@ -51,6 +52,21 @@ type CopyOptions struct {
 	// PhaseChanges over its newer extents, as in RestoreOptions. name is
 	// "vm/manifest".
 	Progress func(name string, phase Phase, done, total int64)
+	// Uploads is how many blocks are copied at once (default
+	// DefaultUploads). Each upload waits on the network and on the
+	// destination storing the object, so to a remote service several at
+	// once go much faster than one after another.
+	Uploads int
+}
+
+// DefaultUploads is how many blocks a copy sends at once unless told.
+const DefaultUploads = 8
+
+func (o CopyOptions) uploads() int {
+	if o.Uploads <= 0 {
+		return DefaultUploads
+	}
+	return min(o.Uploads, 64)
 }
 
 // CopyStats summarise a copy.
@@ -156,62 +172,117 @@ func CopyManifest(ctx context.Context, o CopyOptions, vm, name string, st *CopyS
 		report = func(p Phase, done, total int64) { o.Progress(label, p, done, total) }
 	}
 
-	// Base blocks.
+	// Base blocks, several at a time. This goroutine walks the manifest
+	// and hands each block not seen yet to the uploaders; translate, have,
+	// reused and the counters are shared with them, under mu.
 	have, err := o.To.BlockSet(ctx)
 	if err != nil {
 		return err
 	}
-	var done int64
-	report(PhaseWriting, 0, m.DiskSize)
-	for i, ref := range m.Blocks {
-		if err := ctx.Err(); err != nil {
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+	copyBlock := func(ref extent.Ref) error {
+		if sameKey {
+			sealed, err := o.From.GetSealedBlock(cctx, ref.Hash)
+			if err != nil {
+				return err
+			}
+			if err := o.To.PutSealedBlock(cctx, ref.Hash, sealed, put); err != nil {
+				return err
+			}
+			mu.Lock()
+			st.BytesWritten += int64(len(sealed))
+			st.BlocksCopied++
+			mu.Unlock()
+			return nil
+		}
+		data, err := o.From.GetBlock(cctx, ref.Hash)
+		if err != nil {
 			return err
 		}
-		off := int64(i) * int64(m.BlockSize)
-		done = min(off+int64(m.BlockSize), m.DiskSize)
-		if ref.Zero {
-			report(PhaseWriting, done, m.DiskSize)
+		h2 := o.To.Hasher().Sum(data)
+		mu.Lock()
+		translate[ref.Hash] = h2
+		if have[h2] { // there already, or another upload has it
+			st.BlocksPresent++
+			reused = append(reused, repo.BlockKey(h2))
+			mu.Unlock()
+			return nil
+		}
+		have[h2] = true
+		mu.Unlock()
+		n, err := o.To.PutBlock(cctx, h2, data, put)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		st.BytesWritten += int64(n)
+		st.BlocksCopied++
+		mu.Unlock()
+		return nil
+	}
+	jobs := make(chan extent.Ref)
+	for range o.uploads() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ref := range jobs {
+				if err := copyBlock(ref); err != nil {
+					fail(err)
+				}
+			}
+		}()
+	}
+	seen := map[extent.Hash]bool{}
+	report(PhaseWriting, 0, m.DiskSize)
+walk:
+	for i, ref := range m.Blocks {
+		if ref.Zero || seen[ref.Hash] {
 			continue
 		}
-		report(PhaseWriting, off, m.DiskSize)
-		if _, done := translate[ref.Hash]; done {
-			continue
-		}
+		seen[ref.Hash] = true
+		report(PhaseWriting, int64(i)*int64(m.BlockSize), m.DiskSize)
 		if sameKey {
+			mu.Lock()
 			translate[ref.Hash] = ref.Hash
-			if have[ref.Hash] {
+			present := have[ref.Hash]
+			if present {
 				st.BlocksPresent++
 				reused = append(reused, repo.BlockKey(ref.Hash))
+			} else {
+				have[ref.Hash] = true
+			}
+			mu.Unlock()
+			if present {
 				continue
 			}
-			sealed, err := o.From.GetSealedBlock(ctx, ref.Hash)
-			if err != nil {
-				return err
-			}
-			if err := o.To.PutSealedBlock(ctx, ref.Hash, sealed, put); err != nil {
-				return err
-			}
-			st.BytesWritten += int64(len(sealed))
-		} else {
-			data, err := o.From.GetBlock(ctx, ref.Hash)
-			if err != nil {
-				return err
-			}
-			h2 := o.To.Hasher().Sum(data)
-			translate[ref.Hash] = h2
-			if have[h2] {
-				st.BlocksPresent++
-				reused = append(reused, repo.BlockKey(h2))
-				continue
-			}
-			n, err := o.To.PutBlock(ctx, h2, data, put)
-			if err != nil {
-				return err
-			}
-			st.BytesWritten += int64(n)
 		}
-		have[translate[ref.Hash]] = true
-		st.BlocksCopied++
+		select {
+		case jobs <- ref:
+		case <-cctx.Done():
+			break walk
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	report(PhaseWriting, m.DiskSize, m.DiskSize)
 
