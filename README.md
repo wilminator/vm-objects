@@ -144,6 +144,26 @@ vmobj backup-vm --repo /mnt/backup/vmobj --key-file /root/vmobj.key --domain win
 for one backup, and is safe to repeat. Repositories with different keys
 work too: vmobj re-encrypts as it copies.
 
+## Interrupted runs
+
+Nothing needs cleaning up after a backup, copy or restore stops part-way
+(a dropped connection, Ctrl-C, a reboot). Run the same command again:
+
+- **backup and copy** find the blocks already stored and skip them, so
+  only the rest is sent. A backup (or copy) is listed only once all of it
+  is stored, so a broken run never looks like a good backup.
+- **restore** (the default rename mode) keeps what it wrote in a hidden
+  `.NAME.vmobj-partial` file next to the output, and never puts a partial
+  image under the real name. The rerun reads that file back, keeps every
+  block that already matches the backup, and fetches only the rest.
+  `--no-resume` starts afresh instead.
+- **restore-vm** keeps a `.vmobj-restore-vm` marker naming the backup in
+  its folder until it finishes. Rerun into the same folder: finished disks
+  are checked in place, and the unfinished one continues. A folder holding
+  another backup's unfinished restore is refused.
+- **in-place and staged restores** were already safe to rerun: they
+  compare before writing.
+
 ## Repositories in S3
 
 Anywhere `--repo` takes a folder, it also takes an S3 address:

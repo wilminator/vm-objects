@@ -247,6 +247,13 @@ func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (so
 	return source.Open(spec, format)
 }
 
+// rerunHint adds to a failed backup or copy that running it again picks
+// up where it stopped: the blocks already stored are found and skipped,
+// and a backup is only listed once all of it is stored.
+func rerunHint(err error) error {
+	return fmt.Errorf("%w\nRun the same command again to continue: what is already stored is skipped, and nothing half-done is listed as a backup", err)
+}
+
 // copyUploads is --uploads: how many blocks a copy sends at once.
 var copyUploads = engine.DefaultUploads
 
@@ -493,7 +500,7 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	st, err := engine.Backup(ctx, base)
 	stopProgress()
 	if err != nil {
-		return err
+		return rerunHint(err)
 	}
 	fmt.Printf("Manifest:  %s\n", st.Manifest)
 	if m, err := r.GetManifest(ctx, *vm, st.Manifest); err == nil {
@@ -587,6 +594,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
+	noResume := fs.Bool("no-resume", false, "rename mode: start afresh instead of continuing what an interrupted run of this restore left (."+"NAME.vmobj-partial)")
 	outFormat := fs.String("output-format", "raw", "raw, or qcow2: write a new qcow2 image (with --backing, an overlay holding only what differs from it)")
 	backing := fs.String("backing", "", "with --output-format qcow2: the image the new one goes on top of, as a QNAP snapshot does")
 	backingFormat := fs.String("backing-format", "qcow2", "with --backing: qcow2 or raw")
@@ -662,7 +670,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	report, stopReport := restoreProgress(pc, *out, scratchLabel)
 	st, err := engine.Restore(ctx, engine.RestoreOptions{Repo: r, VM: *vm, Manifest: *name, Output: *out, Force: *force,
-		Mode: mode, Scratch: *scratch, Check: *check, Base: *base, CheckWritten: *checkWritten, ExpectSHA256: *expectSHA, Journal: *journal,
+		NoResume: *noResume, Mode: mode, Scratch: *scratch, Check: *check, Base: *base, CheckWritten: *checkWritten, ExpectSHA256: *expectSHA, Journal: *journal,
 		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }})
 	stopReport()
 	var nr *engine.NotReadyError
@@ -676,6 +684,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if mode == engine.ModeRename {
 		fmt.Printf("Restored %s to %s in %s: %d blocks, %d newer extents, %d zero blocks.\n",
 			units.Format(st.DiskBytes), *out, took, st.BlocksRead, st.ExtentsRead, st.ZeroBlocks)
+		if st.Resumed {
+			fmt.Printf("  Resumed:   continued the interrupted restore in %s; %s already there was read back and kept, %s fetched\n",
+				st.ResumedFrom, units.Format(st.Compared-st.Written), units.Format(st.Written))
+		}
 		return nil
 	}
 	if mode == engine.ModeStaged {
@@ -987,7 +999,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		},
 	})
 	if err != nil {
-		return err
+		return rerunHint(err)
 	}
 	fmt.Printf("VM record: %s (%s)\n", st.Record, st.Consistency)
 	var newHistory [][2]string // stream, manifest
@@ -1154,6 +1166,9 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("Restored %s (%s) into %s in %s.\n", st.Record.DomainName, st.Record.Name, *to, time.Since(start).Round(time.Second))
+	if st.Resumed {
+		fmt.Println("  Resumed:   continued an interrupted restore into this folder; finished disks were checked, not fetched again")
+	}
 	fmt.Printf("Definition: %s\n", st.Definition)
 	fmt.Println("Nothing was registered with libvirt. Read RESTORE.txt in that folder for the next steps.")
 	return nil
@@ -1184,7 +1199,7 @@ func copyAfterBackup(ctx context.Context, from *repo.Repo, targets []string, key
 		failed = append(failed, t)
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("the backup succeeded, but copying it to %s failed; retry with vmobj copy", strings.Join(failed, ", "))
+		return fmt.Errorf("the backup succeeded, but copying it to %s failed; retry with vmobj copy (blocks already copied are skipped)", strings.Join(failed, ", "))
 	}
 	return nil
 }
@@ -1259,7 +1274,7 @@ func cmdCopy(ctx context.Context, args []string) error {
 		return err
 	}
 	if err != nil {
-		return err
+		return rerunHint(err)
 	}
 	fmt.Printf("Copied:    %d backups, %d VM records in %s\n", st.Manifests, st.Records, time.Since(start).Round(time.Second))
 	fmt.Printf("Blocks:    %d copied, %d already there\n", st.BlocksCopied, st.BlocksPresent)

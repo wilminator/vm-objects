@@ -32,6 +32,9 @@ type RestoreOptions struct {
 	Output   string // a raw image file, or a block device such as a zvol
 	Force    bool   // allow replacing an existing regular file (rename mode)
 	Mode     Mode   // rename (default), copy or in-place; see ModeRename
+	// NoResume starts a rename-mode restore afresh, removing what an
+	// earlier, interrupted run of it left behind, instead of continuing it.
+	NoResume bool
 	Scratch  string // copy mode: folder for the temporary full restore (default: the target's folder)
 	Check    bool   // copy and in-place: read the target back afterwards and compare
 	// Base (in-place only) names a backup of the same disk that the target
@@ -81,7 +84,11 @@ type RestoreStats struct {
 	ZeroBlocks  int
 
 	// Copy and in-place modes.
-	Compared      int64 // bytes of the target read and compared
+	Compared int64 // bytes of the target read and compared
+	// Resumed is set when a rename-mode restore continued the partial file
+	// an interrupted run left; ResumedFrom is that file.
+	Resumed       bool
+	ResumedFrom   string
 	Written       int64 // bytes written to the target
 	PiecesWritten int   // 4 KiB pieces written (the disk's last maybe shorter)
 	Writes        int   // write calls; neighbouring pieces go out together
@@ -164,13 +171,22 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 	default:
 		return nil, fmt.Errorf("unknown restore mode %q", o.Mode)
 	}
-	t, err := openTarget(o.Output, m.DiskSize, o.Force)
+	t, err := openTarget(o.Output, m.DiskSize, o.Force, !o.NoResume)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeDisk(ctx, r, m, t.f, t.sparse, stats, report); err != nil {
-		t.abort()
-		return nil, err
+	if t.resumed {
+		// Continue what an interrupted run wrote: every block is read
+		// back and compared with the backup, and only the ones that
+		// differ are fetched. Whatever the partial file holds, the
+		// result is the backup.
+		stats.Resumed, stats.ResumedFrom = true, t.tmp
+		_, err = updateInPlace(ctx, r, m, nil, t.f, t.f, stats, report)
+	} else {
+		err = writeDisk(ctx, r, m, t.f, t.sparse, stats, report)
+	}
+	if err != nil {
+		return nil, t.keep(err)
 	}
 	if err := t.commit(); err != nil {
 		return nil, err
@@ -296,17 +312,25 @@ func writeNonZero(r *repo.Repo, out io.WriterAt, block []byte, off, es int64) er
 
 // target is where a restore writes.
 type target struct {
-	f      *os.File
-	sparse bool   // zeros can be skipped (a fresh file)
-	tmp    string // temporary file name; empty for a block device
-	final  string
+	f       *os.File
+	sparse  bool   // zeros can be skipped (a fresh file)
+	tmp     string // the partial file; empty for a block device
+	final   string
+	resumed bool // tmp was left by an interrupted run and is being continued
+}
+
+// PartialName is where a rename-mode restore writes until it is complete:
+// a hidden file next to the output. An interrupted restore leaves it, and
+// running the same restore again continues it.
+func PartialName(output string) string {
+	return filepath.Join(filepath.Dir(output), "."+filepath.Base(output)+".vmobj-partial")
 }
 
 // openTarget prepares the restore target. Files are written under a
 // temporary name next to the final one, created at full size so zero
 // regions stay sparse holes. Block devices are written in full, zeros
 // included, because old data there must be overwritten.
-func openTarget(path string, size int64, force bool) (*target, error) {
+func openTarget(path string, size int64, force, resume bool) (*target, error) {
 	info, err := os.Stat(path)
 	switch {
 	case err == nil && info.Mode()&fs.ModeDevice != 0:
@@ -335,17 +359,64 @@ func openTarget(path string, size int64, force bool) (*target, error) {
 	case !errors.Is(err, fs.ErrNotExist):
 		return nil, err
 	}
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".vmobj-restore-*")
+	partial := PartialName(path)
+	if pi, err := os.Stat(partial); err == nil {
+		if !pi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is in the way and isn't a file", partial)
+		}
+		f, err := os.OpenFile(partial, os.O_RDWR, 0)
+		if err != nil {
+			return nil, err
+		}
+		if err := lockFile(f); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("%s: another restore is writing it (%w)", partial, err)
+		}
+		if resume && pi.Size() == size {
+			return &target{f: f, tmp: partial, final: path, resumed: true}, nil
+		}
+		// A different size (another backup) or --no-resume: start over in
+		// the same file, from empty.
+		if err := f.Truncate(0); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if err := f.Truncate(size); err != nil {
+			f.Close()
+			return nil, err
+		}
+		return &target{f: f, sparse: true, tmp: partial, final: path}, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	f, err := os.OpenFile(partial, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	if err := lockFile(f); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s: another restore is writing it (%w)", partial, err)
+	}
 	if err := f.Truncate(size); err != nil {
 		f.Close()
-		os.Remove(f.Name())
+		os.Remove(partial)
 		return nil, err
 	}
-	return &target{f: f, sparse: true, tmp: f.Name(), final: path}, nil
+	return &target{f: f, sparse: true, tmp: partial, final: path}, nil
+}
+
+// ResumeHint is added to the error of a restore that stopped part-way.
+const ResumeHint = "run the same restore again to continue it (only what isn't there yet is fetched), or add --no-resume to start over"
+
+// keep closes the target after a failure, leaving a partial file for a
+// later run to continue, and says so in the error.
+func (t *target) keep(err error) error {
+	t.f.Sync()
+	t.f.Close()
+	if t.tmp == "" {
+		return err
+	}
+	return fmt.Errorf("%w\nThe restore so far is kept in %s; %s", err, t.tmp, ResumeHint)
 }
 
 // commit flushes the target and, for a file, renames it into place.
