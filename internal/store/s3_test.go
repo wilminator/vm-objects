@@ -8,6 +8,8 @@ package store_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -24,6 +26,8 @@ func TestParseS3(t *testing.T) {
 			Bucket: "bkt", Endpoint: "http://nas:8010", Profile: "qnap", PathStyle: true},
 		"s3://bkt?endpoint=https://s3.example&path-style=false": {
 			Bucket: "bkt", Endpoint: "https://s3.example"},
+		"s3://bkt?profile=p&credentials=/root/backup-secrets/credentials": {
+			Bucket: "bkt", Profile: "p", Credentials: "/root/backup-secrets/credentials"},
 	}
 	for in, want := range good {
 		got, err := store.ParseS3(in)
@@ -38,6 +42,7 @@ func TestParseS3(t *testing.T) {
 		"s3://bkt?regoin=us-west-2",  // misspelt option
 		"s3://bkt?endpoint=nas:8010", // no scheme
 		"s3://bkt?path-style=yes",
+		"s3://bkt?credentials=relative/path", // must be absolute
 		"s3://bkt/../escape",
 	} {
 		loc, err := store.ParseS3(bad)
@@ -91,5 +96,34 @@ func TestS3MissingBucket(t *testing.T) {
 	s, _ := store.NewS3(s3fake.New(), "absent", "")
 	if err := s.Put(context.Background(), "x", nil); err == nil || !strings.Contains(err.Error(), "NoSuchBucket") {
 		t.Fatalf("Put to a missing bucket: %v", err)
+	}
+}
+
+// A credentials file named in the address is read instead of ~/.aws.
+func TestS3CredentialsFile(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "creds")
+	if err := os.WriteFile(f, []byte("[p]\naws_access_key_id = AKIDEXAMPLE\naws_secret_access_key = notreal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir) // no ~/.aws to fall back on
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_PROFILE", "")
+	loc, err := store.ParseS3("s3://bkt?region=us-east-2&profile=p&credentials=" + f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := store.NewS3Client(context.Background(), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr, err := c.Options().Credentials.Retrieve(context.Background())
+	if err != nil || cr.AccessKeyID != "AKIDEXAMPLE" {
+		t.Fatalf("credentials = %q, %v", cr.AccessKeyID, err)
+	}
+	loc.Credentials = filepath.Join(dir, "missing")
+	if _, err := store.NewS3Client(context.Background(), loc); err == nil {
+		t.Fatal("a missing credentials file was accepted")
 	}
 }

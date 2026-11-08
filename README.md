@@ -149,7 +149,7 @@ work too: vmobj re-encrypts as it copies.
 Anywhere `--repo` takes a folder, it also takes an S3 address:
 
 ```text
-s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|false]
+s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false]
 ```
 
 - `region` is required for AWS unless `AWS_REGION` is set.
@@ -158,6 +158,9 @@ s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|fals
 - `profile` picks a section of `~/.aws/credentials`. Credentials are never
   part of the address: vmobj reads them from the standard AWS environment
   variables, files or instance role.
+- `credentials` names another credentials file (an absolute path) to read
+  instead of `~/.aws/credentials`, so a job run as root or from cron finds
+  its keys without any environment variable.
 - A `PREFIX` lets several repositories share one bucket.
 
 ```bash
@@ -174,9 +177,12 @@ backup. `vmobj profiles` lists them:
 | `disaster-recovery` (default) | Deep Archive, 180 days | Standard-IA, 30 days |
 | `fast-restore` | Glacier Instant Retrieval, 90 days | Standard-IA, 30 days |
 | `standard` | Standard | Standard |
+| `offsite` | Standard: fulls 1 year, differentials 90 days | Standard, 90 days |
+| `cold` | Deep Archive, 1 year (for monthly fulls copied with `--record`) | Deep Archive, 180 days |
+| `test` | Standard, 1 day | Standard, 1 day |
 
-Use `--profile standard` with self-hosted services, which usually have only
-Standard storage. `--class` overrides the class for a single run.
+Use `--profile standard` or `offsite` with self-hosted services and
+Backblaze B2, which have only Standard storage. `--class` overrides the class for a single run.
 Manifests and indexes always stay in Standard, so listing and planning a
 restore never wait on the archive. Restoring from Glacier Flexible Retrieval
 or Deep Archive is two steps: `vmobj restore ... --request-restore` starts
