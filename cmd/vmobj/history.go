@@ -21,6 +21,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/progress"
+	"github.com/wilminator/vm-objects/internal/qvs"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/target"
 	"github.com/wilminator/vm-objects/internal/units"
@@ -338,6 +339,67 @@ func cmdQNAPSnapshots(ctx context.Context, args []string) error {
 		fmt.Println("Nothing was written. Run again with --apply to write them.")
 	} else {
 		fmt.Println("Open the VM in Virtualization Station: its Snapshots tab lists them.")
+	}
+	return nil
+}
+
+// cmdQVSCheck logs in to Virtualization Station's API and lists what it
+// reports, changing nothing: to confirm the routes and the account's
+// rights on a live system.
+func cmdQVSCheck(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("qvs-check", flag.ExitOnError)
+	creds := fs.String("qvs-credentials", "", "credentials file ([qvs] url, username, password; mode 600)")
+	vm := fs.String("vm", "", "also list this VM's state and snapshots (name or UUID)")
+	fs.Parse(args)
+	if err := require(fs, "qvs-credentials"); err != nil {
+		return err
+	}
+	cfg, err := qvs.LoadConfig(*creds)
+	if err != nil {
+		return err
+	}
+	c, err := qvs.New(cfg)
+	if err != nil {
+		return err
+	}
+	if err := c.Login(ctx); err != nil {
+		return err
+	}
+	defer c.Logout(context.WithoutCancel(ctx))
+	fmt.Printf("Logged in to %s as %s.\n", cfg.URL, cfg.Username)
+	vms, err := c.ListVMs(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%d VMs:\n", len(vms))
+	for _, v := range vms {
+		fmt.Printf("  %-4s %-24s %-38s %s\n", v.ID, v.Name, v.UUID, v.State)
+	}
+	if *vm == "" {
+		return nil
+	}
+	v, err := c.FindVM(ctx, *vm, *vm)
+	if err != nil {
+		if v, err = c.FindVM(ctx, "", *vm); err != nil {
+			return err
+		}
+	}
+	st, err := c.State(ctx, v.ID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\n%s (id %s): %s\n", v.Name, v.ID, st)
+	snaps, err := c.ListSnapshots(ctx, v.ID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%d snapshots:\n", len(snaps))
+	for _, s := range snaps {
+		lock := ""
+		if s.Locked {
+			lock = " (locked)"
+		}
+		fmt.Printf("  %-12s %-28s %s%s\n", s.ID, s.Name, s.Created.Local().Format("2006-01-02 15:04"), lock)
 	}
 	return nil
 }

@@ -135,17 +135,28 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 		return nil, fmt.Errorf("domain %s has no disks to back up", dom.Name)
 	}
 
-	// Find every problem before touching anything.
+	// Find every problem before touching anything. A running VM's disks
+	// are read from a snapshot: ZFS's for zvols, the platform's own (a
+	// qcow2 overlay, through its API) for image files.
 	var zvols []string
+	var overlayDisks []vmdef.Disk
+	_, canOverlay := plat.(platform.SnapshotManager)
 	for _, d := range disks {
 		if !live {
 			continue
 		}
-		ds, ok := strings.CutPrefix(d.Path, "/dev/zvol/")
-		if d.Type != "block" || !ok {
-			return nil, fmt.Errorf("disk %s (%s): %w", d.Target, d.Path, ErrLiveQCOW2)
+		if ds, ok := strings.CutPrefix(d.Path, "/dev/zvol/"); ok && d.Type == "block" {
+			zvols = append(zvols, ds)
+			continue
 		}
-		zvols = append(zvols, ds)
+		if canOverlay && d.Type == "file" && d.Format == "qcow2" {
+			overlayDisks = append(overlayDisks, d)
+			continue
+		}
+		return nil, fmt.Errorf("disk %s (%s): %w", d.Target, d.Path, ErrLiveQCOW2)
+	}
+	if len(zvols) > 0 && len(overlayDisks) > 0 {
+		return nil, errors.New("the VM runs with both zvol and image-file disks; vmobj can't snapshot both kinds at the same moment, so shut it down for the backup")
 	}
 	// History goes first: its first snapshot makes the disk's full, so an
 	// incremental of the current state can follow on a new repository.
@@ -171,7 +182,18 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	started := o.Now().UTC()
 	stats.Consistency = "shut off"
 	snaps := map[string]string{}
-	if live {
+	var frozen map[string]string // image-file disks of a running VM: target -> the layer to read
+	if live && len(overlayDisks) > 0 {
+		stats.Consistency = "snapshot"
+		var release func()
+		if frozen, release, err = snapshotOverlays(ctx, o, plat, dom, overlayDisks, started); err != nil {
+			return nil, err
+		}
+		defer release()
+		if o.Quiesce {
+			stats.Consistency = "quiesced snapshot"
+		}
+	} else if live {
 		stats.Consistency = "snapshot"
 		if snaps, err = snapshotVM(ctx, o, plat, zvols, started); err != nil {
 			return nil, err
@@ -199,7 +221,12 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 		Consistency: stats.Consistency, Files: files, Skipped: stats.Skipped,
 	}
 	for _, d := range disks {
-		src, err := openVMDisk(ctx, o, d, live, pending)
+		var src source.Source
+		if layer, ok := frozen[d.Target]; ok {
+			src, err = source.Open(layer, "qcow2") // with everything below it
+		} else {
+			src, err = openVMDisk(ctx, o, d, live, pending)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("disk %s: %w", d.Target, err)
 		}
@@ -295,6 +322,83 @@ func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, 
 		}()
 	}
 	return source.SnapshotZvols(ctx, o.zfs(), now, zvols...)
+}
+
+// SnapshotNamePrefix starts the name of every platform snapshot vmobj
+// takes for a backup; it deletes each one when the backup is done.
+const SnapshotNamePrefix = "vmobj-"
+
+// snapshotOverlays takes a platform snapshot of a running VM whose disks
+// are qcow2 image files (QNAP Virtualization Station, through its API).
+// The platform starts a new overlay on top of each disk, so the file each
+// disk used until then can't change any more: that is the layer to read,
+// with everything below it. release deletes the snapshot again (the
+// platform merges the overlay back); it must run even if the backup fails.
+func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM,
+	disks []vmdef.Disk, now time.Time) (layers map[string]string, release func(), err error) {
+	sm := plat.(platform.SnapshotManager)
+	tops := map[string]string{}
+	for _, d := range disks {
+		tops[d.Target] = d.Path
+	}
+	info := platform.SnapshotInfo{
+		Name:        SnapshotNamePrefix + now.UTC().Format("20060102T150405Z"),
+		Description: "Taken by vmobj for a backup; vmobj deletes it when the backup is done.",
+	}
+	snap, err := func() (snap platform.SnapshotInfo, err error) {
+		if q, ok := plat.(platform.Quiescer); o.Quiesce && ok {
+			if err := q.Freeze(ctx, o.Domain); err != nil {
+				return snap, fmt.Errorf("freezing the guest's filesystems (is the QEMU guest agent running?): %w", err)
+			}
+			defer func() {
+				if terr := q.Thaw(context.WithoutCancel(ctx), o.Domain); terr != nil && err == nil {
+					err = fmt.Errorf("thawing the guest's filesystems: %w", terr)
+				}
+			}()
+		}
+		return sm.CreateSnapshot(ctx, dom, info)
+	}()
+	if err != nil {
+		return nil, nil, fmt.Errorf("taking the platform snapshot %s: %w", info.Name, err)
+	}
+	release = func() {
+		if derr := sm.DeleteSnapshot(context.WithoutCancel(ctx), dom, snap.ID); derr != nil {
+			fmt.Fprintf(os.Stderr, "vmobj: deleting the backup snapshot %s failed: %v; delete it in the platform's UI\n", info.Name, derr)
+		}
+	}
+	after, err := plat.Describe(ctx, o.Domain)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	layers = map[string]string{}
+	for _, d := range after.Disks {
+		old, ok := tops[d.Target]
+		if !ok {
+			continue
+		}
+		if sameFile(d.Path, old) {
+			release()
+			return nil, nil, fmt.Errorf("disk %s: the platform's snapshot didn't start a new overlay (still %s), so it isn't frozen", d.Target, d.Path)
+		}
+		chain, err := source.QCOW2Chain(d.Path)
+		if err != nil {
+			release()
+			return nil, nil, fmt.Errorf("disk %s: %w", d.Target, err)
+		}
+		if len(chain) < 2 || !sameFile(chain[1].Path, old) {
+			release()
+			return nil, nil, fmt.Errorf("disk %s: the new top %s doesn't sit on %s, so vmobj can't tell which layer is frozen", d.Target, d.Path, old)
+		}
+		layers[d.Target] = old
+	}
+	for t := range tops {
+		if _, ok := layers[t]; !ok {
+			release()
+			return nil, nil, fmt.Errorf("disk %s disappeared from the VM during the snapshot", t)
+		}
+	}
+	return layers, release, nil
 }
 
 // openVMDisk opens one disk: from its snapshot when the VM runs, directly
