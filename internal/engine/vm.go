@@ -54,6 +54,16 @@ type BackupVMOptions struct {
 	SwtpmDir string // default /var/lib/libvirt/swtpm
 	// Progress, when set, wraps each disk source (for progress output).
 	Progress func(target string, s source.Source) (source.Source, func())
+
+	// History first backs up each disk's named snapshots that the
+	// repository lacks (milestone 9), then the VM as usual. Zvol disks'
+	// ZFS snapshots are read directly; other disks need a platform that
+	// lists snapshots (platform.Snapshotter).
+	History bool
+	// Hash records each history snapshot's whole-disk SHA-256.
+	Hash bool
+	// HistoryStep, when set, is told about each disk's snapshots in turn.
+	HistoryStep func(target string, i, n int, snap manifest.Snapshot, skipped bool)
 }
 
 // DefaultSwtpmDir is where libvirt keeps emulated TPM state.
@@ -77,6 +87,8 @@ type BackupVMStats struct {
 	TPMFiles    int
 	ConfigFiles []string // names of platform settings files, such as truenas-vm.json
 	Skipped     []string
+	// History is what --history did, by disk target.
+	History map[string][]HistoryStep
 }
 
 // ErrLiveQCOW2 means a running VM has file-backed disks, which can't be
@@ -121,6 +133,11 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	}
 	if len(disks) == 0 {
 		return nil, fmt.Errorf("domain %s has no disks to back up", dom.Name)
+	}
+	if o.History {
+		if stats.History, err = backupVMHistory(ctx, o, plat, dom, disks); err != nil {
+			return nil, err
+		}
 	}
 
 	// Find every problem before touching anything.
@@ -682,4 +699,69 @@ func restoreNotes(rec *manifest.VMRecord, st *RestoreVMStats, name string, renam
 		fmt.Fprintf(&b, "     virsh define %s\n", st.Definition)
 	}
 	return b.String()
+}
+
+// backupVMHistory backs up each disk's named snapshots the repository
+// lacks, into the disk's own series, oldest first. All disks are listed
+// before any is backed up, so a disk that can't be read stops the run
+// before anything is written.
+func backupVMHistory(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM, disks []vmdef.Disk) (map[string][]HistoryStep, error) {
+	lists := map[string][]SnapshotSource{}
+	for _, d := range disks {
+		snaps, err := diskSnapshots(ctx, o, plat, dom, d)
+		if err != nil {
+			return nil, fmt.Errorf("disk %s: %w", d.Target, err)
+		}
+		lists[d.Target] = snaps
+	}
+	out := map[string][]HistoryStep{}
+	for _, d := range disks {
+		target := d.Target
+		ho := HistoryOptions{
+			BackupOptions: BackupOptions{
+				Repo: o.Repo, VM: manifest.DiskStream(o.VM, target), StatePath: diskStatePath(o, target),
+				Workers: o.Workers, Profile: o.Profile, Class: o.Class, Now: o.Now,
+			},
+			Snapshots: lists[target], Hash: o.Hash,
+		}
+		if o.HistoryStep != nil {
+			ho.Step = func(i, n int, s manifest.Snapshot, skipped bool) { o.HistoryStep(target, i, n, s, skipped) }
+		}
+		if o.Progress != nil {
+			ho.Wrap = func(src source.Source) (source.Source, func()) { return o.Progress(target, src) }
+		}
+		steps, err := BackupHistory(ctx, ho)
+		out[target] = steps
+		if err != nil {
+			return out, fmt.Errorf("disk %s history: %w", target, err)
+		}
+	}
+	return out, nil
+}
+
+// diskSnapshots lists one disk's named snapshots: the platform's own when
+// it has a way, otherwise a zvol's ZFS snapshots.
+func diskSnapshots(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM, d vmdef.Disk) ([]SnapshotSource, error) {
+	if s, ok := plat.(platform.Snapshotter); ok {
+		return s.DiskSnapshots(ctx, dom, d)
+	}
+	zvol, ok := strings.CutPrefix(d.Path, "/dev/zvol/")
+	if d.Type != "block" || !ok {
+		return nil, fmt.Errorf("%s: --history reads ZFS zvol snapshots; the %s module can't list this disk's snapshots", d.Path, plat.Name())
+	}
+	snaps, err := source.ListZFSSnapshots(ctx, o.zfs(), zvol)
+	if err != nil {
+		return nil, err
+	}
+	var list []SnapshotSource
+	for _, sn := range snaps {
+		full := zvol + "@" + sn.Name
+		list = append(list, SnapshotSource{
+			Info: manifest.Snapshot{Name: sn.Name, Created: sn.Created, Description: sn.Description, Platform: plat.Name()},
+			Open: func(ctx context.Context) (source.Source, error) {
+				return source.OpenZFS(ctx, zvol, source.ZFSOptions{Runner: o.zfs(), DevDir: o.ZFSDevDir, Existing: full})
+			},
+		})
+	}
+	return list, nil
 }

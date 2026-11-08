@@ -21,6 +21,7 @@ import (
 	"sort"
 
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/vmdef"
 )
 
@@ -52,6 +53,20 @@ type Platform interface {
 type Quiescer interface {
 	Freeze(ctx context.Context, vm string) error
 	Thaw(ctx context.Context, vm string) error
+}
+
+// DiskSnapshot is one of a disk's named snapshots (milestone 9).
+type DiskSnapshot struct {
+	Info manifest.Snapshot
+	// Open returns the disk as it was at the snapshot; the caller closes it.
+	Open func(ctx context.Context) (source.Source, error)
+}
+
+// Snapshotter lists a disk's named snapshots, oldest first. A platform
+// whose snapshots aren't plain ZFS ones (QNAP's qcow2 overlays) offers it;
+// for zvol disks the engine reads ZFS snapshots itself.
+type Snapshotter interface {
+	DiskSnapshots(ctx context.Context, vm *VM, disk vmdef.Disk) ([]DiskSnapshot, error)
 }
 
 // Names lists the platforms vmobj knows, for --platform.

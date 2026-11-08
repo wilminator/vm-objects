@@ -890,6 +890,8 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system (default: the platform's)")
 	defFile := fs.String("definition", "", "read the VM's libvirt definition from this file instead of from libvirt, for a shut-off VM the platform defines only while it runs (QNAP Virtualization Station: <disk folder>/.<UUID>.meta/<UUID>.xml)")
 	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
+	history := fs.Bool("history", false, "first back up each disk's named snapshots the repository lacks, oldest first (zvol disks)")
+	hash := fs.Bool("hash", false, "with --history, record each snapshot's whole-disk SHA-256 (one extra read per snapshot)")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
 	pf := addProgressFlags(fs)
@@ -944,7 +946,14 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	start := time.Now()
 	st, err := engine.BackupVM(ctx, engine.BackupVMOptions{
 		Repo: r, Domain: *domain, VM: *vm, Kind: k, Profile: &prof, Class: class, Workers: *workers,
-		StateDir: *stateDir, Quiesce: *quiesce, Platform: plat,
+		StateDir: *stateDir, Quiesce: *quiesce, Platform: plat, History: *history, Hash: *hash,
+		HistoryStep: func(target string, i, n int, sn manifest.Snapshot, skipped bool) {
+			what := "backing up"
+			if skipped {
+				what = "already backed up"
+			}
+			fmt.Fprintf(os.Stderr, "Disk %s snapshot [%d/%d] %s (%s): %s\n", target, i+1, n, sn.Name, sn.Created.Local().Format("2006-01-02 15:04"), what)
+		},
 		Progress: func(target string, s source.Source) (source.Source, func()) {
 			fmt.Fprintf(os.Stderr, "Disk %s (%s)...\n", target, units.Format(s.Size()))
 			return withProgress(pc, "disk "+target, s)
@@ -954,6 +963,17 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("VM record: %s (%s)\n", st.Record, st.Consistency)
+	var newHistory [][2]string // stream, manifest
+	for t, steps := range st.History {
+		added := 0
+		for _, h := range steps {
+			if !h.Skipped {
+				added++
+				newHistory = append(newHistory, [2]string{manifest.DiskStream(vmOrRecord(ctx, r, *vm, st.Record), t), h.Manifest})
+			}
+		}
+		fmt.Printf("History:   disk %s, %d snapshots backed up, %d already there\n", t, added, len(steps)-added)
+	}
 	var targets []string
 	for t := range st.Disks {
 		targets = append(targets, t)
@@ -981,8 +1001,25 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 			}
 			vmName = rec
 		}
+		for _, h := range newHistory {
+			if err := engine.CopyManifest(ctx, o, h[0], h[1], cs); err != nil {
+				return fmt.Errorf("history backup %s: %w", h[1], err)
+			}
+		}
 		return engine.CopyRecord(ctx, o, vmName, st.Record, cs)
 	})
+}
+
+// vmOrRecord is the VM's name in the repository: --vm when given, else
+// the one the record was written under.
+func vmOrRecord(ctx context.Context, r *repo.Repo, vm, record string) string {
+	if vm != "" {
+		return vm
+	}
+	if name, err := findRecord(ctx, r, record); err == nil {
+		return name
+	}
+	return ""
 }
 
 // findRecord finds which VM a just-written record belongs to.

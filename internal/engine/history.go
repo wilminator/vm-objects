@@ -15,6 +15,7 @@ import (
 	"slices"
 
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/repo"
 	"github.com/wilminator/vm-objects/internal/source"
 )
@@ -26,12 +27,9 @@ import (
 // ZFS or QNAP: a platform lists the snapshots (SnapshotSource) and
 // recreates them (HistoryTarget).
 
-// SnapshotSource is one of a disk's named snapshots, as a platform lists it.
-type SnapshotSource struct {
-	Info manifest.Snapshot
-	// Open returns the disk as it was at the snapshot. The engine closes it.
-	Open func(ctx context.Context) (source.Source, error)
-}
+// SnapshotSource is one of a disk's named snapshots, as a platform lists
+// it. The engine closes what Open returns.
+type SnapshotSource = platform.DiskSnapshot
 
 // HistoryOptions describe a history backup. Repo, VM, StatePath, Workers,
 // Profile, Class and Now come from the embedded BackupOptions; its Source,
