@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -36,6 +37,9 @@ type S3Location struct {
 	// any user, needs no environment variable to find its keys.
 	Credentials string
 	PathStyle   bool // bucket in the path, not the host name; needed by most non-AWS services
+	// Stall is how long a request may move no data before it's cancelled
+	// and retried (stall=90s); zero means DefaultStall.
+	Stall time.Duration
 }
 
 // ParseS3 parses an s3:// address.
@@ -71,9 +75,16 @@ func ParseS3(raw string) (S3Location, error) {
 	default:
 		return S3Location{}, fmt.Errorf("%q: path-style must be true or false", raw)
 	}
+	if v := q.Get("stall"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < time.Second {
+			return S3Location{}, fmt.Errorf("%q: stall must be a duration of at least 1s, such as 90s or 5m", raw)
+		}
+		loc.Stall = d
+	}
 	for k := range q {
 		switch k {
-		case "region", "endpoint", "profile", "path-style", "credentials":
+		case "region", "endpoint", "profile", "path-style", "credentials", "stall":
 		default:
 			return S3Location{}, fmt.Errorf("%q: unknown option %q", raw, k)
 		}
@@ -104,7 +115,12 @@ func Open(ctx context.Context, location string) (Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewS3(client, loc.Bucket, loc.Prefix)
+	b, err := NewS3(client, loc.Bucket, loc.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	b.SetStall(loc.Stall)
+	return b, nil
 }
 
 // NewS3Client builds an AWS SDK client for loc.

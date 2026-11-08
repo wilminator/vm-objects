@@ -147,7 +147,10 @@ work too: vmobj re-encrypts as it copies.
 ## Interrupted runs
 
 Nothing needs cleaning up after a backup, copy or restore stops part-way
-(a dropped connection, Ctrl-C, a reboot). Run the same command again:
+(a dropped connection, Ctrl-C, a reboot). A connection that goes quiet is
+caught by the stall watchdog and retried; if it never comes back, the run
+stops with an error rather than hanging. Either way, run the same command
+again:
 
 - **backup and copy** find the blocks already stored and skip them, so
   only the rest is sent. A backup (or copy) is listed only once all of it
@@ -169,7 +172,7 @@ Nothing needs cleaning up after a backup, copy or restore stops part-way
 Anywhere `--repo` takes a folder, it also takes an S3 address:
 
 ```text
-s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false]
+s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false][&stall=DURATION]
 ```
 
 - `region` is required for AWS unless `AWS_REGION` is set.
@@ -181,6 +184,12 @@ s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&
 - `credentials` names another credentials file (an absolute path) to read
   instead of `~/.aws/credentials`, so a job run as root or from cron finds
   its keys without any environment variable.
+- `stall` (default `2m`) is how long a request may move no data before
+  it is cancelled and retried. A connection whose network path
+  disappears (a route withdrawn, a NAT entry dropped) often never errors
+  and would otherwise wait forever. Each request is tried up to four
+  times, so a brief outage costs a retry, not the whole run. A slow link
+  never trips it; only a dead one does.
 - A `PREFIX` lets several repositories share one bucket.
 
 ```bash
