@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
@@ -115,7 +116,13 @@ type Libvirt struct {
 	Virsh    libvirt.Runner
 	SwtpmDir string // default DefaultSwtpmDir
 	Config   LibvirtConfig
-	name     string
+	// DefinitionFile, when set, is read instead of asking libvirt for the
+	// definition: for a VM the platform keeps defined only while it runs,
+	// as QNAP Virtualization Station does (its definitions live beside the
+	// disks, in .<UUID>.meta/<UUID>.xml). The VM must be shut off: if
+	// libvirt knows the domain and it is running, Describe refuses.
+	DefinitionFile string
+	name           string
 }
 
 // NewLibvirt returns the generic libvirt module.
@@ -149,6 +156,9 @@ func (l *Libvirt) Name() string {
 
 // Describe reads the domain's state, definition, NVRAM and TPM state.
 func (l *Libvirt) Describe(ctx context.Context, domain string) (*VM, error) {
+	if l.DefinitionFile != "" {
+		return l.describeFile(ctx, domain)
+	}
 	state, err := libvirt.DomainState(ctx, l.Virsh, domain)
 	if err != nil {
 		return nil, err
@@ -157,12 +167,37 @@ func (l *Libvirt) Describe(ctx context.Context, domain string) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
+	return l.describeXML(xmlDef, state != libvirt.ShutOff)
+}
+
+// describeFile describes a shut-off VM from its definition file.
+func (l *Libvirt) describeFile(ctx context.Context, domain string) (*VM, error) {
+	xmlDef, err := os.ReadFile(l.DefinitionFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading the definition: %w", err)
+	}
+	dom, err := vmdef.Parse(xmlDef)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", l.DefinitionFile, err)
+	}
+	if domain != "" && domain != dom.Name && !strings.EqualFold(domain, dom.UUID) {
+		return nil, fmt.Errorf("%s defines %s (%s), not %s", l.DefinitionFile, dom.Name, dom.UUID, domain)
+	}
+	// A domain libvirt knows must be shut off; one it doesn't know isn't
+	// running (the platform defines it only while it runs).
+	if state, err := libvirt.DomainState(ctx, l.Virsh, dom.UUID); err == nil && state != libvirt.ShutOff {
+		return nil, fmt.Errorf("%s is %s in libvirt: back up a running VM by its domain, without --definition", dom.Name, state)
+	}
+	return l.describeXML(xmlDef, false)
+}
+
+func (l *Libvirt) describeXML(xmlDef []byte, running bool) (*VM, error) {
 	dom, err := vmdef.Parse(xmlDef)
 	if err != nil {
 		return nil, err
 	}
 	vm := &VM{
-		Name: dom.Name, UUID: dom.UUID, Running: state != libvirt.ShutOff,
+		Name: dom.Name, UUID: dom.UUID, Running: running,
 		Definition: xmlDef, DefinitionType: "libvirt-xml",
 		Disks: dom.Disks, Skipped: dom.Skipped,
 	}

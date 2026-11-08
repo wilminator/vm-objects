@@ -51,7 +51,8 @@ Usage:
                     [--check [--check-written]] [--expect-sha256 HEX] [--base NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
-                    [--vm NAME] [--profile NAME] [--quiesce] [--virsh PATH] [--connect URI] [--swtpm-dir DIR]
+                    [--vm NAME] [--profile NAME] [--quiesce] [--platform NAME] [--virsh PATH] [--connect URI]
+                    [--libvirt-socket PATH] [--swtpm-dir DIR] [--definition FILE]
                     [--copy-to REPO ...]
   vmobj vms         --repo REPO --key-file PATH [--vm NAME]
   vmobj restore-vm  --repo REPO --key-file PATH --vm NAME --record NAME --to DIR [--new-name NAME]
@@ -837,6 +838,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	swtpmDir := fs.String("swtpm-dir", "", "where libvirt keeps TPM state (default: the platform's; see vmobj platforms)")
 	virshPath := fs.String("virsh", "", "virsh program (default: the platform's; see vmobj platforms)")
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system (default: the platform's)")
+	defFile := fs.String("definition", "", "read the VM's libvirt definition from this file instead of from libvirt, for a shut-off VM the platform defines only while it runs (QNAP Virtualization Station: <disk folder>/.<UUID>.meta/<UUID>.xml)")
 	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
@@ -848,8 +850,11 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	if perr != nil {
 		return perr
 	}
-	if err := require(fs, "repo", "key-file", "domain", "type"); err != nil {
+	if err := require(fs, "repo", "key-file", "type"); err != nil {
 		return err
+	}
+	if *domain == "" && *defFile == "" {
+		return errors.New("backup-vm: give --domain, or --definition for a VM libvirt doesn't hold while it's off")
 	}
 	k, err := manifest.ParseKind(*kind)
 	if err != nil {
@@ -858,6 +863,16 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	plat, err := newPlatform(*platformName, *virshPath, *connect, *socket, *swtpmDir)
 	if err != nil {
 		return err
+	}
+	if *defFile != "" {
+		lv, ok := plat.(*platform.Libvirt)
+		if !ok {
+			return fmt.Errorf("backup-vm: --definition works with the libvirt and qnap platforms, not %s", plat.Name())
+		}
+		if *quiesce {
+			return errors.New("backup-vm: --quiesce needs a running VM; --definition is for a shut-off one")
+		}
+		lv.DefinitionFile = *defFile
 	}
 	prof, err := policy.Lookup(*profileName)
 	if err != nil {
