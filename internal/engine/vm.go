@@ -340,6 +340,11 @@ type RestoreVMOptions struct {
 	// Target is the platform the VM will run on next (libvirt, qnap or
 	// truenas): RESTORE.txt explains the steps for it. Empty means libvirt.
 	Target string
+	// History restores each disk's snapshot history too (milestone 9), as
+	// the qcow2 overlay chain QNAP Virtualization Station keeps, with a
+	// plan for its snapshot records (QNAPPlanFile). QNAP only for now;
+	// restore-history rebuilds a single disk's history in a ZFS zvol.
+	History bool
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -349,6 +354,9 @@ type RestoreVMStats struct {
 	Files      int
 	Record     *manifest.VMRecord
 	Resumed    bool // continued an interrupted restore into the same folder
+	// HistoryPlan is the snapshot plan restore-vm --history wrote, for
+	// "vmobj qnap-snapshots".
+	HistoryPlan string
 }
 
 // RestoreVMMarker is the file restore-vm keeps in its folder until the
@@ -431,7 +439,22 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if o.Target == "qnap" {
 		ext = ".img"
 	}
+	if o.History {
+		if o.Target != "qnap" {
+			return nil, fmt.Errorf("restore-vm --history writes QNAP Virtualization Station's layout; for a zvol, use restore-history per disk")
+		}
+		if resuming {
+			return nil, fmt.Errorf("%s holds an unfinished history restore; restore into a new folder (overlays can't be continued part-way)", dir)
+		}
+		if err := restoreQNAPHistory(ctx, o, rec, dir, name, st, &changes); err != nil {
+			return nil, err
+		}
+		st.HistoryPlan = filepath.Join(dir, QNAPPlanFile)
+	}
 	for _, d := range rec.Disks {
+		if o.History {
+			break
+		}
 		out := filepath.Join(dir, name+"-"+d.Target+ext)
 		ro := RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}
 		if fi, err := os.Stat(out); resuming && err == nil && fi.Mode().IsRegular() {
@@ -557,32 +580,50 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 	case "qnap":
 		b.WriteString("To run it in QNAP Virtualization Station (which manages its own VMs, so\n")
 		b.WriteString("nothing is defined from here):\n\n")
-		// Virtualization Station's disk picker lists only qcow2 images, so
-		// each raw disk is converted first, with QNAP's own qemu-img.
-		b.WriteString("1. Convert each restored disk to qcow2: Virtualization Station's disk\n")
-		b.WriteString("   picker lists only .qcow2 files. Use QNAP's own qemu-img:\n\n")
-		for _, t := range disks {
-			raw := st.Disks[t]
-			fmt.Fprintf(&b, "     LD_LIBRARY_PATH=%s %s convert -p -f raw -O qcow2 %s %s\n", platform.QNAPLibDir, platform.QNAPQemuImg, raw, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
-		}
-		b.WriteString("\n   Keep the .img until the VM runs: it is the copy checked against the backup.\n\n")
-		b.WriteString("2. In Virtualization Station, create a VM with UEFI firmware")
-		if tpm {
-			b.WriteString(" and a TPM 2.0 device")
-		}
-		b.WriteString(",\n   and give it the converted disks as its disk images:\n\n")
-		for _, t := range disks {
-			raw := st.Disks[t]
-			fmt.Fprintf(&b, "     %s  %s\n", t, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
-		}
-		b.WriteString("\n   Use the original's settings (CPU, memory, firmware) from the definition\n")
-		fmt.Fprintf(&b, "   %s", filepath.Base(st.Definition))
-		if config != "" {
-			fmt.Fprintf(&b, " and %s", config)
+		if st.HistoryPlan != "" {
+			b.WriteString("1. The disks are already qcow2 overlay chains (one layer per snapshot):\n")
+			b.WriteString("   don't convert, move or rename any of these files. Each layer names the\n")
+			b.WriteString("   one below it, and the snapshot records will name them all.\n\n")
+			b.WriteString("2. In Virtualization Station, create a VM with UEFI firmware")
+			if tpm {
+				b.WriteString(" and a TPM 2.0 device")
+			}
+			b.WriteString(",\n   and give it each disk's top layer as its disk image:\n\n")
+			for _, t := range disks {
+				fmt.Fprintf(&b, "     %s  %s\n", t, st.Disks[t])
+			}
+			b.WriteString("\n   Use the original's settings (CPU, memory, firmware) from the definition\n")
+			fmt.Fprintf(&b, "   %s", filepath.Base(st.Definition))
+		} else {
+			// Virtualization Station's disk picker lists only qcow2 images, so
+			// each raw disk is converted first, with QNAP's own qemu-img.
+			b.WriteString("1. Convert each restored disk to qcow2: Virtualization Station's disk\n")
+			b.WriteString("   picker lists only .qcow2 files. Use QNAP's own qemu-img:\n\n")
+			for _, t := range disks {
+				raw := st.Disks[t]
+				fmt.Fprintf(&b, "     LD_LIBRARY_PATH=%s %s convert -p -f raw -O qcow2 %s %s\n", platform.QNAPLibDir, platform.QNAPQemuImg, raw, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
+			}
+			b.WriteString("\n   Keep the .img until the VM runs: it is the copy checked against the backup.\n\n")
+			b.WriteString("2. In Virtualization Station, create a VM with UEFI firmware")
+			if tpm {
+				b.WriteString(" and a TPM 2.0 device")
+			}
+			b.WriteString(",\n   and give it the converted disks as its disk images:\n\n")
+			for _, t := range disks {
+				raw := st.Disks[t]
+				fmt.Fprintf(&b, "     %s  %s\n", t, strings.TrimSuffix(raw, filepath.Ext(raw))+".qcow2")
+			}
+			b.WriteString("\n   Use the original's settings (CPU, memory, firmware) from the definition\n")
+			fmt.Fprintf(&b, "   %s", filepath.Base(st.Definition))
+			if config != "" {
+				fmt.Fprintf(&b, " and %s", config)
+			}
 		}
 		b.WriteString(". Don't start it yet.\n\n")
+		step := 3 // the steps after creating the VM are numbered as they're written
 		if tpm {
-			b.WriteString("3. Find the new VM's UUID, then put the TPM state where QNAP keeps it:\n\n")
+			fmt.Fprintf(&b, "%d. Find the new VM's UUID, then put the TPM state where QNAP keeps it:\n\n", step)
+			step++
 			fmt.Fprintf(&b, "     %s list --all --uuid\n", platform.QNAPVirsh)
 			fmt.Fprintf(&b, "     mkdir -p %s\n", tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
 			fmt.Fprintf(&b, "     cp -a %s/. %s/\n\n", filepath.Join(dir, "tpm"), tpmInto(platform.QNAPSwtpmDir+"/<UUID>"))
@@ -594,10 +635,19 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 			}
 		}
 		if nvram != "" {
-			b.WriteString("4. If the original had UEFI settings to keep, copy the restored NVRAM file\n")
+			fmt.Fprintf(&b, "%d. If the original had UEFI settings to keep, copy the restored NVRAM file\n", step)
+			step++
 			b.WriteString("   over the new VM's while it is stopped. Its path is the <nvram> line of\n")
 			fmt.Fprintf(&b, "   `%s dumpxml <UUID>`:\n\n", platform.QNAPVirsh)
 			fmt.Fprintf(&b, "     cp %s <that path>\n\n", nvram)
+		}
+		if st.HistoryPlan != "" {
+			fmt.Fprintf(&b, "%d. Register the snapshots, with the VM still shut off. The new VM's\n", step)
+			b.WriteString("   definition is .<UUID>.meta/<UUID>.xml in the folder Virtualization\n")
+			b.WriteString("   Station made for it. Check first (writes nothing), then add --apply:\n\n")
+			fmt.Fprintf(&b, "     vmobj qnap-snapshots --plan %s --definition <that file>\n", st.HistoryPlan)
+			fmt.Fprintf(&b, "     vmobj qnap-snapshots --plan %s --definition <that file> --apply\n\n", st.HistoryPlan)
+			b.WriteString("   Its Snapshots tab then lists them, with their original names and dates.\n\n")
 		}
 		if from == "truenas" {
 			b.WriteString("Windows activation is tied to the original's hardware identity (its SMBIOS\n")
@@ -777,7 +827,10 @@ func backupVMHistory(ctx context.Context, o BackupVMOptions, plat platform.Platf
 // it has a way, otherwise a zvol's ZFS snapshots.
 func diskSnapshots(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM, d vmdef.Disk) ([]SnapshotSource, error) {
 	if s, ok := plat.(platform.Snapshotter); ok {
-		return s.DiskSnapshots(ctx, dom, d)
+		list, err := s.DiskSnapshots(ctx, dom, d)
+		if !errors.Is(err, platform.ErrZvolSnapshots) {
+			return list, err
+		}
 	}
 	zvol, ok := strings.CutPrefix(d.Path, "/dev/zvol/")
 	if d.Type != "block" || !ok {

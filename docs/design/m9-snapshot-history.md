@@ -1,6 +1,6 @@
 # M9: snapshot history
 
-Status: design; the QNAP layout is found, build order below. Builds on M8 (`internal/platform`).
+Status: parts A and B built (PR #35); part C (QNAP) built, waiting on the test on real hardware. Builds on M8 (`internal/platform`).
 
 ## What it does
 
@@ -60,7 +60,7 @@ the oldest in full and each later one with `--mode in-place`, calling
 | Platform | Snapshots are | Original date kept as |
 | --- | --- | --- |
 | TrueNAS / ZFS | zvol snapshots | a `vmobj:created` user property (ZFS sets `creation` itself) |
-| QNAP (Virtualization Station) | external qcow2 overlays, one file per snapshot (see below) | the overlay's epoch name and libvirt snapshot metadata (`<creationTime>`, `<description>`); where VS keeps the name shown in its UI is being probed |
+| QNAP (Virtualization Station) | external qcow2 overlays, one file per snapshot (see below) | its record file `.<uuid>.meta/snapshot/<epoch>.xml`: libvirt snapshot XML plus `<displayname>`, `<creationLocaltime>`, `<lockSnapshot>`, `<createdBy>` (see below) |
 | generic libvirt | qcow2 snapshots | as QNAP |
 | VMware, Nutanix (later) | their snapshot APIs | their own fields where they exist |
 
@@ -135,9 +135,25 @@ Station (VS) UI of a shut-off VM. VS makes an **external overlay**.
 - libvirt knows the snapshot by the epoch alone (`virsh snapshot-list`
   shows `1794103287`, with its creation time). The name typed in the UI
   isn't a libvirt snapshot name. VS keeps a record per snapshot at
-  `.<uuid>.meta/snapshot/<epoch>.xml` (libvirt snapshot XML). Where VS
-  keeps the UI name and description is the open question; a second probe
-  is reading that record and looking for a VS database.
+  `.<uuid>.meta/snapshot/<epoch>.xml`, and **lists a VM's snapshots from
+  those files**: there's no snapshot table in its database. A record is
+  the libvirt `<domainsnapshot>` (named and dated by the epoch, with a
+  `<parent>` naming the previous snapshot's epoch, the overlay each disk
+  started, and a copy of the domain), followed on one line by VS's own
+  elements:
+
+  ```
+  <displayname>before update</displayname><creationLocaltime>1794074487</creationLocaltime><lockSnapshot>unlock</lockSnapshot><createdBy>user</createdBy>
+  ```
+
+  `creationLocaltime` is the same moment as local wall-clock time, stored
+  as if it were UTC (the epoch minus 28800 in PST). Scheduled snapshots
+  say `createdBy` `scheduling`, carry a `<description>`, and have no
+  `lockSnapshot`.
+- VS's database (Django, SQLite) keeps each disk's current top file in
+  `vms_disk.path` and its bottom image in `vms_disk.root_path`. vmobj
+  never writes there: the VM is created in the VS UI on the restored top
+  layer, so VS records it itself.
 - QNAP's virsh (8.6) has no `snapshot-list --details`, and the libvirt
   domain name is the VM's UUID, not its display name.
 
@@ -150,11 +166,24 @@ So, for the QNAP module:
   as it was at that snapshot. `internal/source`'s qcow2 reader already
   follows backing chains, so this needs no QEMU tools. The current state
   is the top overlay.
-- **Recreating:** each step after the first becomes a new overlay
-  holding only that step's changes, on top of the one before. This needs
-  a qcow2 writer that can write an image with a backing file (the "qcow2
-  output" item on the roadmap), so it comes first. The VS records are
-  written once probe 2 shows what VS reads.
+- **Recreating** (`restore-vm --history --platform qnap`): each disk is
+  written as the chain VS would have made:
+
+  ```
+  NAME-vda.img          the first snapshot, a standalone qcow2 image
+  NAME-vda.<epoch1>     overlay: the second snapshot (only what changed)
+  ...
+  NAME-vda.qcow2        overlay: the current state, the top layer
+  ```
+
+  The top layer ends in `.qcow2` because the VS disk picker lists only
+  `.qcow2` files. Each snapshot gets one epoch for all disks (its creation
+  time, a second later if two share a second), and its record names the
+  overlay started on top of it. The records are left as a plan
+  (`qnap-snapshots.json`). Once the VM has been created in the VS UI on
+  the top layers, `vmobj qnap-snapshots` checks that the VM is shut off,
+  that its disks are those top layers, and that no record exists yet, and
+  then writes the records with a copy of the VM's new definition.
 
 ## Build order
 

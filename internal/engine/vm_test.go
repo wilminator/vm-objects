@@ -513,8 +513,8 @@ func TestBackupVMHistory(t *testing.T) {
 	}
 }
 
-// --history with a disk that can't be listed stops before anything is
-// written.
+// --history with a disk whose snapshots can't be listed (a raw image)
+// stops before anything is written.
 func TestBackupVMHistoryNeedsZvolsOrASnapshotter(t *testing.T) {
 	v := newVMHarness(t)
 	img := filepath.Join(v.dir, "win11.raw")
@@ -522,7 +522,7 @@ func TestBackupVMHistoryNeedsZvolsOrASnapshotter(t *testing.T) {
 	v.virsh.xml = domainXML(fileDisk("vda", img), "")
 	o := v.opts(manifest.Full)
 	o.History = true
-	if _, err := BackupVM(v.ctx, o); err == nil || !strings.Contains(err.Error(), "--history") {
+	if _, err := BackupVM(v.ctx, o); err == nil || !strings.Contains(err.Error(), "snapshot history needs a qcow2") {
 		t.Fatalf("got %v", err)
 	}
 	if names, _ := v.repo.ListManifests(v.ctx, "win11.vda"); len(names) != 0 {

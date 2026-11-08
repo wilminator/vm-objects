@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/wilminator/vm-objects/internal/engine"
+	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/progress"
 	"github.com/wilminator/vm-objects/internal/source"
@@ -293,6 +295,49 @@ func restoreQCOW2(ctx context.Context, a restoreQCOW2Args) error {
 	if st.Checked {
 		fmt.Println("  Checked:   read back through the whole chain, every block matches")
 		fmt.Printf("  SHA-256:   %s\n", st.SHA256)
+	}
+	return nil
+}
+
+// cmdQNAPSnapshots registers the snapshots restore-vm --history prepared,
+// for a VM created in Virtualization Station on the restored top layers.
+func cmdQNAPSnapshots(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("qnap-snapshots", flag.ExitOnError)
+	planPath := fs.String("plan", "", "the "+engine.QNAPPlanFile+" restore-vm --history wrote")
+	definition := fs.String("definition", "", "the new VM's definition: .<UUID>.meta/<UUID>.xml in its folder")
+	apply := fs.Bool("apply", false, "write the records; without it, only check and list what would be written")
+	virsh := fs.String("virsh", platform.QNAPVirsh, "virsh used to check that the VM is shut off (empty: don't check)")
+	fs.Parse(args)
+	if err := require(fs, "plan", "definition"); err != nil {
+		return err
+	}
+	plan, err := engine.ReadQNAPPlan(*planPath)
+	if err != nil {
+		return err
+	}
+	var runner libvirt.Runner
+	if *virsh != "" {
+		if _, err := os.Stat(*virsh); err == nil {
+			runner = libvirt.Virsh{Path: *virsh}
+		}
+	}
+	paths, err := engine.RegisterQNAPSnapshots(ctx, plan, *definition, runner, *apply)
+	if err != nil {
+		return err
+	}
+	verb := "Would write"
+	if *apply {
+		verb = "Wrote"
+	}
+	fmt.Printf("%s %d snapshot records for %s (backup %s):\n", verb, len(paths), plan.VM, plan.Record)
+	for i, p := range paths {
+		r := plan.Records[i]
+		fmt.Printf("  %s  %q, taken %s\n", p, r.DisplayName, time.Unix(r.Epoch, 0).Local().Format("2006-01-02 15:04"))
+	}
+	if !*apply {
+		fmt.Println("Nothing was written. Run again with --apply to write them.")
+	} else {
+		fmt.Println("Open the VM in Virtualization Station: its Snapshots tab lists them.")
 	}
 	return nil
 }
