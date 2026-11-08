@@ -777,7 +777,10 @@ func backupVMHistory(ctx context.Context, o BackupVMOptions, plat platform.Platf
 // it has a way, otherwise a zvol's ZFS snapshots.
 func diskSnapshots(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM, d vmdef.Disk) ([]SnapshotSource, error) {
 	if s, ok := plat.(platform.Snapshotter); ok {
-		return s.DiskSnapshots(ctx, dom, d)
+		list, err := s.DiskSnapshots(ctx, dom, d)
+		if !errors.Is(err, platform.ErrZvolSnapshots) {
+			return list, err
+		}
 	}
 	zvol, ok := strings.CutPrefix(d.Path, "/dev/zvol/")
 	if d.Type != "block" || !ok {

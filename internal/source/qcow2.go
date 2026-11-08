@@ -45,6 +45,8 @@ type QCOW2 struct {
 	l1          []uint64
 	zstd        bool
 	backing     Source // nil when there is none
+	backingPath string // the backing file, as opened (absolute, or relative to the working folder)
+	backingFmt  string // its recorded format: qcow2 or raw
 
 	mu      sync.Mutex
 	l2Cache map[uint64][]uint64 // L2 table offset -> entries
@@ -207,6 +209,7 @@ func (q *QCOW2) readHeader(depth int) error {
 		if err != nil {
 			return err
 		}
+		q.backingPath, q.backingFmt = bpath, bformat
 		if q.backing, err = open(bpath, bformat, depth+1); err != nil {
 			if errors.Is(err, ErrAmbiguousFormat) {
 				return fmt.Errorf("backing file %s has no recorded format; record it (metadata only, no data changes) with: "+
@@ -257,6 +260,37 @@ func (q *QCOW2) backingFormat(start int64) (string, error) {
 
 // Size is the guest disk size.
 func (q *QCOW2) Size() int64 { return q.size }
+
+// Backing names the image's backing file and its format, or "" when it
+// has none.
+func (q *QCOW2) Backing() (path, format string) { return q.backingPath, q.backingFmt }
+
+// Layer is one file of a qcow2 backing chain.
+type Layer struct {
+	Path   string
+	Format string // qcow2 or raw
+}
+
+// QCOW2Chain lists a qcow2 image's backing chain, the image itself first
+// and the bottom-most file last. Each file is opened (read-only) to read
+// its header; none is kept open.
+func QCOW2Chain(path string) ([]Layer, error) {
+	q, err := OpenQCOW2(path)
+	if err != nil {
+		return nil, err
+	}
+	defer q.Close()
+	chain := []Layer{{Path: path, Format: "qcow2"}}
+	for cur := q; cur.backing != nil; {
+		chain = append(chain, Layer{Path: cur.backingPath, Format: cur.backingFmt})
+		next, ok := cur.backing.(*QCOW2)
+		if !ok {
+			break // a raw file ends the chain
+		}
+		cur = next
+	}
+	return chain, nil
+}
 
 // Close closes the image and its backing chain.
 func (q *QCOW2) Close() error {

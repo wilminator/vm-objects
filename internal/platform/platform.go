@@ -16,6 +16,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -68,6 +69,10 @@ type DiskSnapshot struct {
 type Snapshotter interface {
 	DiskSnapshots(ctx context.Context, vm *VM, disk vmdef.Disk) ([]DiskSnapshot, error)
 }
+
+// ErrZvolSnapshots, from a Snapshotter, means the disk is a ZFS zvol: the
+// engine reads its ZFS snapshots itself.
+var ErrZvolSnapshots = errors.New("a zvol: use its ZFS snapshots")
 
 // Names lists the platforms vmobj knows, for --platform.
 var Names = []string{"libvirt", "qnap", "truenas"}
