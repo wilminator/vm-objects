@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,6 +76,11 @@ type ZFSOptions struct {
 	// (from SnapshotZvols). OpenZFS then takes none of its own, but still
 	// destroys this one on Close unless KeepSnapshot is set.
 	Snapshot string
+	// Existing, when set, is one of the zvol's own snapshots to read
+	// ("pool/zvol@name"), such as a VM snapshot taken before an update.
+	// It is read through a clone like any other, and never destroyed:
+	// KeepSnapshot is implied.
+	Existing string
 }
 
 // SnapshotZvols snapshots several zvols in one zfs command, which ZFS
@@ -137,7 +143,25 @@ func OpenZFS(ctx context.Context, dataset string, o ZFSOptions) (*ZFS, error) {
 
 	stamp := o.Now().UTC().Format("20060102T150405Z")
 	z := &ZFS{z: o.Runner, snapshot: dataset + "@vmobj-" + stamp, clone: dataset + "-vmobj-" + stamp, keep: o.KeepSnapshot}
-	if o.Snapshot != "" {
+	if o.Existing != "" {
+		if o.Snapshot != "" {
+			return nil, errors.New("give an existing snapshot or a vmobj one, not both")
+		}
+		snap, ok := strings.CutPrefix(o.Existing, dataset+"@")
+		if !ok {
+			return nil, fmt.Errorf("%s is not a snapshot of %s", o.Existing, dataset)
+		}
+		if err := CheckZFSSnapshotName(snap); err != nil {
+			return nil, err
+		}
+		if _, err := o.Runner.Run(ctx, "list", "-H", "-o", "name", "-t", "snapshot", o.Existing); err != nil {
+			return nil, err
+		}
+		// The clone's name carries the snapshot's, so reading several
+		// snapshots in one second never reuses a name (or a stale
+		// /dev/zvol link).
+		z.snapshot, z.clone, z.keep = o.Existing, dataset+"-vmobj-"+stamp+"-"+snap, true
+	} else if o.Snapshot != "" {
 		// Only snapshots that vmobj names may be adopted, so Close can
 		// never destroy someone else's snapshot.
 		snapStamp, ok := strings.CutPrefix(o.Snapshot, dataset+"@vmobj-")
@@ -145,8 +169,11 @@ func OpenZFS(ctx context.Context, dataset string, o ZFSOptions) (*ZFS, error) {
 			return nil, fmt.Errorf("%s is not a vmobj snapshot of %s", o.Snapshot, dataset)
 		}
 		z.snapshot, z.clone = o.Snapshot, dataset+"-vmobj-"+snapStamp
-	} else if _, err := o.Runner.Run(ctx, "snapshot", z.snapshot); err != nil {
-		return nil, err
+	}
+	if o.Existing == "" && o.Snapshot == "" {
+		if _, err := o.Runner.Run(ctx, "snapshot", z.snapshot); err != nil {
+			return nil, err
+		}
 	}
 	// From here on, undo on failure.
 	if _, err := o.Runner.Run(ctx, "clone", "-o", "readonly=on", z.snapshot, z.clone); err != nil {
@@ -217,4 +244,99 @@ func (z *ZFS) cleanup(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ZFSSnapshot is one of a zvol's own named snapshots.
+type ZFSSnapshot struct {
+	Name string // the part after "@"
+	// Created is when the snapshot was first taken: its vmobj:created
+	// property when vmobj recreated it from a backup (ZFS gives a
+	// recreated snapshot today's date), otherwise ZFS's creation time.
+	Created     time.Time
+	Description string // the vmobj:description property, if set
+}
+
+// ListZFSSnapshots lists a zvol's snapshots in the order ZFS took them,
+// leaving out the ones vmobj takes for its own runs ("@vmobj-...").
+func ListZFSSnapshots(ctx context.Context, r ZFSRunner, dataset string) ([]ZFSSnapshot, error) {
+	if err := checkZvolName(dataset); err != nil {
+		return nil, err
+	}
+	if r == nil {
+		r = ExecZFS{}
+	}
+	out, err := r.Run(ctx, "list", "-H", "-p", "-t", "snapshot", "-d", "1", "-s", "creation",
+		"-o", "name,creation,vmobj:created,vmobj:description", dataset)
+	if err != nil {
+		return nil, err
+	}
+	var snaps []ZFSSnapshot
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, "\t", 4)
+		if len(f) != 4 {
+			return nil, fmt.Errorf("unexpected zfs list output: %q", line)
+		}
+		name, ok := strings.CutPrefix(f[0], dataset+"@")
+		if !ok {
+			return nil, fmt.Errorf("unexpected snapshot %q in zfs list output", f[0])
+		}
+		if strings.HasPrefix(name, "vmobj-") {
+			continue
+		}
+		secs, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %s: creation %q: %w", f[0], f[1], err)
+		}
+		sn := ZFSSnapshot{Name: name, Created: time.Unix(secs, 0).UTC()}
+		if f[2] != "-" && f[2] != "" {
+			t, err := time.Parse(time.RFC3339, f[2])
+			if err != nil {
+				return nil, fmt.Errorf("snapshot %s: vmobj:created %q: %w", f[0], f[2], err)
+			}
+			sn.Created = t.UTC()
+		}
+		if f[3] != "-" {
+			sn.Description = f[3]
+		}
+		snaps = append(snaps, sn)
+	}
+	return snaps, nil
+}
+
+var zfsSnapName = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,200}$`)
+
+// CheckZFSSnapshotName allows the characters ZFS allows in a snapshot
+// name, apart from the space (which shells and scripts handle badly).
+func CheckZFSSnapshotName(name string) error {
+	if !zfsSnapName.MatchString(name) {
+		return fmt.Errorf("%q is not a usable ZFS snapshot name (letters, digits, '_', '.', ':' and '-')", name)
+	}
+	return nil
+}
+
+// ZFSSnapshotName turns any snapshot name (a QNAP one may hold spaces)
+// into one ZFS accepts, replacing other characters with '_'. The original
+// is kept in the vmobj:name property by whoever recreates the snapshot.
+func ZFSSnapshotName(name string) string {
+	b := []byte(name)
+	for i, c := range b {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == ':' || c == '-'
+		if !ok {
+			b[i] = '_'
+		}
+	}
+	if len(b) > 200 {
+		b = b[:200]
+	}
+	switch out := string(b); {
+	case out == "":
+		return "unnamed"
+	case strings.HasPrefix(out, "vmobj-"):
+		return "_" + out // vmobj- names are vmobj's own temporary snapshots
+	default:
+		return out
+	}
 }

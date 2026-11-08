@@ -40,6 +40,13 @@ type BackupOptions struct {
 	Profile *policy.Profile
 	// Class, when set, overrides the profile's class for this run's data.
 	Class policy.Class
+
+	// SHA256, when set, is the whole disk's SHA-256 (see HashSource),
+	// recorded so a restore's check can prove the result.
+	SHA256 string
+	// Snapshot, when set, records that Source is one of the disk's own
+	// named snapshots, so the history can be rebuilt on restore.
+	Snapshot *manifest.Snapshot
 }
 
 // placement works out where this run's data goes and how long it is kept.
@@ -249,6 +256,7 @@ func backupFull(ctx context.Context, o BackupOptions, prev *State, started time.
 		DiskSize: size, BlockSize: r.Config.BlockSize, ExtentSize: r.Config.ExtentSize,
 		Blocks:  blocks,
 		Profile: policyFields.Profile, DataClass: policyFields.DataClass, RetainUntil: policyFields.RetainUntil,
+		SHA256: o.SHA256, Snapshot: o.Snapshot,
 	}
 	if prev != nil {
 		m.Parent = prev.LastManifest
@@ -391,6 +399,7 @@ func backupOverlay(ctx context.Context, o BackupOptions, st *State, started time
 		DiskSize: st.DiskSize, BlockSize: st.BlockSize, ExtentSize: st.ExtentSize,
 		Blocks: st.Blocks, Overlay: overlay,
 		Profile: policyFields.Profile, DataClass: policyFields.DataClass, RetainUntil: policyFields.RetainUntil,
+		SHA256: o.SHA256, Snapshot: o.Snapshot,
 	}
 	if err := r.PutManifest(ctx, m, store.PutOptions{LockUntil: lk.manifestLock()}); err != nil {
 		return nil, err

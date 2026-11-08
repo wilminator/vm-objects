@@ -57,6 +57,15 @@ type fakeZFS struct {
 	snaps  map[string][]byte
 	log    *[]string
 	failOn string
+	order  []string // user snapshots, oldest first (see userSnapshot)
+}
+
+// userSnapshot takes one of the zvol's own named snapshots, as a person
+// would before an update.
+func (f *fakeZFS) userSnapshot(full string) {
+	vol, _, _ := strings.Cut(full, "@")
+	f.snaps[full] = bytes.Clone(f.vols[vol])
+	f.order = append(f.order, full)
 }
 
 func (f *fakeZFS) Run(_ context.Context, args ...string) (string, error) {
@@ -81,7 +90,23 @@ func (f *fakeZFS) Run(_ context.Context, args ...string) (string, error) {
 		os.MkdirAll(filepath.Dir(p), 0o755)
 		os.WriteFile(p, f.snaps[snap], 0o600)
 	case "list":
-		if _, err := os.Stat(filepath.Join(f.devDir, args[len(args)-1])); err != nil {
+		name := args[len(args)-1]
+		if slices.Contains(args, "-p") { // listing a zvol's snapshots, oldest first
+			var lines []string
+			for i, s := range f.order {
+				if strings.HasPrefix(s, name+"@") {
+					lines = append(lines, fmt.Sprintf("%s\t%d\t-\t-", s, 1735689600+i*3600))
+				}
+			}
+			return strings.Join(lines, "\n") + "\n", nil
+		}
+		if strings.Contains(name, "@") {
+			if _, ok := f.snaps[name]; !ok {
+				return "", errors.New("no such snapshot")
+			}
+			return name + "\n", nil
+		}
+		if _, err := os.Stat(filepath.Join(f.devDir, name)); err != nil {
 			return "", errors.New("no such dataset")
 		}
 	case "destroy":
@@ -418,5 +443,89 @@ func TestRestoreVMWritesNothingIfADiskIsIncomplete(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("restore-vm wrote into the folder before finding the damaged disk")
+	}
+}
+
+// backup-vm --history backs up each zvol's named snapshots into the
+// disk's own series, oldest first, then the VM as usual; a second run
+// adds only new snapshots, and the user's snapshots are never destroyed.
+func TestBackupVMHistory(t *testing.T) {
+	v := newVMHarness(t)
+	var log []string
+	z := &fakeZFS{devDir: filepath.Join(v.dir, "dev"), vols: map[string][]byte{}, snaps: map[string][]byte{}, log: &log}
+	disk := make([]byte, 256<<10)
+	rng := rand.New(rand.NewSource(11))
+	rng.Read(disk[:128<<10])
+	z.vols["tank/vms/win11-a"] = disk
+	v.virsh.xml = domainXML(zvolDisk("vda", "tank/vms/win11-a"), "")
+	v.virsh.state = "running" // the current state is read from a vmobj snapshot
+	var states [][]byte
+	for _, name := range []string{"installed", "updated"} {
+		rng.Read(disk[(len(states)*40)<<10 : (len(states)*40+8)<<10])
+		z.userSnapshot("tank/vms/win11-a@" + name)
+		states = append(states, bytes.Clone(disk))
+	}
+
+	o := v.opts(manifest.Incremental) // the first history step makes the full
+	o.ZFS, o.ZFSDevDir, o.History, o.Hash = z, z.devDir, true, true
+	st, err := BackupVM(v.ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := st.History["vda"]; len(h) != 2 || h[0].Skipped || h[1].Skipped {
+		t.Fatalf("history %+v", st.History)
+	}
+	ms, err := HistoryManifests(v.ctx, v.repo, "win11.vda")
+	if err != nil || len(ms) != 2 {
+		t.Fatalf("%d history backups of win11.vda, %v", len(ms), err)
+	}
+	for i, m := range ms {
+		if m.Snapshot.Name != []string{"installed", "updated"}[i] || m.Snapshot.Platform != "libvirt" || m.SHA256 != sum(states[i]) {
+			t.Fatalf("history %d: %+v sha %s", i, m.Snapshot, m.SHA256)
+		}
+	}
+	for _, name := range []string{"installed", "updated"} {
+		if _, ok := z.snaps["tank/vms/win11-a@"+name]; !ok {
+			t.Fatalf("the user's snapshot @%s was destroyed", name)
+		}
+	}
+
+	// One more snapshot: only it is added.
+	rng.Read(disk[200<<10 : 204<<10])
+	z.userSnapshot("tank/vms/win11-a@patched")
+	o = v.opts(manifest.Incremental)
+	o.ZFS, o.ZFSDevDir, o.History = z, z.devDir, true
+	st, err = BackupVM(v.ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := st.History["vda"]; len(h) != 3 || !h[0].Skipped || !h[1].Skipped || h[2].Skipped {
+		t.Fatalf("second run: %+v", h)
+	}
+
+	// The replayed history holds each snapshot exactly.
+	tg := newFileTarget(t, v.dir, len(disk))
+	if _, err := Replay(v.ctx, ReplayOptions{Repo: v.repo, VM: "win11.vda", Target: tg}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(tg.snaps["installed"], states[0]) || !bytes.Equal(tg.snaps["updated"], states[1]) {
+		t.Fatal("a replayed snapshot differs from the original")
+	}
+}
+
+// --history with a disk that can't be listed stops before anything is
+// written.
+func TestBackupVMHistoryNeedsZvolsOrASnapshotter(t *testing.T) {
+	v := newVMHarness(t)
+	img := filepath.Join(v.dir, "win11.raw")
+	randomDisk(t, img, 128<<10, 3)
+	v.virsh.xml = domainXML(fileDisk("vda", img), "")
+	o := v.opts(manifest.Full)
+	o.History = true
+	if _, err := BackupVM(v.ctx, o); err == nil || !strings.Contains(err.Error(), "--history") {
+		t.Fatalf("got %v", err)
+	}
+	if names, _ := v.repo.ListManifests(v.ctx, "win11.vda"); len(names) != 0 {
+		t.Fatalf("wrote %v before failing", names)
 	}
 }
