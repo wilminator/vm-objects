@@ -181,3 +181,28 @@ func TestPruneKeepsLastBackupOfIdleVM(t *testing.T) {
 		t.Fatalf("the VM's only backup was pruned: %v", left)
 	}
 }
+
+// Superseded versions of live objects are counted, and sized, apart from
+// unreferenced objects: the summary once put their size under
+// "Unreferenced objects: 0".
+func TestPruneSizesSupersededVersionsApart(t *testing.T) {
+	h, _ := newLockedHarness(t)
+	h.write(make([]byte, 64<<10))
+	h.write(append(make([]byte, 32<<10), bytes.Repeat([]byte{7}, 32<<10)...))
+	h.backup(manifest.Full)
+	keys, err := h.repo.Backend.List(h.ctx, "blocks/")
+	if err != nil || len(keys) == 0 {
+		t.Fatalf("%v %v", keys, err)
+	}
+	data, _ := h.repo.Backend.Get(h.ctx, keys[0])
+	if err := h.repo.Backend.Put(h.ctx, keys[0], data); err != nil { // a second version
+		t.Fatal(err)
+	}
+	rep, err := Prune(h.ctx, PruneOptions{Repo: h.repo, Now: h.clock, KeepLast: 1, Grace: DefaultGrace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OldVersions != 1 || rep.OldVersionsSize != int64(len(data)) || rep.Unreferenced != 0 || rep.UnreferencedSize != 0 {
+		t.Fatalf("old %d (%d bytes), unreferenced %d (%d bytes)", rep.OldVersions, rep.OldVersionsSize, rep.Unreferenced, rep.UnreferencedSize)
+	}
+}

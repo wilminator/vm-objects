@@ -688,8 +688,9 @@ func cmdRestore(ctx context.Context, args []string) error {
 		fmt.Printf("Restored %s to %s in %s: %d blocks, %d newer extents, %d zero blocks.\n",
 			units.Format(st.DiskBytes), *out, took, st.BlocksRead, st.ExtentsRead, st.ZeroBlocks)
 		if st.Resumed {
-			fmt.Printf("  Resumed:   continued the interrupted restore in %s; %s already there was read back and kept, %s fetched\n",
-				st.ResumedFrom, units.Format(st.Compared-st.Written), units.Format(st.Written))
+			fmt.Printf("  Resumed:   continued the interrupted restore in %s: read back %s, of which %s was rewritten\n",
+				st.ResumedFrom, units.Format(st.Compared), units.Format(st.Written))
+			fmt.Printf("             %d blocks fetched; every other block already matched the backup and was kept\n", st.BlocksRead)
 		}
 		return nil
 	}
@@ -885,7 +886,7 @@ func cmdPrune(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("Unreferenced objects: %d (%s)\n", rep.Unreferenced, units.Format(rep.UnreferencedSize))
 	if rep.OldVersions > 0 {
-		fmt.Printf("Superseded versions:  %d\n", rep.OldVersions)
+		fmt.Printf("Superseded versions:  %d (%s)\n", rep.OldVersions, units.Format(rep.OldVersionsSize))
 	}
 	if rep.Recent > 0 {
 		fmt.Printf("Too recent to touch:  %d (written within %s)\n", rep.Recent, *grace)

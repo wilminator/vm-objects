@@ -45,6 +45,7 @@ type PruneReport struct {
 	Unreferenced     int      // data objects no kept backup needs
 	UnreferencedSize int64
 	OldVersions      int // superseded versions of live objects (Object Lock repositories)
+	OldVersionsSize  int64
 	Deleted          int // object versions removed (Applied only)
 	DeletedSize      int64
 	Recent           int // skipped: written within the grace period
@@ -350,12 +351,15 @@ func pruneVersions(ctx context.Context, v store.Versioned, o PruneOptions, rep *
 				continue // the object a kept backup reads
 			case isLive:
 				rep.OldVersions++
-			case !counted[ver.Key]:
-				counted[ver.Key] = true
-				rep.Unreferenced++
-			}
-			if !ver.DeleteMarker {
-				rep.UnreferencedSize += ver.Size
+				rep.OldVersionsSize += ver.Size
+			default:
+				if !counted[ver.Key] {
+					counted[ver.Key] = true
+					rep.Unreferenced++
+				}
+				if !ver.DeleteMarker {
+					rep.UnreferencedSize += ver.Size
+				}
 			}
 			if _, err := removeVersion(ctx, v, o, rep, ver); err != nil {
 				return err
