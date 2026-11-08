@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,12 +26,16 @@ import (
 // standard AWS sources: the AWS_* environment variables, ~/.aws/credentials
 // and ~/.aws/config (choose a section with profile=), or an instance role.
 type S3Location struct {
-	Bucket    string
-	Prefix    string
-	Region    string
-	Endpoint  string // empty for AWS itself; set for QuObjects, MinIO and the like
-	Profile   string
-	PathStyle bool // bucket in the path, not the host name; needed by most non-AWS services
+	Bucket   string
+	Prefix   string
+	Region   string
+	Endpoint string // empty for AWS itself; set for QuObjects, MinIO and the like
+	Profile  string
+	// Credentials is a shared credentials file to read instead of
+	// ~/.aws/credentials (credentials=PATH), so a job running as root, or
+	// any user, needs no environment variable to find its keys.
+	Credentials string
+	PathStyle   bool // bucket in the path, not the host name; needed by most non-AWS services
 }
 
 // ParseS3 parses an s3:// address.
@@ -53,6 +58,7 @@ func ParseS3(raw string) (S3Location, error) {
 		Endpoint: q.Get("endpoint"),
 		Profile:  q.Get("profile"),
 	}
+	loc.Credentials = q.Get("credentials")
 	// Path style defaults on whenever a custom endpoint is given, since
 	// that is what self-hosted services expect.
 	loc.PathStyle = loc.Endpoint != ""
@@ -67,10 +73,13 @@ func ParseS3(raw string) (S3Location, error) {
 	}
 	for k := range q {
 		switch k {
-		case "region", "endpoint", "profile", "path-style":
+		case "region", "endpoint", "profile", "path-style", "credentials":
 		default:
 			return S3Location{}, fmt.Errorf("%q: unknown option %q", raw, k)
 		}
+	}
+	if loc.Credentials != "" && !strings.HasPrefix(loc.Credentials, "/") {
+		return S3Location{}, fmt.Errorf("%q: credentials must be an absolute path", raw)
 	}
 	if loc.Endpoint != "" {
 		e, err := url.Parse(loc.Endpoint)
@@ -106,6 +115,12 @@ func NewS3Client(ctx context.Context, loc S3Location) (*s3.Client, error) {
 	}
 	if loc.Profile != "" {
 		opts = append(opts, config.WithSharedConfigProfile(loc.Profile))
+	}
+	if loc.Credentials != "" {
+		if _, err := os.Stat(loc.Credentials); err != nil {
+			return nil, fmt.Errorf("credentials file: %w", err)
+		}
+		opts = append(opts, config.WithSharedCredentialsFiles([]string{loc.Credentials}))
 	}
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
