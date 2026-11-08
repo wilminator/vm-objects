@@ -1,6 +1,6 @@
 # M9: snapshot history
 
-Status: design, not built. Builds on M8 (`internal/platform`).
+Status: design; the QNAP layout is found, build order below. Builds on M8 (`internal/platform`).
 
 ## What it does
 
@@ -60,7 +60,7 @@ the oldest in full and each later one with `--mode in-place`, calling
 | Platform | Snapshots are | Original date kept as |
 | --- | --- | --- |
 | TrueNAS / ZFS | zvol snapshots | a `vmobj:created` user property (ZFS sets `creation` itself) |
-| QNAP (Virtualization Station) | **to be found out** (see below) | libvirt snapshot metadata: `<creationTime>` and `<description>`, loaded with `virsh snapshot-create --redefine`, which keeps them as given |
+| QNAP (Virtualization Station) | external qcow2 overlays, one file per snapshot (see below) | the overlay's epoch name and libvirt snapshot metadata (`<creationTime>`, `<description>`); where VS keeps the name shown in its UI is being probed |
 | generic libvirt | qcow2 snapshots | as QNAP |
 | VMware, Nutanix (later) | their snapshot APIs | their own fields where they exist |
 
@@ -120,23 +120,55 @@ Later: reuse an uncommitted journal's fetched pieces on a rerun (they are
 discarded today), and keep pieces as fetched (still compressed) rather
 than re-compressing.
 
-## First step: how Virtualization Station stores snapshots
+## How Virtualization Station stores snapshots
 
-QNAP stores VM snapshots as deltas. Which kind decides how `Recreate`
-works on the QNAP:
+Found by a read-only probe: one snapshot taken in the Virtualization
+Station (VS) UI of a shut-off VM. VS makes an **external overlay**.
 
-- **external overlays** (a qcow2 file per snapshot, each on top of the
-  last): rebuild by creating each overlay and writing that step's changes
-  into it;
-- **internal qcow2 snapshots** (all in one file): `qemu-img snapshot -c`
-  after each step;
-- **QTS volume snapshots** (below the VM): out of reach from libvirt; the
-  history would be listed but not recreated.
+- The live disk becomes a new qcow2 file, `<disk>.<epoch>` (for example
+  `vm-vda.img` gains `vm-vda.1794103287`), whose backing file is the
+  previous image. The previous image is read-only from then on: it must
+  never be changed or renamed while an overlay points at it.
+- The domain definition (`.<uuid>.meta/<uuid>.xml`, the file
+  `--definition` reads) is repointed at the overlay, with a
+  `<backingStore>` for the image below it.
+- libvirt knows the snapshot by the epoch alone (`virsh snapshot-list`
+  shows `1794103287`, with its creation time). The name typed in the UI
+  isn't a libvirt snapshot name. VS keeps a record per snapshot at
+  `.<uuid>.meta/snapshot/<epoch>.xml` (libvirt snapshot XML). Where VS
+  keeps the UI name and description is the open question; a second probe
+  is reading that record and looking for a VS database.
+- QNAP's virsh (8.6) has no `snapshot-list --details`, and the libvirt
+  domain name is the VM's UUID, not its display name.
 
-To find out: take one snapshot of a test VM in Virtualization Station,
-then read, without changing anything, `virsh snapshot-list --tree`,
-`virsh snapshot-dumpxml`, `qemu-img info --backing-chain` on the disk, and
-the files next to it.
+So, for the QNAP module:
+
+- **Listing:** the snapshots are the chain under the disk `domblklist`
+  reports, top to bottom. Each overlay's epoch is its date, and its name
+  comes from VS's record.
+- **Backing one up:** opening the chain down to overlay *N* gives the disk
+  as it was at that snapshot. `internal/source`'s qcow2 reader already
+  follows backing chains, so this needs no QEMU tools. The current state
+  is the top overlay.
+- **Recreating:** each step after the first becomes a new overlay
+  holding only that step's changes, on top of the one before. This needs
+  a qcow2 writer that can write an image with a backing file (the "qcow2
+  output" item on the roadmap), so it comes first. The VS records are
+  written once probe 2 shows what VS reads.
+
+## Build order
+
+1. **Part A, ZFS and TrueNAS** (no QNAP needed): snapshot fields in the
+   manifest, `--source zfs:pool/zvol@snap`, the `Snapshotter` interface
+   and its TrueNAS implementation, and `backup-vm --history` /
+   `restore-vm --history`.
+2. **qcow2 writer:** a restore can write qcow2, including an overlay on a
+   given backing file holding only the clusters that changed. Checked
+   with `qemu-img check` and `qemu-img compare` in CI.
+3. **Part B, QNAP:** list, back up and recreate VS snapshots, on 1 and 2
+   plus probe 2's findings.
+4. **The test on real hardware:** a TrueNAS history restores on the QNAP
+   as VS snapshots, and the VM boots from each.
 
 ## Done when
 
