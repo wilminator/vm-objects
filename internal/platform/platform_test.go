@@ -22,13 +22,17 @@ const testUUID = "aaaaaaaa-1111-2222-3333-444444444444"
 
 // fakeVirsh answers domstate and dumpxml for one domain.
 type fakeVirsh struct {
-	state string
-	xml   string
-	calls []string
+	state   string
+	xml     string
+	unknown bool // libvirt has no such domain
+	calls   []string
 }
 
 func (f *fakeVirsh) Run(_ context.Context, args ...string) (string, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
+	if f.unknown {
+		return "", errors.New("error: failed to get domain")
+	}
 	switch args[0] {
 	case "domstate":
 		return f.state + "\n", nil
@@ -167,5 +171,45 @@ func TestLibvirtSettings(t *testing.T) {
 	}
 	if _, err := New("vmware", LibvirtConfig{}); err == nil {
 		t.Fatal("unknown platform accepted")
+	}
+}
+
+// QNAP Virtualization Station defines a VM in libvirt only while it runs;
+// a shut-off one is described from its definition file.
+func TestDescribeFromDefinitionFile(t *testing.T) {
+	dir := t.TempDir()
+	swtpm := filepath.Join(dir, "swtpm")
+	if err := os.MkdirAll(filepath.Join(swtpm, testUUID, "tpm2"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(swtpm, testUUID, "tpm2", "tpm2-00.permall"), []byte("tpm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	def := filepath.Join(dir, testUUID+".xml")
+	if err := os.WriteFile(def, []byte(strings.Replace(domainXML(""), "<nvram></nvram>", "", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v := &fakeVirsh{unknown: true}
+	p := NewQNAP(v, swtpm)
+	p.DefinitionFile = def
+	vm, err := p.Describe(context.Background(), testUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.Running || vm.UUID != testUUID || len(vm.Disks) != 1 || len(vm.Files) != 1 || vm.Files[0].Name != "tpm2/tpm2-00.permall" {
+		t.Fatalf("described %+v", vm)
+	}
+	if _, err := p.Describe(context.Background(), "other"); err == nil || !strings.Contains(err.Error(), "not other") {
+		t.Fatalf("wrong domain: %v", err)
+	}
+	// Known to libvirt and running: refused.
+	p.Virsh = &fakeVirsh{state: "running"}
+	if _, err := p.Describe(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "running") {
+		t.Fatalf("running VM from a file: %v", err)
+	}
+	// Known and shut off: fine.
+	p.Virsh = &fakeVirsh{state: "shut off"}
+	if _, err := p.Describe(context.Background(), ""); err != nil {
+		t.Fatal(err)
 	}
 }
