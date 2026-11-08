@@ -229,6 +229,13 @@ func openSource(ctx context.Context, spec, format string, keepSnapshot bool) (so
 	return source.Open(spec, format)
 }
 
+// copyUploads is --uploads: how many blocks a copy sends at once.
+var copyUploads = engine.DefaultUploads
+
+func addUploadsFlag(fs *flag.FlagSet) {
+	fs.IntVar(&copyUploads, "uploads", engine.DefaultUploads, "copies: blocks sent at once (1-64); more helps over the internet, where each upload waits on the network")
+}
+
 // ---- commands ----
 
 func cmdKey(args []string) error {
@@ -389,6 +396,7 @@ func cmdBackup(ctx context.Context, args []string) (err error) {
 	keepSnap := fs.Bool("keep-snapshot", false, "with zfs:, keep the snapshot the backup was read from")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
+	addUploadsFlag(fs)
 	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
@@ -842,6 +850,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
 	var copyTo repeated
 	fs.Var(&copyTo, "copy-to", "also copy the new backup to this repository (repeatable; same key file)")
+	addUploadsFlag(fs)
 	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
@@ -1061,7 +1070,7 @@ func copyAfterBackup(ctx context.Context, from *repo.Repo, targets []string, key
 		to, err := openRepo(ctx, t, keyFile)
 		if err == nil {
 			cs := &engine.CopyStats{}
-			if err = copyOne(engine.CopyOptions{From: from, To: to, Profile: prof, Class: class}, cs); err == nil {
+			if err = copyOne(engine.CopyOptions{From: from, To: to, Profile: prof, Class: class, Uploads: copyUploads}, cs); err == nil {
 				fmt.Printf("Copied to: %s (%s written)\n", t, units.Format(cs.BytesWritten))
 				continue
 			}
@@ -1086,6 +1095,7 @@ func cmdCopy(ctx context.Context, args []string) error {
 	record := fs.String("record", "", "copy only this whole-VM backup of --vm")
 	profileName := fs.String("profile", policy.DefaultProfile, "storage profile at the destination")
 	classFlag := fs.String("class", "", "storage class at the destination, overriding the profile")
+	addUploadsFlag(fs)
 	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
@@ -1126,7 +1136,7 @@ func cmdCopy(ctx context.Context, args []string) error {
 	}
 	report, stopReport := copyProgress(pc)
 	defer stopReport()
-	o := engine.CopyOptions{From: src, To: dst, Profile: &prof, Class: class, Progress: report}
+	o := engine.CopyOptions{From: src, To: dst, Profile: &prof, Class: class, Progress: report, Uploads: copyUploads}
 	start := time.Now()
 	st := &engine.CopyStats{}
 	switch {
