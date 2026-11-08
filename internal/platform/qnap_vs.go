@@ -45,10 +45,10 @@ func NewQNAPManaged(ctx context.Context, l *Libvirt, credentials string) (*QNAPM
 // Close ends the Virtualization Station session.
 func (q *QNAPManaged) Close(ctx context.Context) { q.API.Logout(ctx) }
 
-func (q *QNAPManaged) vmID(ctx context.Context, vm *VM) (string, error) {
+func (q *QNAPManaged) vmID(ctx context.Context, vm *VM) (qvs.ID, error) {
 	v, err := q.API.FindVM(ctx, vm.UUID, vm.Name)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	return v.ID, nil
 }
@@ -64,7 +64,7 @@ func (q *QNAPManaged) ListSnapshots(ctx context.Context, vm *VM) ([]SnapshotInfo
 	}
 	out := make([]SnapshotInfo, len(snaps))
 	for i, s := range snaps {
-		out[i] = SnapshotInfo{ID: s.ID, Name: s.Name, Description: s.Description, Created: s.Created, Locked: s.Locked}
+		out[i] = SnapshotInfo{ID: s.ID.String(), Name: s.Name, Description: s.Description, Created: s.Created, Locked: s.Locked}
 	}
 	return out, nil
 }
@@ -78,23 +78,31 @@ func (q *QNAPManaged) CreateSnapshot(ctx context.Context, vm *VM, s SnapshotInfo
 	if err != nil {
 		return s, err
 	}
-	return SnapshotInfo{ID: got.ID, Name: got.Name, Description: got.Description, Created: got.Created, Locked: got.Locked}, nil
+	return SnapshotInfo{ID: got.ID.String(), Name: got.Name, Description: got.Description, Created: got.Created, Locked: got.Locked}, nil
 }
 
 func (q *QNAPManaged) RevertSnapshot(ctx context.Context, vm *VM, snap string) error {
+	sid, err := qvs.ParseID(snap)
+	if err != nil {
+		return err
+	}
 	id, err := q.vmID(ctx, vm)
 	if err != nil {
 		return err
 	}
-	return q.API.RevertSnapshot(ctx, id, snap)
+	return q.API.RevertSnapshot(ctx, id, sid)
 }
 
 func (q *QNAPManaged) DeleteSnapshot(ctx context.Context, vm *VM, snap string) error {
+	sid, err := qvs.ParseID(snap)
+	if err != nil {
+		return err
+	}
 	id, err := q.vmID(ctx, vm)
 	if err != nil {
 		return err
 	}
-	return q.API.DeleteSnapshot(ctx, id, snap)
+	return q.API.DeleteSnapshot(ctx, id, sid)
 }
 
 func (q *QNAPManaged) State(ctx context.Context, vm *VM) (string, error) {
@@ -110,7 +118,7 @@ func (q *QNAPManaged) Start(ctx context.Context, vm *VM) error {
 	if err != nil {
 		return err
 	}
-	return q.API.Action(ctx, id, "start")
+	return q.API.Act(ctx, id, qvs.ActionStart)
 }
 
 // Stop asks the guest to shut down, waits up to timeout for it to stop,
@@ -120,7 +128,7 @@ func (q *QNAPManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration, f
 	if err != nil {
 		return err
 	}
-	if err := q.API.Action(ctx, id, "shutdown"); err != nil {
+	if err := q.API.Act(ctx, id, qvs.ActionShutdown); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(timeout)
@@ -137,7 +145,7 @@ func (q *QNAPManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration, f
 	if !force {
 		return fmt.Errorf("the VM didn't shut down within %s", timeout)
 	}
-	return q.API.Action(ctx, id, "forceshutdown")
+	return q.API.Act(ctx, id, qvs.ActionForceShutdown)
 }
 
 // ErrCreateNotReady means creating a VM through Virtualization Station

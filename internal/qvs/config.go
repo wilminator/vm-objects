@@ -28,6 +28,10 @@ type Config struct {
 	URL      string // QTS's web address as seen from where vmobj runs, e.g. http://127.0.0.1:8080
 	Username string
 	Password string
+	// CA, for an https url, is a PEM file to trust instead of the system's
+	// roots (QTS's own certificate is self-signed). Verification is never
+	// switched off.
+	CA string
 }
 
 // LoadConfig reads a credentials file:
@@ -36,6 +40,7 @@ type Config struct {
 //	url = http://127.0.0.1:8080
 //	username = vmobj
 //	password = ...
+//	ca = /path/to/qts-cert.pem   (optional, for https)
 //
 // It refuses a file that anyone but its owner can read: it holds a
 // password.
@@ -78,6 +83,8 @@ func LoadConfig(path string) (*Config, error) {
 			c.Username = strings.TrimSpace(v)
 		case "password":
 			c.Password = strings.TrimSpace(v)
+		case "ca":
+			c.CA = strings.TrimSpace(v)
 		default:
 			return nil, fmt.Errorf("%s line %d: unknown key %q", path, n, strings.TrimSpace(k))
 		}
@@ -87,6 +94,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.URL == "" || c.Username == "" || c.Password == "" {
 		return nil, errors.New(path + ": the [qvs] section needs url, username and password")
+	}
+	if _, err := checkURL(c.URL); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
 }

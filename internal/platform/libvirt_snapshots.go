@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/vmdef"
@@ -53,6 +54,9 @@ func (l *Libvirt) snapshotRecords(ctx context.Context, vm *VM) ([]*vmdef.Snapsho
 	dom := vm.UUID
 	if dom == "" {
 		dom = vm.Name
+	}
+	if err := libvirt.CheckDomain(dom); err != nil {
+		return nil, err
 	}
 	out, err := l.Virsh.Run(ctx, "snapshot-list", dom, "--name")
 	if err != nil {

@@ -241,7 +241,7 @@ func RegisterQNAPSnapshots(ctx context.Context, plan *QNAPPlan, definition strin
 			return nil, fmt.Errorf("the VM's disk %s is %s, not the restored top layer %s; the snapshots belong to that file's chain", target, dom.Disks[i].Path, top)
 		}
 	}
-	if virsh != nil && dom.UUID != "" {
+	if virsh != nil && dom.UUID != "" && libvirt.CheckDomain(dom.UUID) == nil {
 		if out, err := virsh.Run(ctx, "domstate", dom.UUID); err == nil {
 			if state := strings.TrimSpace(out); state != "shut off" {
 				return nil, fmt.Errorf("the VM is %s; shut it down in Virtualization Station first", state)

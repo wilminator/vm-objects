@@ -373,12 +373,13 @@ func cmdQVSCheck(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("%d VMs:\n", len(vms))
 	for _, v := range vms {
-		fmt.Printf("  %-4s %-24s %-38s %s\n", v.ID, v.Name, v.UUID, v.State)
+		fmt.Printf("  %-4d %-24s %-38s %s\n", v.ID, v.Name, v.UUID, qvs.NormalState(v.PowerState))
 	}
 	if *vm == "" {
 		return nil
 	}
-	v, err := c.FindVM(ctx, *vm, *vm)
+	// A UUID first; failing that, a name.
+	v, err := c.FindVM(ctx, *vm, "")
 	if err != nil {
 		if v, err = c.FindVM(ctx, "", *vm); err != nil {
 			return err
@@ -388,7 +389,7 @@ func cmdQVSCheck(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\n%s (id %s): %s\n", v.Name, v.ID, st)
+	fmt.Printf("\n%s (id %d): %s\n", v.Name, v.ID, st)
 	snaps, err := c.ListSnapshots(ctx, v.ID)
 	if err != nil {
 		return err
@@ -399,7 +400,7 @@ func cmdQVSCheck(ctx context.Context, args []string) error {
 		if s.Locked {
 			lock = " (locked)"
 		}
-		fmt.Printf("  %-12s %-28s %s%s\n", s.ID, s.Name, s.Created.Local().Format("2006-01-02 15:04"), lock)
+		fmt.Printf("  %-12d %-28s %s%s\n", s.ID, s.Name, s.Created.Local().Format("2006-01-02 15:04"), lock)
 	}
 	return nil
 }
