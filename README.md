@@ -144,12 +144,35 @@ vmobj backup-vm --repo /mnt/backup/vmobj --key-file /root/vmobj.key --domain win
 for one backup, and is safe to repeat. Repositories with different keys
 work too: vmobj re-encrypts as it copies.
 
+## Interrupted runs
+
+Nothing needs cleaning up after a backup, copy or restore stops part-way
+(a dropped connection, Ctrl-C, a reboot). A connection that goes quiet is
+caught by the stall watchdog and retried; if it never comes back, the run
+stops with an error rather than hanging. Either way, run the same command
+again:
+
+- **backup and copy** find the blocks already stored and skip them, so
+  only the rest is sent. A backup (or copy) is listed only once all of it
+  is stored, so a broken run never looks like a good backup.
+- **restore** (the default rename mode) keeps what it wrote in a hidden
+  `.NAME.vmobj-partial` file next to the output, and never puts a partial
+  image under the real name. The rerun reads that file back, keeps every
+  block that already matches the backup, and fetches only the rest.
+  `--no-resume` starts afresh instead.
+- **restore-vm** keeps a `.vmobj-restore-vm` marker naming the backup in
+  its folder until it finishes. Rerun into the same folder: finished disks
+  are checked in place, and the unfinished one continues. A folder holding
+  another backup's unfinished restore is refused.
+- **in-place and staged restores** were already safe to rerun: they
+  compare before writing.
+
 ## Repositories in S3
 
 Anywhere `--repo` takes a folder, it also takes an S3 address:
 
 ```text
-s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false][&ip=4|6]
+s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false][&ip=4|6][&stall=DURATION]
 ```
 
 - `region` is required for AWS unless `AWS_REGION` is set.
@@ -161,6 +184,12 @@ s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&
 - `credentials` names another credentials file (an absolute path) to read
   instead of `~/.aws/credentials`, so a job run as root or from cron finds
   its keys without any environment variable.
+- `stall` (default `2m`) is how long a request may move no data before
+  it is cancelled and retried. A connection whose network path
+  disappears (a route withdrawn, a NAT entry dropped) often never errors
+  and would otherwise wait forever. Each request is tried up to four
+  times, so a brief outage costs a retry, not the whole run. A slow link
+  never trips it; only a dead one does.
 - `ip=4` (or `ip=6`) makes every connection use only that IP version.
   Use it when a host's IPv6 route comes and goes (a router that announces
   it unreliably, say): the system prefers IPv6 whenever it has an address,

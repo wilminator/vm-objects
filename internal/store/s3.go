@@ -51,8 +51,18 @@ type S3API interface {
 // repositories can share one bucket.
 type S3 struct {
 	api    S3API
+	w      *watchedAPI // api, under the stall watchdog and retries
 	bucket string
 	prefix string // "" or ends with "/"
+}
+
+// SetStall changes how long a request may move no data before it is
+// cancelled and retried (DefaultStall unless set; the stall= address
+// option).
+func (s *S3) SetStall(d time.Duration) {
+	if d > 0 {
+		s.w.stall = d
+	}
 }
 
 // NewS3 wraps an S3 client. prefix may be empty.
@@ -67,7 +77,8 @@ func NewS3(api S3API, bucket, prefix string) (*S3, error) {
 		}
 		prefix += "/"
 	}
-	return &S3{api: api, bucket: bucket, prefix: prefix}, nil
+	w := &watchedAPI{S3API: api, stall: DefaultStall}
+	return &S3{api: w, w: w, bucket: bucket, prefix: prefix}, nil
 }
 
 // String names the location, for messages.
@@ -186,18 +197,25 @@ func (s *S3) Get(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := s.api.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: k})
-	if err != nil {
-		switch {
-		case isNotFound(err):
-			return nil, ErrNotFound
-		case apiCode(err) == "InvalidObjectState":
-			return nil, fmt.Errorf("s3 get %s: %w", key, ErrArchived)
+	var data []byte
+	err = retry(ctx, s.w.stall, func(ctx context.Context, _ func()) error {
+		out, err := s.api.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: k})
+		if err != nil {
+			switch {
+			case isNotFound(err):
+				return permanent{ErrNotFound}
+			case apiCode(err) == "InvalidObjectState":
+				return permanent{fmt.Errorf("s3 get %s: %w", key, ErrArchived)}
+			}
+			return fmt.Errorf("s3 get %s: %w", key, err)
 		}
-		return nil, fmt.Errorf("s3 get %s: %w", key, err)
-	}
-	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+		defer out.Body.Close()
+		if data, err = io.ReadAll(out.Body); err != nil {
+			return fmt.Errorf("s3 get %s: reading: %w", key, err)
+		}
+		return nil
+	})
+	return data, unwrapPermanent(err)
 }
 
 // GetRange downloads part of an object with an HTTP Range request, so
@@ -213,35 +231,38 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) ([]
 	if length == 0 {
 		return []byte{}, nil
 	}
-	out, err := s.api.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    k,
-		// HTTP ranges are inclusive at both ends.
-		Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
-	})
-	if err != nil {
-		switch {
-		case isNotFound(err):
-			return nil, ErrNotFound
-		case apiCode(err) == "InvalidObjectState":
-			return nil, fmt.Errorf("s3 get %s: %w", key, ErrArchived)
-		case apiCode(err) == "InvalidRange", httpStatus(err) == http.StatusRequestedRangeNotSatisfiable:
-			return nil, io.ErrUnexpectedEOF
+	var buf []byte
+	err = retry(ctx, s.w.stall, func(ctx context.Context, _ func()) error {
+		out, err := s.api.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    k,
+			// HTTP ranges are inclusive at both ends.
+			Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
+		})
+		if err != nil {
+			switch {
+			case isNotFound(err):
+				return permanent{ErrNotFound}
+			case apiCode(err) == "InvalidObjectState":
+				return permanent{fmt.Errorf("s3 get %s: %w", key, ErrArchived)}
+			case apiCode(err) == "InvalidRange", httpStatus(err) == http.StatusRequestedRangeNotSatisfiable:
+				return permanent{io.ErrUnexpectedEOF}
+			}
+			return fmt.Errorf("s3 get %s: %w", key, err)
 		}
-		return nil, fmt.Errorf("s3 get %s: %w", key, err)
-	}
-	defer out.Body.Close()
-	// S3 silently shortens a range that runs past the end of the object.
-	// Read one byte more than asked for so both a short and an over-long
-	// reply are caught.
-	buf, err := io.ReadAll(io.LimitReader(out.Body, length+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(buf)) != length {
-		return nil, io.ErrUnexpectedEOF
-	}
-	return buf, nil
+		defer out.Body.Close()
+		// S3 silently shortens a range that runs past the end of the
+		// object. Read one byte more than asked for so both a short and
+		// an over-long reply are caught.
+		if buf, err = io.ReadAll(io.LimitReader(out.Body, length+1)); err != nil {
+			return fmt.Errorf("s3 get %s: reading: %w", key, err)
+		}
+		if int64(len(buf)) != length {
+			return permanent{io.ErrUnexpectedEOF} // an answer, not a dropped connection
+		}
+		return nil
+	})
+	return buf, unwrapPermanent(err)
 }
 
 // Exists asks for the object's headers without downloading it.

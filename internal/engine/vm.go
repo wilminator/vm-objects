@@ -348,7 +348,13 @@ type RestoreVMStats struct {
 	Disks      map[string]string
 	Files      int
 	Record     *manifest.VMRecord
+	Resumed    bool // continued an interrupted restore into the same folder
 }
+
+// RestoreVMMarker is the file restore-vm keeps in its folder until the
+// restore is complete. It names the VM and backup, so running the same
+// restore again continues it, and nothing else is written over.
+const RestoreVMMarker = ".vmobj-restore-vm"
 
 // RestoreVM writes a VM's disks (as raw images), definition, NVRAM and
 // TPM state into a folder. It changes nothing on the host's libvirt:
@@ -368,8 +374,20 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if err != nil {
 		return nil, err
 	}
+	// A folder in use by an earlier, interrupted restore of this same
+	// backup is continued; any other non-empty folder is refused.
+	marker := filepath.Join(dir, RestoreVMMarker)
+	want := fmt.Sprintf("vm=%s\nrecord=%s\n", o.VM, o.Record)
+	resuming := false
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
-		return nil, fmt.Errorf("%s is not empty", dir)
+		got, rerr := os.ReadFile(marker)
+		switch {
+		case rerr != nil:
+			return nil, fmt.Errorf("%s is not empty", dir)
+		case string(got) != want:
+			return nil, fmt.Errorf("%s holds an unfinished restore of another backup (%s); pick another folder", dir, strings.ReplaceAll(strings.TrimSpace(string(got)), "\n", ", "))
+		}
+		resuming = true
 	}
 
 	// Every disk must be complete and readable before anything is written,
@@ -397,6 +415,9 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if err := atomicfile.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	if err := atomicfile.Write(marker, []byte(want), 0o600); err != nil {
+		return nil, err
+	}
 
 	name := rec.DomainName
 	if o.NewName != "" {
@@ -413,12 +434,20 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	for _, d := range rec.Disks {
 		out := filepath.Join(dir, name+"-"+d.Target+ext)
 		ro := RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}
+		if fi, err := os.Stat(out); resuming && err == nil && fi.Mode().IsRegular() {
+			// Finished by the earlier run: read it back and fix anything
+			// that isn't the backup, fetching nothing if it all is.
+			ro.Mode, ro.Check = ModeInPlace, true
+			st.Resumed = true
+		} else if _, err := os.Stat(PartialName(out)); resuming && err == nil {
+			st.Resumed = true // Restore continues the partial file
+		}
 		if o.Progress != nil {
 			target := d.Target
 			ro.Progress = func(p Phase, done, total int64) { o.Progress(target, p, done, total) }
 		}
 		if _, err := Restore(ctx, ro); err != nil {
-			return nil, fmt.Errorf("disk %s: %w", d.Target, err)
+			return nil, fmt.Errorf("disk %s: %w\nRun the same restore-vm again to continue it", d.Target, err)
 		}
 		st.Disks[d.Target] = out
 		changes.Disks[d.Target] = vmdef.DiskChange{Path: out, Format: "raw", AsFile: d.Type == "block"}
@@ -462,6 +491,9 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	}
 	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
 	if err := atomicfile.Write(filepath.Join(dir, "RESTORE.txt"), []byte(notes), 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.Remove(marker); err != nil {
 		return nil, err
 	}
 	return st, nil
