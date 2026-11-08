@@ -178,7 +178,7 @@ func Restore(ctx context.Context, o RestoreOptions) (*RestoreStats, error) {
 	return stats, nil
 }
 
-func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.File, sparse bool, stats *RestoreStats, report func(Phase, int64, int64)) error {
+func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out io.WriterAt, sparse bool, stats *RestoreStats, report func(Phase, int64, int64)) error {
 	bs, es := int64(m.BlockSize), int64(m.ExtentSize)
 	zeros := make([]byte, bs)
 	overlays := overlaysByBlock(m)
@@ -280,7 +280,7 @@ func writeDisk(ctx context.Context, r *repo.Repo, m *manifest.Manifest, out *os.
 }
 
 // writeNonZero writes the extent-sized pieces of block that aren't all zero.
-func writeNonZero(r *repo.Repo, out *os.File, block []byte, off, es int64) error {
+func writeNonZero(r *repo.Repo, out io.WriterAt, block []byte, off, es int64) error {
 	n := int64(len(block))
 	for e := int64(0); e < n; e += es {
 		end := min(e+es, n)

@@ -579,6 +579,9 @@ func cmdRestore(ctx context.Context, args []string) error {
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
+	outFormat := fs.String("output-format", "raw", "raw, or qcow2: write a new qcow2 image (with --backing, an overlay holding only what differs from it)")
+	backing := fs.String("backing", "", "with --output-format qcow2: the image the new one goes on top of, as a QNAP snapshot does")
+	backingFormat := fs.String("backing-format", "qcow2", "with --backing: qcow2 or raw")
 	pf := addProgressFlags(fs)
 	metricsOn := addMetricsFlag(fs)
 	fs.Parse(args)
@@ -593,6 +596,21 @@ func cmdRestore(ctx context.Context, args []string) error {
 	tier, err := policy.ParseTier(*tierFlag)
 	if err != nil {
 		return err
+	}
+	switch *outFormat {
+	case "raw":
+		if *backing != "" {
+			return errors.New("restore: --backing needs --output-format qcow2")
+		}
+	case "qcow2":
+		return restoreQCOW2(ctx, restoreQCOW2Args{
+			repo: *dir, keyFile: *keyFile, vm: *vm, manifest: *name, out: *out, backing: *backing,
+			backingFormat: *backingFormat, base: *base, check: *check, expect: *expectSHA,
+			mode: *modeFlag, request: *request, tier: tier, days: *days, pc: pc,
+			others: *force || *journal != "" || *scratch != "" || *checkWritten,
+		})
+	default:
+		return fmt.Errorf("restore: --output-format raw or qcow2, not %q", *outFormat)
 	}
 	mode, err := engine.ParseMode(*modeFlag)
 	if err != nil {

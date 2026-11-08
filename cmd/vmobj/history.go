@@ -17,6 +17,7 @@ import (
 
 	"github.com/wilminator/vm-objects/internal/engine"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/policy"
 	"github.com/wilminator/vm-objects/internal/progress"
 	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/target"
@@ -230,5 +231,68 @@ func cmdRestoreHistory(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("Done: %s holds all %d snapshots (took %s). Point the VM's disk at %s when ready.\n",
 		*zvol, len(steps), time.Since(start).Round(time.Second), t.Output())
+	return nil
+}
+
+type restoreQCOW2Args struct {
+	repo, keyFile, vm, manifest, out, backing, backingFormat, base, expect, mode string
+	check, request, others                                                       bool
+	tier                                                                         policy.Tier
+	days                                                                         int
+	pc                                                                           progress.Config
+}
+
+// restoreQCOW2 is restore --output-format qcow2: a new image, standalone
+// or as an overlay on --backing.
+func restoreQCOW2(ctx context.Context, a restoreQCOW2Args) error {
+	if a.mode != "rename" {
+		return errors.New("restore: --output-format qcow2 always writes a new image; --mode doesn't apply")
+	}
+	if a.others {
+		return errors.New("restore: --force, --journal, --scratch and --check-written don't apply to --output-format qcow2")
+	}
+	if a.base != "" && a.backing == "" {
+		return errors.New("restore: --base with --output-format qcow2 needs --backing (the image that holds the base)")
+	}
+	if a.expect != "" && !a.check {
+		return errors.New("restore: --expect-sha256 needs --check")
+	}
+	r, err := openRepo(ctx, a.repo, a.keyFile)
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	report, stop := restoreProgress(a.pc, a.out, "")
+	o := engine.QCOW2Options{Repo: r, VM: a.vm, Manifest: a.manifest, Output: a.out, Base: a.base,
+		Check: a.check, ExpectSHA256: a.expect,
+		Progress: func(p engine.Phase, done, total int64) { report("", p, done, total) }}
+	if a.backing != "" {
+		o.Backing, o.BackingFormat = a.backing, a.backingFormat
+	}
+	st, err := engine.RestoreQCOW2(ctx, o)
+	stop()
+	var nr *engine.NotReadyError
+	if errors.As(err, &nr) {
+		return explainNotReady(ctx, r, nr.Readiness, a.request, a.tier, a.days)
+	}
+	if err != nil {
+		return err
+	}
+	what := "qcow2 image"
+	if a.backing != "" {
+		what = "qcow2 overlay on " + a.backing
+	}
+	fmt.Printf("Restored %s to %s (%s) in %s.\n", units.Format(st.DiskBytes), a.out, what, time.Since(start).Round(time.Second))
+	if a.backing != "" {
+		if st.BlocksSkipped > 0 {
+			fmt.Printf("  Skipped:   %d blocks the same in --base, not read\n", st.BlocksSkipped)
+		}
+		fmt.Printf("  Compared:  %s with the backing file; %s written into the overlay\n", units.Format(st.Compared), units.Format(st.Written))
+	}
+	fmt.Printf("  Fetched:   %d blocks and %d newer extents\n", st.BlocksRead, st.ExtentsRead)
+	if st.Checked {
+		fmt.Println("  Checked:   read back through the whole chain, every block matches")
+		fmt.Printf("  SHA-256:   %s\n", st.SHA256)
+	}
 	return nil
 }
