@@ -595,6 +595,12 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 	if tpm {
 		b.WriteString("\nWithout the TPM state, Windows asks for the BitLocker recovery key and\n")
 		b.WriteString("Windows Hello PINs must be set up again.\n")
+		b.WriteString("\nTPM state only moves forward: it loads on the same or a newer libtpms\n")
+		b.WriteString("than the one that wrote it, never an older one. If the VM won't start\n")
+		b.WriteString("and the VM log shows \"TPM result for CMD_INIT: 0x101\", this host's\n")
+		b.WriteString("libtpms is older than the source's (QNAP Virtualization Station's 0.8.8\n")
+		b.WriteString("is older than TrueNAS 25.10's 0.9.2). Then the only way to start it is\n")
+		b.WriteString("with a fresh TPM: move the copied TPM folder aside and start again.\n")
 	}
 	return b.String()
 }
