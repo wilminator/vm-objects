@@ -1,0 +1,83 @@
+// Copyright (c) 2026 Michael Allen Wilmes
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+package platform
+
+import (
+	"context"
+	"time"
+)
+
+// Hypervisor management through the platform's own API. TrueNAS and QNAP
+// Virtualization Station each keep their own record of every VM and
+// regenerate libvirt's definition from it, so a change made with virsh
+// behind their back gives a VM the UI doesn't know, or one it overwrites.
+// The rule: read from libvirt (as Describe does), change through the
+// manager. Only a plain libvirt host is changed with virsh.
+
+// SnapshotInfo is a platform-level snapshot: one the platform's UI lists.
+type SnapshotInfo struct {
+	ID          string // the platform's id for it
+	Name        string
+	Description string
+	Created     time.Time
+	Locked      bool
+}
+
+// SnapshotManager takes and removes snapshots through the platform's own
+// API. On QNAP a snapshot is an external qcow2 overlay: taking one turns
+// the disk's current top file read-only, which is what lets vmobj back up
+// a running VM's image-file disks, and deleting it merges the overlay back.
+type SnapshotManager interface {
+	ListSnapshots(ctx context.Context, vm *VM) ([]SnapshotInfo, error)
+	// CreateSnapshot takes a snapshot and returns it, ID filled in, once
+	// the platform reports it done.
+	CreateSnapshot(ctx context.Context, vm *VM, s SnapshotInfo) (SnapshotInfo, error)
+	RevertSnapshot(ctx context.Context, vm *VM, id string) error
+	DeleteSnapshot(ctx context.Context, vm *VM, id string) error
+}
+
+// VM states a Manager reports.
+const (
+	StateRunning = "running"
+	StateStopped = "stopped"
+	StatePaused  = "paused"
+)
+
+// VMSpec describes a VM to create on existing disks, for a full restore.
+type VMSpec struct {
+	Name     string
+	Memory   int64 // bytes
+	VCPUs    int
+	UEFI     bool
+	TPM      bool
+	Disks    []DiskSpec
+	Networks []string // bridge or network names, one per NIC
+	// Definition is the original's definition, for settings a platform
+	// can carry over beyond the fields above.
+	Definition     []byte
+	DefinitionType string
+}
+
+// DiskSpec is one disk of a VMSpec: an existing image or zvol, used in
+// place.
+type DiskSpec struct {
+	Target string // vda, sda...
+	Path   string
+	Format string // qcow2, raw
+	Bus    string // virtio, sata...
+}
+
+// Manager drives a VM's lifecycle through the platform's own API.
+type Manager interface {
+	State(ctx context.Context, vm *VM) (string, error)
+	Start(ctx context.Context, vm *VM) error
+	// Stop asks the guest to shut down, waiting up to timeout, then
+	// forces it off if force is set.
+	Stop(ctx context.Context, vm *VM, timeout time.Duration, force bool) error
+	// Create defines a VM on existing disks. It never starts it.
+	Create(ctx context.Context, spec VMSpec) (*VM, error)
+}

@@ -62,6 +62,7 @@ Usage:
   vmobj restore-history --repo REPO --key-file PATH --vm NAME --zvol POOL/NEW
                     [--like POOL/OLD | --volsize SIZE] [--resume] [--staged DIR]
                     [--verify every|end] [--list]
+  vmobj qvs-check   --qvs-credentials FILE [--vm NAME|UUID]
   vmobj qnap-snapshots --plan DIR/qnap-snapshots.json --definition .UUID.meta/UUID.xml [--apply]
   vmobj copy        --from REPO --to REPO --key-file PATH [--to-key-file PATH] [--vm NAME]
                     [--manifest NAME | --record NAME] [--profile NAME] [--class CLASS]
@@ -163,6 +164,8 @@ func main() {
 		err = cmdRestoreHistory(ctx, args)
 	case "qnap-snapshots":
 		err = cmdQNAPSnapshots(ctx, args)
+	case "qvs-check":
+		err = cmdQVSCheck(ctx, args)
 	case "vms":
 		err = cmdVMs(ctx, args)
 	case "copy":
@@ -932,6 +935,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	connect := fs.String("connect", "", "libvirt URI, e.g. qemu:///system (default: the platform's)")
 	defFile := fs.String("definition", "", "read the VM's libvirt definition from this file instead of from libvirt, for a shut-off VM the platform defines only while it runs (QNAP Virtualization Station: <disk folder>/.<UUID>.meta/<UUID>.xml)")
 	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
+	qvsCreds := fs.String("qvs-credentials", "", "QNAP: a credentials file ([qvs] url, username, password; mode 600) for Virtualization Station's API, so a running VM's image-file disks can be backed up from a snapshot it takes and removes")
 	history := fs.Bool("history", false, "first back up each disk's named snapshots the repository lacks, oldest first (zvol disks)")
 	hash := fs.Bool("hash", false, "with --history, record each snapshot's whole-disk SHA-256 (one extra read per snapshot)")
 	var copyTo repeated
@@ -968,6 +972,18 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 			return errors.New("backup-vm: --quiesce needs a running VM; --definition is for a shut-off one")
 		}
 		lv.DefinitionFile = *defFile
+	}
+	if *qvsCreds != "" {
+		lv, ok := plat.(*platform.Libvirt)
+		if !ok || plat.Name() != "qnap" {
+			return fmt.Errorf("backup-vm: --qvs-credentials is for the qnap platform, not %s", plat.Name())
+		}
+		qm, err := platform.NewQNAPManaged(ctx, lv, *qvsCreds)
+		if err != nil {
+			return fmt.Errorf("backup-vm: Virtualization Station: %w", err)
+		}
+		defer qm.Close(context.WithoutCancel(ctx))
+		plat = qm
 	}
 	prof, err := policy.Lookup(*profileName)
 	if err != nil {
