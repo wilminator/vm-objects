@@ -9,6 +9,8 @@ package qvs
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -18,29 +20,79 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"time"
 )
 
-// Client is a logged-in session with Virtualization Station.
+// Client is a logged-in session with Virtualization Station. The account
+// is a QTS administrator (Virtualization Station gives other users no way
+// to create VMs), so the client only ever calls the closed set of routes
+// in routes.go, with typed ids.
 type Client struct {
 	cfg  *Config
+	base *url.URL
 	http *http.Client
 	sid  string
 	// PollEvery and TaskTimeout govern waiting for Virtualization
-	// Station's background tasks (a snapshot, a shutdown).
+	// Station to finish something (a snapshot, a shutdown).
 	PollEvery   time.Duration
 	TaskTimeout time.Duration
 }
 
 // New returns a client; call Login before anything else.
 func New(cfg *Config) (*Client, error) {
+	base, err := checkURL(cfg.URL)
+	if err != nil {
+		return nil, err
+	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg, http: &http.Client{Jar: jar, Timeout: 2 * time.Minute},
-		PollEvery: 2 * time.Second, TaskTimeout: 30 * time.Minute}, nil
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.CA != "" {
+		pem, err := os.ReadFile(cfg.CA)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("qvs: %s holds no PEM certificate", cfg.CA)
+		}
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	hc := &http.Client{
+		Jar: jar, Transport: tr, Timeout: 2 * time.Minute,
+		// Never follow a redirect: a 307 or 308 would resend the login
+		// form, password included, wherever it pointed. The API never
+		// needs one.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return &Client{cfg: cfg, base: base, http: hc, PollEvery: 2 * time.Second, TaskTimeout: 30 * time.Minute}, nil
+}
+
+// checkURL allows https anywhere, and plain http only to this machine:
+// QTS takes the password merely base64-encoded, and the session id is a
+// whole administrator session.
+func checkURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("qvs: url %q must be just scheme://host[:port]", raw)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		h := u.Hostname()
+		if h != "127.0.0.1" && h != "::1" && h != "localhost" {
+			return nil, fmt.Errorf("qvs: url %q: plain http only to this machine (127.0.0.1); use https, with ca = the QTS certificate if it's self-signed", raw)
+		}
+	default:
+		return nil, fmt.Errorf("qvs: url %q must be http or https", raw)
+	}
+	u.Path = ""
+	return u, nil
 }
 
 // ErrNotLoggedIn means a login was refused or the session ended.
@@ -50,12 +102,12 @@ type qtsLogin struct {
 	AuthPassed string `xml:"authPassed"`
 	AuthSid    string `xml:"authSid"`
 	Need2SV    string `xml:"need_2sv"`
-	ErrorValue string `xml:"errorValue"`
 }
 
-// Login logs in to QTS (which gives a session id), then to Virtualization
-// Station with it (which sets its session and CSRF cookies). The password
-// is never logged or put in a URL.
+// Login logs in to QTS, which gives a session id, and hands that to
+// Virtualization Station as its NAS_SID cookie, which its middleware
+// authenticates every request with. The password goes only in the POST
+// body, never in a URL or a message.
 func (c *Client) Login(ctx context.Context) error {
 	form := url.Values{
 		"user":       {c.cfg.Username},
@@ -67,7 +119,7 @@ func (c *Client) Login(ctx context.Context) error {
 		return fmt.Errorf("qts login: %w", err)
 	}
 	var r qtsLogin
-	if err := xml.Unmarshal(body, &r); err != nil || status != http.StatusOK {
+	if status != http.StatusOK || xml.Unmarshal(body, &r) != nil {
 		return fmt.Errorf("qts login: unexpected reply (HTTP %d)", status)
 	}
 	switch {
@@ -77,31 +129,31 @@ func (c *Client) Login(ctx context.Context) error {
 		return fmt.Errorf("%w: QTS refused the username or password for %q", ErrNotLoggedIn, c.cfg.Username)
 	}
 	c.sid = strings.TrimSpace(r.AuthSid)
-	vsForm := url.Values{"sid": {c.sid}}
-	if _, status, err = c.raw(ctx, http.MethodPost, routeLogin, "application/x-www-form-urlencoded", []byte(vsForm.Encode())); err != nil {
-		return fmt.Errorf("virtualization station login: %w", err)
-	}
-	if status >= 300 {
-		return fmt.Errorf("%w: Virtualization Station refused the session (HTTP %d); does %q have Virtualization Station rights?", ErrNotLoggedIn, status, c.cfg.Username)
+	c.http.Jar.SetCookies(c.base, []*http.Cookie{{Name: sidCookie, Value: c.sid, Path: "/",
+		Secure: c.base.Scheme == "https", HttpOnly: true}})
+	var check struct{}
+	if err := c.call(ctx, http.MethodGet, routeCheck, nil, &check); err != nil {
+		if errors.Is(err, ErrNotLoggedIn) {
+			return fmt.Errorf("%w: Virtualization Station doesn't know %q; it must be in the QTS administrators group", ErrNotLoggedIn, c.cfg.Username)
+		}
+		return err
 	}
 	return nil
 }
 
-// Logout ends both sessions. Errors are ignored: it's cleanup.
+// Logout ends both sessions. QTS wants the session id in the logout URL;
+// vmobj never logs that URL. Errors are ignored: it's cleanup.
 func (c *Client) Logout(ctx context.Context) {
-	c.raw(ctx, http.MethodPost, routeLogout, "application/json", nil)
-	if c.sid != "" {
-		c.raw(ctx, http.MethodGet, routeQTSLogout+"?sid="+url.QueryEscape(c.sid), "", nil)
-		c.sid = ""
+	if c.sid == "" {
+		return
 	}
+	c.raw(ctx, http.MethodPost, routeLogout, "application/json", nil)
+	c.raw(ctx, http.MethodGet, routeQTSLogout+"?sid="+url.QueryEscape(c.sid), "", nil)
+	c.sid = ""
 }
 
 func (c *Client) csrf() string {
-	u, err := url.Parse(c.cfg.URL)
-	if err != nil {
-		return ""
-	}
-	for _, ck := range c.http.Jar.Cookies(u) {
+	for _, ck := range c.http.Jar.Cookies(c.base) {
 		if ck.Name == "csrftoken" {
 			return ck.Value
 		}
@@ -109,15 +161,15 @@ func (c *Client) csrf() string {
 	return ""
 }
 
-// raw sends one request and returns the body and status. Django wants
-// the CSRF token in a header (and a Referer) on anything that changes
-// something.
-func (c *Client) raw(ctx context.Context, method, path, ctype string, body []byte) ([]byte, int, error) {
+// raw sends one request to a route from routes.go and returns the body
+// and status. Django wants the CSRF token in a header (and a Referer) on
+// anything that changes something, when it has issued one.
+func (c *Client) raw(ctx context.Context, method, route, ctype string, body []byte) ([]byte, int, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.cfg.URL+path, rd)
+	req, err := http.NewRequestWithContext(ctx, method, c.base.String()+route, rd)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -125,7 +177,7 @@ func (c *Client) raw(ctx context.Context, method, path, ctype string, body []byt
 		req.Header.Set("Content-Type", ctype)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Referer", c.cfg.URL+"/qvs/")
+	req.Header.Set("Referer", c.base.String()+"/qvs/")
 	if method != http.MethodGet && method != http.MethodHead {
 		if t := c.csrf(); t != "" {
 			req.Header.Set("X-CSRFToken", t)
@@ -133,27 +185,71 @@ func (c *Client) raw(ctx context.Context, method, path, ctype string, body []byt
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, redactErr(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, resp.StatusCode, fmt.Errorf("qvs %s %s: refused a redirect (HTTP %d); check url in the credentials file", method, route, resp.StatusCode)
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	return b, resp.StatusCode, err
 }
 
-// APIError is a reply Virtualization Station refused, with the start of
-// its body (which never holds the session or the password).
+// redactErr keeps a session id out of transport errors, which quote the
+// URL (only the QTS logout URL carries one).
+func redactErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
+}
+
+// APIError is a request Virtualization Station refused. Detail is the
+// server's text, cleaned for a terminal and with secrets redacted.
 type APIError struct {
-	Method, Path string
-	Status       int
-	Body         string
+	Method, Route string
+	HTTP, Status  int
+	Detail        string
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("qvs %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
+	return fmt.Sprintf("qvs %s %s: HTTP %d, status %d: %s", e.Method, e.Route, e.HTTP, e.Status, e.Detail)
 }
 
-// call sends JSON and decodes a JSON reply into out (when non-nil).
-func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
+var secretish = regexp.MustCompile(`(?i)("?[a-z_]*(sid|token|csrf|passw(or)?d|secret)[a-z_]*"?\s*[:=]\s*)("[^"]*"|[^\s,}&]+)`)
+
+// clean makes server text safe to print: no control characters or
+// escape sequences (which could rewrite a terminal or forge log lines),
+// anything that looks like a secret redacted, and at most 300 characters.
+func clean(s string) string {
+	s = secretish.ReplaceAllString(s, `${1}[redacted]`)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0):
+			// dropped: control characters, ESC included
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len([]rune(out)) > 300 {
+		out = string([]rune(out)[:300]) + "…"
+	}
+	return out
+}
+
+type envelope struct {
+	Status *int            `json:"status"`
+	Data   json.RawMessage `json:"data"`
+	Detail string          `json:"detail"`
+}
+
+// call sends JSON to a route and decodes the reply's data into out.
+func (c *Client) call(ctx context.Context, method, route string, in, out any) error {
 	var body []byte
 	if in != nil {
 		var err error
@@ -161,82 +257,48 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 			return err
 		}
 	}
-	b, status, err := c.raw(ctx, method, path, "application/json", body)
+	b, httpStatus, err := c.raw(ctx, method, route, "application/json", body)
 	if err != nil {
-		return fmt.Errorf("qvs %s %s: %w", method, path, err)
+		return fmt.Errorf("qvs %s %s: %w", method, route, err)
 	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return fmt.Errorf("%w (qvs %s %s: HTTP %d)", ErrNotLoggedIn, method, path, status)
+	var env envelope
+	jerr := json.Unmarshal(b, &env)
+	status := -1
+	if jerr == nil && env.Status != nil {
+		status = *env.Status
 	}
-	if status >= 300 {
-		s := strings.TrimSpace(string(b))
-		if len(s) > 300 {
-			s = s[:300] + "…"
+	if status == statusNotAuthenticated || httpStatus == http.StatusUnauthorized || httpStatus == http.StatusForbidden {
+		return fmt.Errorf("%w (qvs %s %s)", ErrNotLoggedIn, method, route)
+	}
+	if httpStatus >= 300 || (status != statusOK && status != -1) || (jerr != nil && len(bytes.TrimSpace(b)) > 0) {
+		detail := env.Detail
+		if detail == "" {
+			detail = string(b)
 		}
-		return &APIError{Method: method, Path: path, Status: status, Body: s}
+		return &APIError{Method: method, Route: route, HTTP: httpStatus, Status: status, Detail: clean(detail)}
 	}
-	if out == nil || len(bytes.TrimSpace(b)) == 0 {
+	if out == nil || len(env.Data) == 0 || string(env.Data) == "null" {
 		return nil
 	}
-	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("qvs %s %s: reply isn't the JSON expected: %w", method, path, err)
+	if err := json.Unmarshal(env.Data, out); err != nil {
+		return fmt.Errorf("qvs %s %s: the reply's data isn't what vmobj expects: %w", method, route, err)
 	}
 	return nil
 }
 
-// obj is a JSON object read leniently.
-type obj map[string]any
-
-func (o obj) str(names []string) string {
-	for _, n := range names {
-		switch v := o[n].(type) {
-		case string:
-			return v
-		case float64:
-			return fmt.Sprintf("%.0f", v)
-		case bool:
-			return fmt.Sprint(v)
-		}
-	}
-	return ""
-}
-
-// list reads a reply that is a list, or an object holding one.
-func list(raw json.RawMessage) ([]obj, error) {
-	var arr []obj
-	if err := json.Unmarshal(raw, &arr); err == nil {
-		return arr, nil
-	}
-	var wrap map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &wrap); err != nil {
-		return nil, err
-	}
-	for _, k := range fieldResults {
-		if inner, ok := wrap[k]; ok {
-			return list(inner)
-		}
-	}
-	return nil, errors.New("no list in the reply")
-}
-
 // VM is Virtualization Station's view of a VM.
 type VM struct {
-	ID, UUID, Name, State string
+	ID         ID     `json:"id"`
+	UUID       string `json:"uuid"`
+	Name       string `json:"name"`
+	PowerState string `json:"power_state"`
 }
 
 // ListVMs lists every VM.
 func (c *Client) ListVMs(ctx context.Context) ([]VM, error) {
-	var raw json.RawMessage
-	if err := c.call(ctx, http.MethodGet, routeVMs, nil, &raw); err != nil {
-		return nil, err
-	}
-	items, err := list(raw)
-	if err != nil {
-		return nil, fmt.Errorf("qvs: listing VMs: %w", err)
-	}
 	var vms []VM
-	for _, o := range items {
-		vms = append(vms, VM{ID: o.str(fieldID), UUID: o.str(fieldUUID), Name: o.str(fieldName), State: o.str(fieldState)})
+	if err := c.call(ctx, http.MethodGet, routeVMs, nil, &vms); err != nil {
+		return nil, err
 	}
 	return vms, nil
 }
@@ -247,14 +309,17 @@ func (c *Client) FindVM(ctx context.Context, uuid, name string) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range vms {
-		if uuid != "" && strings.EqualFold(vms[i].UUID, uuid) {
-			return &vms[i], nil
+	if uuid != "" {
+		for i := range vms {
+			if strings.EqualFold(vms[i].UUID, uuid) {
+				return &vms[i], nil
+			}
 		}
+		return nil, fmt.Errorf("qvs: no VM has UUID %q", uuid)
 	}
 	var found *VM
 	for i := range vms {
-		if uuid == "" && vms[i].Name == name {
+		if vms[i].Name == name {
 			if found != nil {
 				return nil, fmt.Errorf("qvs: two VMs are named %q; use its UUID", name)
 			}
@@ -262,23 +327,22 @@ func (c *Client) FindVM(ctx context.Context, uuid, name string) (*VM, error) {
 		}
 	}
 	if found == nil {
-		return nil, fmt.Errorf("qvs: no VM with UUID %q or name %q", uuid, name)
+		return nil, fmt.Errorf("qvs: no VM is named %q", name)
 	}
 	return found, nil
 }
 
-// State reads one VM's state, normalised to running, stopped or paused
-// (or the raw value when it is none of those).
-func (c *Client) State(ctx context.Context, id string) (string, error) {
-	var o obj
-	if err := c.call(ctx, http.MethodGet, routeVM(id), nil, &o); err != nil {
+// State reads a VM's state: running, stopped or paused (or VS's word).
+func (c *Client) State(ctx context.Context, id ID) (string, error) {
+	var vm VM
+	if err := c.call(ctx, http.MethodGet, routeVM(id), nil, &vm); err != nil {
 		return "", err
 	}
-	return NormalState(o.str(fieldState)), nil
+	return NormalState(vm.PowerState), nil
 }
 
-// NormalState maps Virtualization Station's state words to running,
-// stopped or paused.
+// NormalState maps Virtualization Station's power_state ("running",
+// "stop", ...) to running, stopped or paused.
 func NormalState(s string) string {
 	l := strings.ToLower(s)
 	switch {
@@ -292,136 +356,162 @@ func NormalState(s string) string {
 	return s
 }
 
-// Action runs a VM action (start, shutdown, forceshutdown) and waits for
-// its task when it returns one.
-func (c *Client) Action(ctx context.Context, id, action string) error {
-	var o obj
-	if err := c.call(ctx, http.MethodPost, routeVMAction(id, action), map[string]any{}, &o); err != nil {
+// Act runs one of the allowlisted power actions and waits for the task it
+// names, if any.
+func (c *Client) Act(ctx context.Context, id ID, a Action) error {
+	if !a.valid() {
+		return fmt.Errorf("qvs: %q is not an action vmobj sends", a)
+	}
+	var reply taskReply
+	if err := c.call(ctx, http.MethodPost, routeVMAction(id, a), map[string]any{}, &reply); err != nil {
 		return err
 	}
-	return c.waitIfTask(ctx, o)
+	return c.waitTask(ctx, reply)
 }
 
 // Snapshot is Virtualization Station's view of a snapshot.
 type Snapshot struct {
-	ID          string // the epoch name it is filed under
-	Name        string // the name shown in its UI
+	ID          ID     // its epoch, which names its overlay and record
+	Name        string // the name shown in the UI
 	Description string
-	Created     time.Time
+	Created     time.Time // UTC
 	Locked      bool
+	CreatedBy   string // user, scheduling
+}
+
+type snapshotJSON struct {
+	ID           ID     `json:"id"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	CreationTime string `json:"creation_time"` // "2026-11-08T02:01:27", UTC
+	LockSnapshot string `json:"lock_snapshot"` // "unlock", "lock"
+	CreatedBy    string `json:"created_by"`
 }
 
 // ListSnapshots lists a VM's snapshots.
-func (c *Client) ListSnapshots(ctx context.Context, vmID string) ([]Snapshot, error) {
-	var raw json.RawMessage
-	if err := c.call(ctx, http.MethodGet, routeSnapshots(vmID), nil, &raw); err != nil {
+func (c *Client) ListSnapshots(ctx context.Context, vm ID) ([]Snapshot, error) {
+	var raw []snapshotJSON
+	if err := c.call(ctx, http.MethodGet, routeSnapshots(vm), nil, &raw); err != nil {
 		return nil, err
 	}
-	items, err := list(raw)
-	if err != nil {
-		return nil, fmt.Errorf("qvs: listing snapshots: %w", err)
-	}
-	var out []Snapshot
-	for _, o := range items {
-		s := Snapshot{ID: o.str(fieldID), Name: o.str(fieldDisplay), Description: o.str(fieldDesc)}
-		if s.ID == "" {
-			s.ID = o.str(fieldName) // libvirt's name: the epoch
+	out := make([]Snapshot, 0, len(raw))
+	for _, s := range raw {
+		t, _ := time.Parse("2006-01-02T15:04:05", s.CreationTime)
+		if t.IsZero() {
+			t = time.Unix(int64(s.ID), 0).UTC() // the id is the epoch
 		}
-		lock := strings.ToLower(o.str(fieldLocked))
-		s.Locked = lock == "lock" || lock == "locked" || lock == "true"
-		if t := o.str(fieldCreated); t != "" {
-			if secs, err := parseEpoch(t); err == nil {
-				s.Created = secs
-			} else if tm, err := time.Parse(time.RFC3339, t); err == nil {
-				s.Created = tm
-			}
-		}
-		out = append(out, s)
+		out = append(out, Snapshot{ID: s.ID, Name: s.Name, Description: s.Description, Created: t.UTC(),
+			Locked: s.LockSnapshot == "lock", CreatedBy: s.CreatedBy})
 	}
 	return out, nil
 }
 
-func parseEpoch(s string) (time.Time, error) {
-	var secs int64
-	if _, err := fmt.Sscanf(s, "%d", &secs); err != nil || fmt.Sprint(secs) != s {
-		return time.Time{}, errors.New("not an epoch")
+// CreateSnapshot takes a snapshot as the UI does, then waits until it is
+// listed, and returns it.
+func (c *Client) CreateSnapshot(ctx context.Context, vm ID, name, description string) (*Snapshot, error) {
+	if name == "" || strings.ContainsAny(name, "\x00\r\n") {
+		return nil, fmt.Errorf("qvs: snapshot name %q", name)
 	}
-	return time.Unix(secs, 0).UTC(), nil
-}
-
-// CreateSnapshot takes a snapshot as the UI does, waits for it, and
-// returns it as listed afterwards.
-func (c *Client) CreateSnapshot(ctx context.Context, vmID, name, description string) (*Snapshot, error) {
-	var o obj
-	in := map[string]any{"name": name, "description": description, "lockSnapshot": "unlock", "createdBy": "user"}
-	if err := c.call(ctx, http.MethodPost, routeSnapshots(vmID), in, &o); err != nil {
+	var reply taskReply
+	in := map[string]any{"name": name, "description": description, "lock_snapshot": "unlock"}
+	if err := c.call(ctx, http.MethodPost, routeSnapshots(vm), in, &reply); err != nil {
 		return nil, err
 	}
-	if err := c.waitIfTask(ctx, o); err != nil {
+	if err := c.waitTask(ctx, reply); err != nil {
 		return nil, fmt.Errorf("snapshot %q: %w", name, err)
 	}
-	snaps, err := c.ListSnapshots(ctx, vmID)
-	if err != nil {
-		return nil, err
-	}
-	for i := range snaps {
-		if snaps[i].Name == name {
-			return &snaps[i], nil
+	var got *Snapshot
+	err := c.until(ctx, func() (bool, error) {
+		snaps, err := c.ListSnapshots(ctx, vm)
+		for i := range snaps {
+			if snaps[i].Name == name {
+				got = &snaps[i]
+				return true, nil
+			}
 		}
+		return false, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %q: %w", name, err)
 	}
-	return nil, fmt.Errorf("qvs: snapshot %q isn't listed after taking it", name)
+	return got, nil
 }
 
-// DeleteSnapshot deletes a snapshot and waits for it.
-func (c *Client) DeleteSnapshot(ctx context.Context, vmID, id string) error {
-	var o obj
-	if err := c.call(ctx, http.MethodDelete, routeSnapshot(vmID, id), nil, &o); err != nil {
+// DeleteSnapshot deletes a snapshot and waits until it's gone from the list.
+func (c *Client) DeleteSnapshot(ctx context.Context, vm, snap ID) error {
+	var reply taskReply
+	if err := c.call(ctx, http.MethodDelete, routeSnapshot(vm, snap), nil, &reply); err != nil {
 		return err
 	}
-	return c.waitIfTask(ctx, o)
+	if err := c.waitTask(ctx, reply); err != nil {
+		return err
+	}
+	return c.until(ctx, func() (bool, error) {
+		snaps, err := c.ListSnapshots(ctx, vm)
+		for _, s := range snaps {
+			if s.ID == snap {
+				return false, err
+			}
+		}
+		return err == nil, err
+	})
 }
 
 // RevertSnapshot reverts a VM to a snapshot and waits for it.
-func (c *Client) RevertSnapshot(ctx context.Context, vmID, id string) error {
-	var o obj
-	if err := c.call(ctx, http.MethodPost, routeSnapshotRevert(vmID, id), map[string]any{}, &o); err != nil {
+func (c *Client) RevertSnapshot(ctx context.Context, vm, snap ID) error {
+	var reply taskReply
+	if err := c.call(ctx, http.MethodPost, routeSnapshotRevert(vm, snap), map[string]any{}, &reply); err != nil {
 		return err
 	}
-	return c.waitIfTask(ctx, o)
+	return c.waitTask(ctx, reply)
 }
 
-// waitIfTask waits for the task a reply names, if it names one.
-func (c *Client) waitIfTask(ctx context.Context, reply obj) error {
-	id := reply.str(fieldTask)
-	if id == "" {
-		return nil
-	}
-	return c.WaitTask(ctx, id)
+// taskReply is what an action may reply with: a background task's id.
+// Anything else in the reply is ignored.
+type taskReply struct {
+	TaskID *ID `json:"task_id"`
 }
 
 // ErrTaskFailed means Virtualization Station reported a task failed.
 var ErrTaskFailed = errors.New("qvs: the task failed")
 
-// WaitTask polls a background task until it finishes.
-func (c *Client) WaitTask(ctx context.Context, id string) error {
+// waitTask waits for a reply's task, if it named one.
+func (c *Client) waitTask(ctx context.Context, r taskReply) error {
+	if r.TaskID == nil {
+		return nil
+	}
+	id := *r.TaskID
+	return c.until(ctx, func() (bool, error) {
+		var t struct {
+			Status string `json:"status"`
+		}
+		if err := c.call(ctx, http.MethodGet, routeTask(id), nil, &t); err != nil {
+			var ae *APIError
+			if errors.As(err, &ae) && ae.HTTP == http.StatusNotFound {
+				return true, nil // finished tasks are cleaned up
+			}
+			return false, err
+		}
+		switch s := strings.ToLower(t.Status); {
+		case strings.Contains(s, "fail"), strings.Contains(s, "error"), strings.Contains(s, "abort"), strings.Contains(s, "cancel"):
+			return false, fmt.Errorf("%w (task %d: %s)", ErrTaskFailed, id, clean(s))
+		case s == "", strings.Contains(s, "done"), strings.Contains(s, "success"), strings.Contains(s, "finish"), strings.Contains(s, "complete"):
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+// until polls f until it reports done, fails, or TaskTimeout passes.
+func (c *Client) until(ctx context.Context, f func() (bool, error)) error {
 	deadline := time.Now().Add(c.TaskTimeout)
 	for {
-		var o obj
-		if err := c.call(ctx, http.MethodGet, routeTask(id), nil, &o); err != nil {
-			var ae *APIError
-			if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
-				return nil // finished tasks are cleaned up (probe 2: the task table is empty afterwards)
-			}
+		done, err := f()
+		if err != nil || done {
 			return err
 		}
-		switch s := strings.ToLower(o.str(fieldTaskEnd)); {
-		case s == "" || strings.Contains(s, "done") || strings.Contains(s, "success") || strings.Contains(s, "finish") || strings.Contains(s, "complete"):
-			return nil
-		case strings.Contains(s, "fail") || strings.Contains(s, "error") || strings.Contains(s, "abort") || strings.Contains(s, "cancel"):
-			return fmt.Errorf("%w (task %s: %s)", ErrTaskFailed, id, s)
-		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("qvs: task %s didn't finish within %s", id, c.TaskTimeout)
+			return fmt.Errorf("qvs: not done within %s", c.TaskTimeout)
 		}
 		select {
 		case <-ctx.Done():

@@ -156,6 +156,11 @@ func (l *Libvirt) Name() string {
 
 // Describe reads the domain's state, definition, NVRAM and TPM state.
 func (l *Libvirt) Describe(ctx context.Context, domain string) (*VM, error) {
+	if l.DefinitionFile == "" || domain != "" {
+		if err := libvirt.CheckDomain(domain); err != nil {
+			return nil, err
+		}
+	}
 	if l.DefinitionFile != "" {
 		return l.describeFile(ctx, domain)
 	}
@@ -216,10 +221,16 @@ func (l *Libvirt) describeXML(xmlDef []byte, running bool) (*VM, error) {
 }
 
 func (l *Libvirt) Freeze(ctx context.Context, domain string) error {
+	if err := libvirt.CheckDomain(domain); err != nil {
+		return err
+	}
 	return libvirt.Freeze(ctx, l.Virsh, domain)
 }
 
 func (l *Libvirt) Thaw(ctx context.Context, domain string) error {
+	if err := libvirt.CheckDomain(domain); err != nil {
+		return err
+	}
 	return libvirt.Thaw(ctx, l.Virsh, domain)
 }
 

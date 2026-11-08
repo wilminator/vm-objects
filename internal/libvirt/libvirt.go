@@ -88,3 +88,19 @@ func Thaw(ctx context.Context, r Runner, domain string) error {
 	_, err := r.Run(ctx, "domfsthaw", "--", domain)
 	return err
 }
+
+// CheckDomain refuses a domain name or UUID that virsh could read as
+// something else: one starting with "-" (an option) or holding control
+// characters. vmobj passes names as separate arguments, never through a
+// shell, so this is the only way one could be misread.
+func CheckDomain(name string) error {
+	if name == "" || name[0] == '-' {
+		return fmt.Errorf("domain %q: a name must not be empty or start with '-'", name)
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("domain %q holds a control character", name)
+		}
+	}
+	return nil
+}

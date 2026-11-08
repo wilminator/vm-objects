@@ -6,52 +6,83 @@
 
 package qvs
 
-import "fmt"
-
-// Every Virtualization Station route vmobj uses, in one place. Read from
-// Virtualization Station 4.2.0's route and view definitions; the ones
-// marked "inferred" follow its routes and Django REST Framework's
-// conventions and are yet to be confirmed against a live system (vmobj
-// qvs-check does that).
-
-const (
-	// QTS's own login: it returns a session id (SID).
-	routeQTSLogin  = "/cgi-bin/authLogin.cgi"
-	routeQTSLogout = "/cgi-bin/authLogout.cgi"
-	// Virtualization Station's login takes the QTS SID (its
-	// QTSSIDBackend) and sets a session cookie and a CSRF cookie. Inferred.
-	routeLogin  = "/qvs/auth/login"
-	routeCheck  = "/qvs/auth/check"
-	routeLogout = "/qvs/auth/logout"
-
-	routeVMs   = "/qvs/vms/"
-	routeTasks = "/qvs/tasks/"
+import (
+	"fmt"
+	"strconv"
 )
 
-func routeVM(id string) string          { return fmt.Sprintf("/qvs/vms/%s/", id) }
-func routeVMAction(id, a string) string { return fmt.Sprintf("/qvs/vms/%s/%s/", id, a) } // start, shutdown, forceshutdown
-func routeSnapshots(vm string) string   { return fmt.Sprintf("/qvs/vms/%s/snapshots/", vm) }
-func routeSnapshot(vm, id string) string {
-	return fmt.Sprintf("/qvs/vms/%s/snapshots/%s/", vm, id)
-}
-func routeSnapshotRevert(vm, id string) string {
-	return fmt.Sprintf("/qvs/vms/%s/snapshots/%s/revert/", vm, id)
-}
-func routeTask(id string) string { return fmt.Sprintf("/qvs/tasks/%s/", id) }
+// Every Virtualization Station route vmobj uses, in one place: a closed
+// set. Confirmed on Virtualization Station 4.2.0.281 (QTS 5.2) unless
+// marked "inferred" (from its route definitions; confirmed by the first
+// write test). Routes have no trailing slash: with one, VS answers 404.
+//
+// Ids are typed numbers, formatted with %d, so nothing from a command
+// line or a reply can turn a path into another route ("../", "?", "#").
 
-// The field names Virtualization Station uses, as far as known. Replies
-// are read leniently (the first of several names that is present), since
-// these are yet to be confirmed.
-var (
-	fieldID      = []string{"id", "pk"}
-	fieldUUID    = []string{"uuid"}
-	fieldName    = []string{"name"}
-	fieldState   = []string{"status", "state", "power_state"}
-	fieldTask    = []string{"task_id", "task", "id"}
-	fieldCreated = []string{"creationTime", "creation_time", "created", "create_time"}
-	fieldDesc    = []string{"description"}
-	fieldLocked  = []string{"lockSnapshot", "lock_snapshot", "lockStatus"}
-	fieldDisplay = []string{"displayname", "display_name", "name"}
-	fieldResults = []string{"results", "data", "vms", "snapshots"}
-	fieldTaskEnd = []string{"status", "state", "result"}
+const (
+	routeQTSLogin  = "/cgi-bin/authLogin.cgi"  // confirmed
+	routeQTSLogout = "/cgi-bin/authLogout.cgi" // confirmed; QTS wants ?sid=
+	routeCheck     = "/qvs/auth/check"         // confirmed: data status 0 = logged in
+	routeLogout    = "/qvs/auth/logout"        // confirmed
+	routeVMs       = "/qvs/vms"                // confirmed
+)
+
+// sidCookie is the cookie Virtualization Station's QTS middleware reads
+// the QTS session id from (confirmed over http on loopback).
+const sidCookie = "NAS_SID"
+
+// ID is a Virtualization Station id: a VM, a snapshot (its epoch), a
+// task. All are numbers.
+type ID uint64
+
+// ParseID reads an id, accepting decimal digits only.
+func ParseID(s string) (ID, error) {
+	if s == "" || len(s) > 20 {
+		return 0, fmt.Errorf("qvs: %q is not an id", s)
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("qvs: %q is not an id (digits only)", s)
+		}
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("qvs: %q is not an id", s)
+	}
+	return ID(n), nil
+}
+
+func (i ID) String() string { return strconv.FormatUint(uint64(i), 10) }
+
+// Action is a VM power action: only these are ever sent.
+type Action string
+
+const (
+	ActionStart         Action = "start"         // inferred
+	ActionShutdown      Action = "shutdown"      // inferred
+	ActionForceShutdown Action = "forceshutdown" // inferred
+)
+
+func (a Action) valid() bool {
+	switch a {
+	case ActionStart, ActionShutdown, ActionForceShutdown:
+		return true
+	}
+	return false
+}
+
+func routeVM(id ID) string                 { return fmt.Sprintf("/qvs/vms/%d", id) }                    // confirmed
+func routeVMAction(id ID, a Action) string { return fmt.Sprintf("/qvs/vms/%d/%s", id, a) }              // inferred; a is allowlisted
+func routeSnapshots(vm ID) string          { return fmt.Sprintf("/qvs/vms/%d/snapshots", vm) }          // GET confirmed; POST inferred
+func routeSnapshot(vm, snap ID) string     { return fmt.Sprintf("/qvs/vms/%d/snapshots/%d", vm, snap) } // DELETE inferred
+func routeSnapshotRevert(vm, snap ID) string {
+	return fmt.Sprintf("/qvs/vms/%d/snapshots/%d/revert", vm, snap) // inferred
+}
+func routeTask(id ID) string { return fmt.Sprintf("/qvs/tasks/%d", id) } // inferred
+
+// Envelope and field names, as confirmed: every reply is
+// {"status": N, "data": ...}, or {"status": N, "detail": "..."} on error.
+const (
+	statusOK               = 0
+	statusNotAuthenticated = 5
 )
