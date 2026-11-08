@@ -134,11 +134,6 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	if len(disks) == 0 {
 		return nil, fmt.Errorf("domain %s has no disks to back up", dom.Name)
 	}
-	if o.History {
-		if stats.History, err = backupVMHistory(ctx, o, plat, dom, disks); err != nil {
-			return nil, err
-		}
-	}
 
 	// Find every problem before touching anything.
 	var zvols []string
@@ -151,6 +146,13 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 			return nil, fmt.Errorf("disk %s (%s): %w", d.Target, d.Path, ErrLiveQCOW2)
 		}
 		zvols = append(zvols, ds)
+	}
+	// History goes first: its first snapshot makes the disk's full, so an
+	// incremental of the current state can follow on a new repository.
+	if o.History {
+		if stats.History, err = backupVMHistory(ctx, o, plat, dom, disks); err != nil {
+			return nil, err
+		}
 	}
 	if o.Kind != manifest.Full {
 		for _, d := range disks {
