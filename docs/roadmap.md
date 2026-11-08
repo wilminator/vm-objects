@@ -13,7 +13,7 @@ what has been tested and how.
 | **M8: platform modules** | Everything specific to one hypervisor moves behind one interface: list VMs, describe one (disks, firmware files, definition), snapshot it, restore it. Modules: **TrueNAS** (its API, zvols, and TPM state kept under the VM's name), **QNAP** (Virtualization Station's paths), and **generic libvirt**. | `scripts/validate-vm.sh` passes on TrueNAS and on QNAP through the modules, and a TrueNAS backup restores on the QNAP. |
 | **M9: snapshot history** | Back up a disk's named snapshots as a chain, with each snapshot's name and original date in the backup, and rebuild them as real snapshots on the restoring platform, another one included. Covers backing up an existing snapshot (`zfs:pool/zvol@snap`). [Design](design/m9-snapshot-history.md). | A TrueNAS VM's history restores on the QNAP as Virtualization Station snapshots with their original dates. |
 | M10: concurrent I/O | Reads and writes overlap, with `--io-workers`, so storage latency stops setting the pace. | `--metrics` shows backups and copies faster than the M6 baselines. |
-| M11: Btrfs | Btrfs subvolume and snapshot sources. | |
+| M11: LVM and Btrfs sources | Back up LVM logical volumes, through a thin snapshot so the volume holds still (`lvm:vg/lv`, `lvm:vg/lv@snap`), and Btrfs subvolumes. QNAP storage pools are LVM thin pools, and Proxmox and many plain KVM hosts keep VM disks on LVM-thin. | An LVM-thin volume backs up from a snapshot and restores in place. |
 
 ## Later
 
