@@ -172,7 +172,7 @@ again:
 Anywhere `--repo` takes a folder, it also takes an S3 address:
 
 ```text
-s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false][&stall=DURATION]
+s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&path-style=true|false][&ip=4|6][&stall=DURATION]
 ```
 
 - `region` is required for AWS unless `AWS_REGION` is set.
@@ -190,6 +190,10 @@ s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&credentials=/PATH][&
   and would otherwise wait forever. Each request is tried up to four
   times, so a brief outage costs a retry, not the whole run. A slow link
   never trips it; only a dead one does.
+- `ip=4` (or `ip=6`) makes every connection use only that IP version.
+  Use it when a host's IPv6 route comes and goes (a router that announces
+  it unreliably, say): the system prefers IPv6 whenever it has an address,
+  and a long upload or restore breaks the moment that route drops.
 - A `PREFIX` lets several repositories share one bucket.
 
 ```bash

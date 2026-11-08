@@ -9,12 +9,15 @@ package store
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -22,6 +25,7 @@ import (
 // S3Location is a parsed s3:// repository address.
 //
 //	s3://BUCKET[/PREFIX][?region=R][&endpoint=URL][&profile=P][&path-style=true|false]
+//	        [&credentials=/ABS/PATH][&ip=4|6]
 //
 // Credentials are deliberately not part of the address. They come from the
 // standard AWS sources: the AWS_* environment variables, ~/.aws/credentials
@@ -40,6 +44,11 @@ type S3Location struct {
 	// Stall is how long a request may move no data before it's cancelled
 	// and retried (stall=90s); zero means DefaultStall.
 	Stall time.Duration
+	// IP, when "4" or "6", makes every connection use only that IP
+	// version (ip=4). For hosts whose IPv6 (or IPv4) route comes and goes:
+	// a long upload or restore over it breaks when the route drops, and
+	// the system otherwise prefers IPv6 whenever it has an address.
+	IP string
 }
 
 // ParseS3 parses an s3:// address.
@@ -63,6 +72,11 @@ func ParseS3(raw string) (S3Location, error) {
 		Profile:  q.Get("profile"),
 	}
 	loc.Credentials = q.Get("credentials")
+	switch loc.IP = q.Get("ip"); loc.IP {
+	case "", "4", "6":
+	default:
+		return S3Location{}, fmt.Errorf("%q: ip must be 4 or 6", raw)
+	}
 	// Path style defaults on whenever a custom endpoint is given, since
 	// that is what self-hosted services expect.
 	loc.PathStyle = loc.Endpoint != ""
@@ -84,7 +98,7 @@ func ParseS3(raw string) (S3Location, error) {
 	}
 	for k := range q {
 		switch k {
-		case "region", "endpoint", "profile", "path-style", "credentials", "stall":
+		case "region", "endpoint", "profile", "path-style", "credentials", "stall", "ip":
 		default:
 			return S3Location{}, fmt.Errorf("%q: unknown option %q", raw, k)
 		}
@@ -138,6 +152,12 @@ func NewS3Client(ctx context.Context, loc S3Location) (*s3.Client, error) {
 		}
 		opts = append(opts, config.WithSharedCredentialsFiles([]string{loc.Credentials}))
 	}
+	if loc.IP != "" {
+		dial := DialIP(loc.IP)
+		opts = append(opts, config.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+			t.DialContext = dial
+		})))
+	}
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS settings: %w", err)
@@ -161,4 +181,17 @@ func NewS3Client(ctx context.Context, loc S3Location) (*s3.Client, error) {
 		}
 		o.UsePathStyle = loc.PathStyle
 	}), nil
+}
+
+// DialIP returns a dial function that connects over one IP version only
+// ("4" or "6"): it resolves only that version's addresses and never falls
+// back to the other.
+func DialIP(version string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network == "tcp" || network == "tcp4" || network == "tcp6" {
+			network = "tcp" + version
+		}
+		return d.DialContext(ctx, network, addr)
+	}
 }
