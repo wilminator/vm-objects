@@ -8,7 +8,6 @@ package platform
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -148,10 +147,20 @@ func (q *QNAPManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration, f
 	return q.API.Act(ctx, id, qvs.ActionForceShutdown)
 }
 
-// ErrCreateNotReady means creating a VM through Virtualization Station
-// waits for its create payload to be confirmed on a live system.
-var ErrCreateNotReady = errors.New("creating a VM through Virtualization Station isn't built yet: create it in its UI, as RESTORE.txt says")
-
+// Create defines a VM through Virtualization Station on existing qcow2
+// images under a share. It is never started.
 func (q *QNAPManaged) Create(ctx context.Context, spec VMSpec) (*VM, error) {
-	return nil, ErrCreateNotReady
+	cs := qvs.CreateSpec{Name: spec.Name, OSType: spec.OSType, UEFI: spec.UEFI, Machine: spec.Machine,
+		Cores: spec.VCPUs, Memory: spec.Memory, Bridges: spec.Networks}
+	for _, d := range spec.Disks {
+		if d.Format != "" && d.Format != "qcow2" {
+			return nil, fmt.Errorf("disk %s is %s; Virtualization Station takes qcow2 images", d.Target, d.Format)
+		}
+		cs.Disks = append(cs.Disks, qvs.CreateDisk{Path: d.Path, Bus: d.Bus})
+	}
+	v, err := q.API.CreateVM(ctx, cs)
+	if err != nil {
+		return nil, err
+	}
+	return &VM{Name: v.Name, UUID: v.UUID}, nil
 }

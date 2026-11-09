@@ -1152,6 +1152,11 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	newName := fs.String("new-name", "", "rename the VM and drop its UUID, to run it next to the original")
 	targetFlag := fs.String("platform", "auto", "where the VM will run next, for RESTORE.txt: auto (this host), libvirt, qnap or truenas")
 	history := fs.Bool("history", false, "with --platform qnap: restore each disk's snapshot history as Virtualization Station's overlay chain (see RESTORE.txt, then vmobj qnap-snapshots)")
+	create := fs.Bool("create", false, "with --platform qnap and --qvs-credentials: also create the VM in Virtualization Station on the restored disks (qcow2), never starting it; with --history, register its snapshots too")
+	restoreQVS := fs.String("qvs-credentials", "", "with --create: Virtualization Station's credentials file ([qvs] url, username, password; mode 600)")
+	osType := fs.String("os-type", "", "with --create: Virtualization Station's OS type, such as win11 (its list: GET /qvs/os_types)")
+	var bridges repeated
+	fs.Var(&bridges, "bridge", "with --create: add a NIC on this bridge (repeatable; the QNAP's own bridge names)")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
@@ -1180,7 +1185,23 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	}
 	start := time.Now()
 	report, stopReport := restoreProgress(pc, *to, "")
-	st, err := engine.RestoreVM(ctx, engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report, History: *history})
+	ro := engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report, History: *history}
+	if *create {
+		if *restoreQVS == "" {
+			return errors.New("restore-vm: --create needs --qvs-credentials")
+		}
+		p, err := platform.New("qnap", platform.LibvirtConfig{})
+		if err != nil {
+			return err
+		}
+		qm, err := platform.NewQNAPManaged(ctx, p.(*platform.Libvirt), *restoreQVS)
+		if err != nil {
+			return fmt.Errorf("restore-vm: Virtualization Station: %w", err)
+		}
+		defer qm.Close(context.WithoutCancel(ctx))
+		ro.Create, ro.Manager, ro.OSType, ro.Bridges = true, qm, *osType, bridges
+	}
+	st, err := engine.RestoreVM(ctx, ro)
 	stopReport()
 	var nr *engine.NotReadyError
 	if errors.As(err, &nr) {

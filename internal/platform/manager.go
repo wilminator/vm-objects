@@ -50,7 +50,9 @@ const (
 // VMSpec describes a VM to create on existing disks, for a full restore.
 type VMSpec struct {
 	Name     string
-	Memory   int64 // bytes
+	OSType   string // the platform's OS type (QNAP: one of /qvs/os_types, e.g. win11)
+	Machine  string // q35, pc
+	Memory   int64  // bytes
 	VCPUs    int
 	UEFI     bool
 	TPM      bool

@@ -185,6 +185,14 @@ So, for the QNAP module:
   that its disks are those top layers, and that no record exists yet, and
   then writes the records with a copy of the VM's new definition.
 
+  `restore-vm --create --qvs-credentials FILE --os-type TYPE [--bridge BR]`
+  does that step itself: it creates the VM through Virtualization
+  Station's API (`POST /qvs/v2/vms`) on the top layers, using the backed-up
+  definition's memory, vCPUs, firmware and disk buses, never sets a VNC
+  password and never starts the VM, then writes the snapshot records as
+  `qnap-snapshots` would. Without `--history` it creates the VM on a
+  plain `NAME-vda.qcow2`. RESTORE.txt says which of these happened.
+
 ## Build order
 
 1. **Part A, ZFS and TrueNAS** (no QNAP needed): snapshot fields in the

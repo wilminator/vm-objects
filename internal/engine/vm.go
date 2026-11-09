@@ -460,6 +460,15 @@ type RestoreVMOptions struct {
 	// plan for its snapshot records (QNAPPlanFile). QNAP only for now;
 	// restore-history rebuilds a single disk's history in a ZFS zvol.
 	History bool
+	// Create also defines the VM on the platform, through its Manager, on
+	// the restored disks, never starting it (QNAP: Virtualization
+	// Station). The disks are written as qcow2. With History, the
+	// snapshots are registered too. OSType and Bridges fill in what the
+	// original's definition can't say for another platform.
+	Create  bool
+	Manager platform.Manager
+	OSType  string
+	Bridges []string
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -469,6 +478,10 @@ type RestoreVMStats struct {
 	Files      int
 	Record     *manifest.VMRecord
 	Resumed    bool // continued an interrupted restore into the same folder
+	// Created is the VM Create defined; Registered the snapshots
+	// registered for it.
+	Created    *platform.VM
+	Registered int
 	// HistoryPlan is the snapshot plan restore-vm --history wrote, for
 	// "vmobj qnap-snapshots".
 	HistoryPlan string
@@ -554,6 +567,18 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if o.Target == "qnap" {
 		ext = ".img"
 	}
+	if o.Create {
+		switch {
+		case o.Target != "qnap":
+			return nil, errors.New("restore-vm --create works with Virtualization Station (--platform qnap) for now")
+		case o.Manager == nil:
+			return nil, errors.New("restore-vm --create needs the platform's API (--qvs-credentials)")
+		case o.OSType == "":
+			return nil, errors.New("restore-vm --create needs --os-type (Virtualization Station's OS type, such as win11)")
+		case resuming:
+			return nil, fmt.Errorf("%s holds an unfinished restore; to create the VM, restore into a new folder", dir)
+		}
+	}
 	if o.History {
 		if o.Target != "qnap" {
 			return nil, fmt.Errorf("restore-vm --history writes QNAP Virtualization Station's layout; for a zvol, use restore-history per disk")
@@ -569,6 +594,21 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	for _, d := range rec.Disks {
 		if o.History {
 			break
+		}
+		if o.Create {
+			// The platform takes qcow2 images (QNAP's does).
+			out := filepath.Join(dir, name+"-"+d.Target+".qcow2")
+			qo := QCOW2Options{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out, Check: true}
+			if o.Progress != nil {
+				target := d.Target
+				qo.Progress = func(p Phase, done, total int64) { o.Progress(target, p, done, total) }
+			}
+			if _, err := RestoreQCOW2(ctx, qo); err != nil {
+				return nil, fmt.Errorf("disk %s: %w", d.Target, err)
+			}
+			st.Disks[d.Target] = out
+			changes.Disks[d.Target] = vmdef.DiskChange{Path: out, Format: "qcow2", AsFile: d.Type == "block"}
+			continue
 		}
 		out := filepath.Join(dir, name+"-"+d.Target+ext)
 		ro := RestoreOptions{Repo: o.Repo, VM: d.Stream, Manifest: d.Manifest, Output: out}
@@ -627,7 +667,19 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if err := atomicfile.Write(st.Definition, def, 0o600); err != nil {
 		return nil, err
 	}
+	if o.Create {
+		if err := createRestoredVM(ctx, o, rec, def, name, st); err != nil {
+			return st, err
+		}
+	}
 	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
+	if st.Created != nil {
+		head := fmt.Sprintf("vmobj created this VM in Virtualization Station as %q (UUID %s), on the\nrestored disks, and did not start it.", st.Created.Name, st.Created.UUID)
+		if st.Registered > 0 {
+			head += fmt.Sprintf(" Its %d snapshots are registered.", st.Registered)
+		}
+		notes = head + "\nThe steps below that create the VM or register snapshots are done; the\nrest (TPM state, NVRAM) still apply.\n\n" + notes
+	}
 	if err := atomicfile.Write(filepath.Join(dir, "RESTORE.txt"), []byte(notes), 0o600); err != nil {
 		return nil, err
 	}
