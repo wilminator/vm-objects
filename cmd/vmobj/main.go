@@ -939,6 +939,8 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	defFile := fs.String("definition", "", "read the VM's libvirt definition from this file instead of from libvirt, for a shut-off VM the platform defines only while it runs (QNAP Virtualization Station: <disk folder>/.<UUID>.meta/<UUID>.xml)")
 	socket := fs.String("libvirt-socket", "", "libvirt's socket, when it isn't the default one (TrueNAS: "+platform.TrueNASLibvirtSocket+"); --connect wins")
 	qvsCreds := fs.String("qvs-credentials", "", "QNAP: a credentials file ([qvs] url, username, password; mode 600) for Virtualization Station's API, so a running VM's image-file disks can be backed up from a snapshot it takes and removes")
+	keepSnaps := fs.Bool("keep-snapshots", false, "QNAP, running VM: don't delete vmobj's older platform snapshots after a good backup (by default only the newest stays, so the disk's layer chain doesn't grow)")
+	noSnaps := fs.Bool("no-snapshots", false, "refuse to back up a running VM: take no platform snapshot (shut the VM down first)")
 	history := fs.Bool("history", false, "first back up each disk's named snapshots the repository lacks, oldest first (zvol disks)")
 	hash := fs.Bool("hash", false, "with --history, record each snapshot's whole-disk SHA-256 (one extra read per snapshot)")
 	var copyTo repeated
@@ -1009,6 +1011,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	st, err := engine.BackupVM(ctx, engine.BackupVMOptions{
 		Repo: r, Domain: *domain, VM: *vm, Kind: k, Profile: &prof, Class: class, Workers: *workers,
 		StateDir: *stateDir, Quiesce: *quiesce, Platform: plat, History: *history, Hash: *hash,
+		KeepSnapshots: *keepSnaps, NoSnapshots: *noSnaps,
 		HistoryStep: func(target string, i, n int, sn manifest.Snapshot, skipped bool) {
 			what := "backing up"
 			if skipped {

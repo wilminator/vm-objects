@@ -108,3 +108,31 @@ func TestDiskSnapshotsSkipsOtherBranches(t *testing.T) {
 		t.Fatalf("zvol: %v", err)
 	}
 }
+
+// vmobj's own backup snapshots (name prefix and marker) are not part of a
+// VM's history; a person's snapshot named like them is.
+func TestDiskSnapshotsLeavesOutVmobjsOwn(t *testing.T) {
+	dir, disk, _ := vsLayout(t)
+	rec := filepath.Join(dir, ".uuid-1.meta", "snapshot", "1794200000.xml")
+	x, err := os.ReadFile(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := bytes.Replace(x, []byte("<description>step 2</description>"),
+		[]byte("<description>Taken by vmobj for a backup "+BackupSnapshotMarker+".</description>"), 1)
+	mine = bytes.Replace(mine, []byte("<creationTime>"), []byte("<displayname>vmobj-20261108T120000Z</displayname><creationTime>"), 1)
+	if err := os.WriteFile(rec, mine, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l := &Libvirt{DefinitionFile: filepath.Join(dir, ".uuid-1.meta", "uuid-1.xml"), name: "qnap"}
+	snaps, err := l.DiskSnapshots(context.Background(), &VM{UUID: "uuid-1"}, disk)
+	if err != nil || len(snaps) != 1 {
+		t.Fatalf("%d snapshots, %v", len(snaps), err)
+	}
+	// Without the marker the same name stays in the history.
+	lookalike := bytes.Replace(mine, []byte(BackupSnapshotMarker), []byte("by a person"), 1)
+	os.WriteFile(rec, lookalike, 0o600)
+	if snaps, err = l.DiskSnapshots(context.Background(), &VM{UUID: "uuid-1"}, disk); err != nil || len(snaps) != 2 {
+		t.Fatalf("%d snapshots, %v", len(snaps), err)
+	}
+}
