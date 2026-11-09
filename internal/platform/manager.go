@@ -8,6 +8,7 @@ package platform
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,20 @@ type SnapshotInfo struct {
 	Description string
 	Created     time.Time
 	Locked      bool
+}
+
+// BackupSnapshotPrefix and BackupSnapshotMarker identify the platform
+// snapshots vmobj takes for backing up a running VM. A snapshot is vmobj's
+// only if its name starts with the prefix and its description has the
+// marker, so one a person names "vmobj-something" is never touched.
+const (
+	BackupSnapshotPrefix = "vmobj-"
+	BackupSnapshotMarker = "[vmobj-backup]"
+)
+
+// IsBackupSnapshot reports whether a snapshot is one vmobj took for a backup.
+func IsBackupSnapshot(name, description string) bool {
+	return strings.HasPrefix(name, BackupSnapshotPrefix) && strings.Contains(description, BackupSnapshotMarker)
 }
 
 // SnapshotManager takes and removes snapshots through the platform's own

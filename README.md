@@ -130,6 +130,25 @@ steps in `RESTORE.txt`. It never registers the VM with libvirt.
 the original. Restoring the TPM state is what keeps BitLocker and Windows
 Hello PINs working.
 
+### Running VMs on QNAP
+
+A running VM whose disks are qcow2 image files is backed up from a
+snapshot taken through Virtualization Station's API
+(`backup-vm --qvs-credentials FILE`). Virtualization Station does not merge
+the newest snapshot's overlay back when that snapshot is deleted, so taking
+and deleting one per backup would add a layer to the live disk every time.
+vmobj instead leaves its newest snapshot standing: each good backup takes a
+new one, reads from it, and then deletes its older ones, which the platform
+does merge. Snapshots are vmobj's own only if the name starts with `vmobj-`
+and the description carries `[vmobj-backup]`; they never show up in
+`--history`. A failed backup deletes nothing.
+
+- `--keep-snapshots` keeps the older ones too.
+- `--no-snapshots` refuses to back up a running VM at all.
+
+A running VM's snapshot also saves its memory, a file the size of its RAM
+that is removed when the snapshot is deleted.
+
 ## Several targets
 
 `--copy-to REPO` (repeatable) on `backup` and `backup-vm` copies each new

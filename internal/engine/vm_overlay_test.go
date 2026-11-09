@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/platform"
@@ -38,6 +39,7 @@ type fakeVS struct {
 	noOverlay  bool // a broken platform: reports a snapshot but changes nothing
 	failAfter  bool // takes the snapshot, then reports a failure
 	listed     []platform.SnapshotInfo
+	nextID     int
 }
 
 func (f *fakeVS) ListSnapshots(context.Context, *platform.VM) ([]platform.SnapshotInfo, error) {
@@ -50,9 +52,10 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 		return s, errors.New("task failed")
 	}
 	f.created = append(f.created, s.Name)
-	s.ID = "7"
+	f.nextID++
+	s.ID = fmt.Sprint(6 + f.nextID) // "7", "8", ...
+	f.listed = append(f.listed, s)
 	if f.failAfter {
-		f.listed = append(f.listed, s)
 		return s, errors.New("unexpected reply")
 	}
 	if f.noOverlay {
@@ -74,7 +77,13 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 
 func (f *fakeVS) DeleteSnapshot(_ context.Context, _ *platform.VM, id string) error {
 	f.deleted = append(f.deleted, id)
-	f.listed = nil
+	var keep []platform.SnapshotInfo
+	for _, l := range f.listed {
+		if l.ID != id {
+			keep = append(keep, l)
+		}
+	}
+	f.listed = keep
 	return nil
 }
 
@@ -109,8 +118,10 @@ func TestBackupRunningVMThroughPlatformSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Consistency != "snapshot" || len(f.created) != 1 || len(f.deleted) != 1 || f.deleted[0] != "7" {
-		t.Fatalf("consistency %q, created %v, deleted %v", st.Consistency, f.created, f.deleted)
+	// The first backup leaves its snapshot standing: deleting the newest
+	// one wouldn't merge its layer back.
+	if st.Consistency != "snapshot" || len(f.created) != 1 || len(f.deleted) != 0 || len(f.listed) != 1 {
+		t.Fatalf("consistency %q, created %v, deleted %v, listed %v", st.Consistency, f.created, f.deleted, f.listed)
 	}
 	if got := f.created[0]; len(got) < len(SnapshotNamePrefix) || got[:len(SnapshotNamePrefix)] != SnapshotNamePrefix {
 		t.Fatalf("snapshot named %q", got)
@@ -146,7 +157,7 @@ func TestBackupRunningVMSnapshotProblems(t *testing.T) {
 	if _, err := BackupVM(v.ctx, o); err == nil {
 		t.Fatal("backed up a disk that wasn't frozen")
 	}
-	if len(f.deleted) != 1 {
+	if len(f.deleted) != 1 || len(f.listed) != 0 {
 		t.Fatalf("the snapshot wasn't deleted after refusing: %v", f.deleted)
 	}
 }
@@ -174,5 +185,73 @@ func TestBackupRunningVMCleansUpAFailedSnapshotStep(t *testing.T) {
 	}
 	if len(f.deleted) != 1 || f.deleted[0] != "7" || len(f.listed) != 0 {
 		t.Fatalf("the stray snapshot wasn't removed: deleted %v, still listed %v", f.deleted, f.listed)
+	}
+}
+
+// Each good backup of a running VM takes a new snapshot and then deletes
+// vmobj's older ones, so exactly one stands and the layer chain doesn't
+// grow. A snapshot that merely looks like vmobj's (no marker) is never
+// touched, --keep-snapshots deletes nothing, and --no-snapshots refuses.
+func TestBackupRunningVMRotatesItsSnapshot(t *testing.T) {
+	v, f, _ := newFakeVS(t)
+	f.listed = []platform.SnapshotInfo{
+		{ID: "3", Name: "m9-probe", Description: "mine"},
+		{ID: "4", Name: "vmobj-lookalike", Description: "named by a person"},
+	}
+	o := v.opts(manifest.Full)
+	o.Platform = f
+	if _, err := BackupVM(v.ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.deleted) != 0 || len(f.listed) != 3 {
+		t.Fatalf("first backup: deleted %v, listed %v", f.deleted, f.listed)
+	}
+	o = v.opts(manifest.Incremental)
+	o.Platform = f
+	o.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if _, err := BackupVM(v.ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.deleted) != 1 || f.deleted[0] != "7" {
+		t.Fatalf("second backup should delete the first vmobj snapshot only: %v", f.deleted)
+	}
+	var ids []string
+	for _, l := range f.listed {
+		ids = append(ids, l.ID)
+	}
+	if fmt.Sprint(ids) != "[3 4 8]" {
+		t.Fatalf("left %v", ids)
+	}
+}
+
+func TestBackupRunningVMKeepAndNoSnapshots(t *testing.T) {
+	v, f, _ := newFakeVS(t)
+	o := v.opts(manifest.Full)
+	o.Platform, o.KeepSnapshots = f, true
+	if _, err := BackupVM(v.ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	o = v.opts(manifest.Incremental)
+	o.Platform, o.KeepSnapshots = f, true
+	o.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if _, err := BackupVM(v.ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.deleted) != 0 || len(f.listed) != 2 {
+		t.Fatalf("--keep-snapshots deleted %v, listed %v", f.deleted, f.listed)
+	}
+
+	v, f, _ = newFakeVS(t)
+	o = v.opts(manifest.Full)
+	o.Platform, o.NoSnapshots = f, true
+	if _, err := BackupVM(v.ctx, o); !errors.Is(err, ErrNoSnapshots) {
+		t.Fatalf("got %v", err)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("took a snapshot anyway: %v", f.created)
+	}
+	o.KeepSnapshots = true
+	if _, err := BackupVM(v.ctx, o); err == nil {
+		t.Fatal("accepted --keep-snapshots with --no-snapshots")
 	}
 }

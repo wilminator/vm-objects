@@ -60,6 +60,11 @@ type BackupVMOptions struct {
 	// ZFS snapshots are read directly; other disks need a platform that
 	// lists snapshots (platform.Snapshotter).
 	History bool
+	// KeepSnapshots leaves vmobj's older platform snapshots of a running
+	// VM alone (by default each good backup deletes them, keeping only the
+	// newest). NoSnapshots refuses to back up a running VM at all.
+	KeepSnapshots bool
+	NoSnapshots   bool
 	// Hash records each history snapshot's whole-disk SHA-256.
 	Hash bool
 	// HistoryStep, when set, is told about each disk's snapshots in turn.
@@ -98,9 +103,12 @@ var ErrLiveQCOW2 = errors.New("the VM is running and has disk image files; shut 
 
 // BackupVM backs up every disk of a libvirt domain, then its definition,
 // NVRAM and TPM state, and writes a VM record last.
-func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
+func BackupVM(ctx context.Context, o BackupVMOptions) (st *BackupVMStats, err error) {
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.KeepSnapshots && o.NoSnapshots {
+		return nil, errors.New("--keep-snapshots and --no-snapshots contradict each other")
 	}
 	plat := o.platform()
 	dom, err := plat.Describe(ctx, o.Domain)
@@ -158,6 +166,9 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	if len(zvols) > 0 && len(overlayDisks) > 0 {
 		return nil, errors.New("the VM runs with both zvol and image-file disks; vmobj can't snapshot both kinds at the same moment, so shut it down for the backup")
 	}
+	if live && o.NoSnapshots {
+		return nil, ErrNoSnapshots
+	}
 	// History goes first: its first snapshot makes the disk's full, so an
 	// incremental of the current state can follow on a new repository.
 	if o.History {
@@ -185,11 +196,11 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (*BackupVMStats, error) {
 	var frozen map[string]string // image-file disks of a running VM: target -> the layer to read
 	if live && len(overlayDisks) > 0 {
 		stats.Consistency = "snapshot"
-		var release func()
-		if frozen, release, err = snapshotOverlays(ctx, o, plat, dom, overlayDisks, started); err != nil {
+		var finish func(bool)
+		if frozen, finish, err = snapshotOverlays(ctx, o, plat, dom, overlayDisks, started); err != nil {
 			return nil, err
 		}
-		defer release()
+		defer func() { finish(err == nil) }()
 		if o.Quiesce {
 			stats.Consistency = "quiesced snapshot"
 		}
@@ -325,8 +336,23 @@ func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, 
 }
 
 // SnapshotNamePrefix starts the name of every platform snapshot vmobj
-// takes for a backup; it deletes each one when the backup is done.
-const SnapshotNamePrefix = "vmobj-"
+// takes for a backup of a running VM.
+//
+// Deleting the newest snapshot of a layered disk doesn't merge its overlay
+// back (Virtualization Station only drops the record), so taking one per
+// backup and deleting it again would add a layer to the live disk each
+// night. Instead one vmobj snapshot is left standing: each backup takes a
+// new one, reads from it, and after it succeeds deletes the older ones,
+// which sit in the middle of the chain and are merged. See KeepSnapshots
+// and NoSnapshots.
+const SnapshotNamePrefix = platform.BackupSnapshotPrefix
+
+// snapshotDescription is what vmobj writes in its snapshots' description.
+const snapshotDescription = "Taken by vmobj for a backup " + platform.BackupSnapshotMarker +
+	". vmobj keeps the newest and deletes older ones after each good backup."
+
+// ErrNoSnapshots means --no-snapshots was given and the VM is running.
+var ErrNoSnapshots = errors.New("the VM is running and --no-snapshots forbids taking a platform snapshot; shut it down for the backup, or drop --no-snapshots")
 
 // snapshotOverlays takes a platform snapshot of a running VM whose disks
 // are qcow2 image files (QNAP Virtualization Station, through its API).
@@ -334,8 +360,13 @@ const SnapshotNamePrefix = "vmobj-"
 // disk used until then can't change any more: that is the layer to read,
 // with everything below it. release deletes the snapshot again (the
 // platform merges the overlay back); it must run even if the backup fails.
+//
+// finish(ok) is called once the backup is done. The new snapshot always
+// stays. If the backup succeeded (and keep is false), vmobj's older
+// snapshots of this VM are deleted: they are middle points, so the platform
+// merges them down and the chain stays the same depth.
 func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Platform, dom *platform.VM,
-	disks []vmdef.Disk, now time.Time) (layers map[string]string, release func(), err error) {
+	disks []vmdef.Disk, now time.Time) (layers map[string]string, finish func(ok bool), err error) {
 	sm := plat.(platform.SnapshotManager)
 	tops := map[string]string{}
 	for _, d := range disks {
@@ -343,7 +374,7 @@ func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Plat
 	}
 	info := platform.SnapshotInfo{
 		Name:        SnapshotNamePrefix + now.UTC().Format("20060102T150405Z"),
-		Description: "Taken by vmobj for a backup; vmobj deletes it when the backup is done.",
+		Description: snapshotDescription,
 	}
 	snap, err := func() (snap platform.SnapshotInfo, err error) {
 		if q, ok := plat.(platform.Quiescer); o.Quiesce && ok {
@@ -372,9 +403,34 @@ func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Plat
 		}
 		return nil, nil, fmt.Errorf("taking the platform snapshot %s: %w", info.Name, err)
 	}
-	release = func() {
+	// release removes the new snapshot again: only when it turns out not to
+	// be usable. (The newest snapshot's layer isn't merged back, but a
+	// snapshot that froze nothing is no use to keep.)
+	release := func() {
 		if derr := sm.DeleteSnapshot(context.WithoutCancel(ctx), dom, snap.ID); derr != nil {
 			fmt.Fprintf(os.Stderr, "vmobj: deleting the backup snapshot %s failed: %v; delete it in the platform's UI\n", info.Name, derr)
+		}
+	}
+	finish = func(ok bool) {
+		if !ok {
+			fmt.Fprintf(os.Stderr, "vmobj: the backup failed, so snapshot %s stays; the next good backup deletes the older ones\n", info.Name)
+			return
+		}
+		if o.KeepSnapshots {
+			return
+		}
+		all, lerr := sm.ListSnapshots(context.WithoutCancel(ctx), dom)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "vmobj: listing snapshots to remove the old ones failed: %v\n", lerr)
+			return
+		}
+		for _, s := range all {
+			if s.ID == snap.ID || !platform.IsBackupSnapshot(s.Name, s.Description) {
+				continue
+			}
+			if derr := sm.DeleteSnapshot(context.WithoutCancel(ctx), dom, s.ID); derr != nil {
+				fmt.Fprintf(os.Stderr, "vmobj: deleting the old backup snapshot %s failed: %v; delete it in the platform's UI\n", s.Name, derr)
+			}
 		}
 	}
 	after, err := plat.Describe(ctx, o.Domain)
@@ -409,7 +465,7 @@ func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Plat
 			return nil, nil, fmt.Errorf("disk %s disappeared from the VM during the snapshot", t)
 		}
 	}
-	return layers, release, nil
+	return layers, finish, nil
 }
 
 // openVMDisk opens one disk: from its snapshot when the VM runs, directly

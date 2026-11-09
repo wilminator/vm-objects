@@ -133,6 +133,9 @@ func ExternalSnapshots(d vmdef.Disk, records []*vmdef.Snapshot, platformName str
 		if rec.DisplayName != "" {
 			name = rec.DisplayName // QNAP: the name shown in its UI, not the epoch
 		}
+		if IsBackupSnapshot(name, rec.Description) {
+			continue // vmobj's own, for backing up a running VM: not part of the VM's history
+		}
 		out = append(out, DiskSnapshot{
 			Info: manifest.Snapshot{Name: name, Created: rec.Created, Description: rec.Description, Platform: platformName},
 			Open: func(context.Context) (source.Source, error) { return source.Open(layer.Path, layer.Format) },
