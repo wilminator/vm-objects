@@ -78,39 +78,50 @@ func routeSnapshot(vm, snap ID) string     { return fmt.Sprintf("/qvs/vms/%d/sna
 func routeSnapshotRevert(vm, snap ID) string {
 	return fmt.Sprintf("/qvs/vms/%d/snapshots/%d/revert", vm, snap) // inferred
 }
-func routeTask(id ID) string { return fmt.Sprintf("/qvs/tasks/%d", id) } // inferred
+func routeTask(id ID) string { return fmt.Sprintf("/qvs/tasks/%d", id) }
 
 // Envelope and field names, as confirmed: every reply is
 // {"status": N, "data": ...}, or {"status": N, "detail": "..."} on error.
 const (
 	statusOK               = 0
 	statusNotAuthenticated = 5
-	statusQueued           = 8 // confirmed: data is a task; wait for it
+	statusQueued           = 8    // data is a task; wait for it
+	statusTaskNotFound     = 3103 // the task finished and VS has forgotten it
 )
 
 func routeSnapshotLock(vm, snap ID) string {
-	return fmt.Sprintf("/qvs/vms/%d/snapshots/%d/lock", vm, snap) // inferred
+	return fmt.Sprintf("/qvs/vms/%d/snapshots/%d/lock", vm, snap)
 }
 
-// snapshotCreate is the body of POST routeSnapshots. The field VS reads to
-// leave a snapshot unlocked, and the one for "disk only, no memory" on a
-// running VM, are still being confirmed: on QTS 5.2 a running VM's
-// snapshot came back locked and with its RAM saved.
+// snapshotCreate is the body of POST routeSnapshots: the only keys
+// SnapshotViewSet.create reads (VS 4.2). It has no disk-only option: VS
+// saves a running VM's memory with the snapshot (a .state file the size
+// of its RAM), which deleting the snapshot removes again.
 type snapshotCreate struct {
 	Name         string `json:"name"`
 	Description  string `json:"description"`
-	LockSnapshot string `json:"lock_snapshot"`
+	LockSnapshot string `json:"lockSnapshot"` // "lock" (VS's default) or "unlock"
+	CreatedBy    string `json:"createdBy"`    // "user", as the UI does
 }
 
-// snapshotUnlock is the body of POST routeSnapshotLock. Inferred.
+// snapshotUnlock is the body of POST routeSnapshotLock, which replies at
+// once (no task). DELETE refuses a locked snapshot.
 type snapshotUnlock struct {
 	LockStatus string `json:"lockStatus"`
 }
 
 // task is a Virtualization Station background task (confirmed shape:
 // id, state "waiting"..., failed, progress).
+//
+// While it runs, GET routeTask gives the task with state "waiting" or
+// "running". Once it ends VS keeps a short-lived summary (finished,
+// failed, success, error_message), and after that answers
+// statusTaskNotFound.
 type task struct {
-	ID     ID     `json:"id"`
-	State  string `json:"state"`
-	Failed bool   `json:"failed"`
+	ID       ID     `json:"id"`
+	State    string `json:"state"`
+	Failed   bool   `json:"failed"`
+	Finished bool   `json:"finished"`
+	Success  bool   `json:"success"`
+	Error    string `json:"error_message"`
 }
