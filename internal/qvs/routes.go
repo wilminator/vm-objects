@@ -85,4 +85,32 @@ func routeTask(id ID) string { return fmt.Sprintf("/qvs/tasks/%d", id) } // infe
 const (
 	statusOK               = 0
 	statusNotAuthenticated = 5
+	statusQueued           = 8 // confirmed: data is a task; wait for it
 )
+
+func routeSnapshotLock(vm, snap ID) string {
+	return fmt.Sprintf("/qvs/vms/%d/snapshots/%d/lock", vm, snap) // inferred
+}
+
+// snapshotCreate is the body of POST routeSnapshots. The field VS reads to
+// leave a snapshot unlocked, and the one for "disk only, no memory" on a
+// running VM, are still being confirmed: on QTS 5.2 a running VM's
+// snapshot came back locked and with its RAM saved.
+type snapshotCreate struct {
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	LockSnapshot string `json:"lock_snapshot"`
+}
+
+// snapshotUnlock is the body of POST routeSnapshotLock. Inferred.
+type snapshotUnlock struct {
+	LockStatus string `json:"lockStatus"`
+}
+
+// task is a Virtualization Station background task (confirmed shape:
+// id, state "waiting"..., failed, progress).
+type task struct {
+	ID     ID     `json:"id"`
+	State  string `json:"state"`
+	Failed bool   `json:"failed"`
+}

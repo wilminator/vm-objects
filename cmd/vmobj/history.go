@@ -404,3 +404,67 @@ func cmdQVSCheck(ctx context.Context, args []string) error {
 	}
 	return nil
 }
+
+// cmdQVSCleanup removes snapshots vmobj took for backups and left behind
+// (a run that was killed, or an old build): only those named
+// engine.SnapshotNamePrefix + time. Anything else is never touched.
+func cmdQVSCleanup(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("qvs-cleanup", flag.ExitOnError)
+	creds := fs.String("qvs-credentials", "", "credentials file ([qvs] url, username, password; mode 600)")
+	vm := fs.String("vm", "", "the VM (name or UUID)")
+	apply := fs.Bool("apply", false, "delete them; without it, only list them")
+	fs.Parse(args)
+	if err := require(fs, "qvs-credentials", "vm"); err != nil {
+		return err
+	}
+	cfg, err := qvs.LoadConfig(*creds)
+	if err != nil {
+		return err
+	}
+	c, err := qvs.New(cfg)
+	if err != nil {
+		return err
+	}
+	if err := c.Login(ctx); err != nil {
+		return err
+	}
+	defer c.Logout(context.WithoutCancel(ctx))
+	v, err := c.FindVM(ctx, *vm, "")
+	if err != nil {
+		if v, err = c.FindVM(ctx, "", *vm); err != nil {
+			return err
+		}
+	}
+	snaps, err := c.ListSnapshots(ctx, v.ID)
+	if err != nil {
+		return err
+	}
+	var ours []qvs.Snapshot
+	for _, s := range snaps {
+		if strings.HasPrefix(s.Name, engine.SnapshotNamePrefix) {
+			ours = append(ours, s)
+		}
+	}
+	if len(ours) == 0 {
+		fmt.Printf("%s has no snapshots left by vmobj (%d others, untouched).\n", v.Name, len(snaps))
+		return nil
+	}
+	for _, s := range ours {
+		lock := ""
+		if s.Locked {
+			lock = " (locked)"
+		}
+		if !*apply {
+			fmt.Printf("Would delete %d %s, taken %s%s\n", s.ID, s.Name, s.Created.Local().Format("2006-01-02 15:04"), lock)
+			continue
+		}
+		if err := c.DeleteSnapshot(ctx, v.ID, s.ID); err != nil {
+			return fmt.Errorf("deleting %s: %w", s.Name, err)
+		}
+		fmt.Printf("Deleted %d %s%s\n", s.ID, s.Name, lock)
+	}
+	if !*apply {
+		fmt.Printf("%d to delete; nothing was changed. Run again with --apply.\n", len(ours))
+	}
+	return nil
+}

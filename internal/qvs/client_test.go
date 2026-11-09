@@ -34,6 +34,8 @@ type fakeVS struct {
 	failTask bool
 	paths    []string // every request path, to prove nothing strays
 	created  map[string]any
+	polls    int
+	unlocked bool
 }
 
 func (f *fakeVS) handler() http.Handler {
@@ -76,21 +78,43 @@ func (f *fakeVS) handler() http.Handler {
 		case p == "/qvs/vms/21/snapshots" && r.Method == http.MethodGet:
 			ok(w, f.snaps)
 		case p == "/qvs/vms/21/snapshots" && r.Method == http.MethodPost:
+			// As VS 4.2 does for a running VM: queued as a task, and the
+			// snapshot comes out locked.
 			json.Unmarshal(body, &f.created)
 			f.snaps = append(f.snaps, map[string]any{"id": 1794103287, "vm_id": 21, "name": f.created["name"],
 				"description": f.created["description"], "creation_time": "2026-11-08T02:01:27",
-				"lock_snapshot": f.created["lock_snapshot"], "created_by": "user"})
-			ok(w, map[string]any{"task_id": 9})
-		case p == "/qvs/tasks/9":
-			if f.failTask {
-				ok(w, map[string]any{"status": "failed"})
-			} else {
-				w.WriteHeader(http.StatusNotFound) // finished tasks are cleaned up
-				json.NewEncoder(w).Encode(map[string]any{"status": 4, "detail": "Not found."})
+				"lock_snapshot": "lock", "created_by": "user"})
+			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{
+				"id": 3, "user": "qts_vmobj", "state": "waiting", "type": "create_snapshot", "failed": false}})
+		case p == "/qvs/tasks/3":
+			f.polls++
+			switch {
+			case f.failTask:
+				ok(w, map[string]any{"id": 3, "state": "finished", "failed": true})
+			case f.polls < 2:
+				ok(w, map[string]any{"id": 3, "state": "waiting", "failed": false})
+			case f.polls < 3:
+				ok(w, map[string]any{"id": 3, "state": "running", "failed": false})
+			default:
+				ok(w, map[string]any{"id": 3, "state": "finished", "failed": false})
 			}
-		case p == "/qvs/vms/21/snapshots/1794103287" && r.Method == http.MethodDelete:
-			f.snaps = nil
+		case p == "/qvs/vms/21/snapshots/1794103287/lock" && r.Method == http.MethodPost:
+			var in map[string]any
+			json.Unmarshal(body, &in)
+			if in["lockStatus"] == "unlock" {
+				f.unlocked = true
+				for _, sn := range f.snaps {
+					sn["lock_snapshot"] = "unlock"
+				}
+			}
 			ok(w, nil)
+		case p == "/qvs/vms/21/snapshots/1794103287" && r.Method == http.MethodDelete:
+			if !f.unlocked {
+				json.NewEncoder(w).Encode(map[string]any{"status": 2, "detail": "Snapshot is locked."})
+				return
+			}
+			f.snaps = nil
+			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{"id": 3, "state": "waiting"}})
 		default:
 			w.WriteHeader(http.StatusNotFound) // a trailing slash lands here, as on VS
 		}
@@ -128,14 +152,21 @@ func TestLoginAndSnapshotLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ID != 1794103287 || s.Name != "vmobj-20261108T190000Z" || s.Created.Unix() != 1794103287 || s.Locked {
+	if s.ID != 1794103287 || s.Name != "vmobj-20261108T190000Z" || s.Created.Unix() != 1794103287 || !s.Locked {
 		t.Fatalf("%+v", s)
+	}
+	if f.polls < 3 {
+		t.Fatalf("didn't wait for the queued task (%d polls)", f.polls)
 	}
 	if f.created["lock_snapshot"] != "unlock" || f.created["description"] != "for a backup" {
 		t.Fatalf("created with %v", f.created)
 	}
+	f.polls = 0
 	if err := c.DeleteSnapshot(ctx, 21, s.ID); err != nil {
 		t.Fatal(err)
+	}
+	if !f.unlocked {
+		t.Fatal("deleted a locked snapshot without unlocking it")
 	}
 	c.Logout(ctx)
 	for _, p := range f.paths {
