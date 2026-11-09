@@ -36,8 +36,13 @@ type fakeVS struct {
 	created  map[string]any
 	polls    int
 	unlocked bool
-	newVM    []byte // the last create body
-	made     bool
+	// forceLock locks every new snapshot whatever was asked, as the
+	// leftover from the first run is; forgetTasks skips the finished
+	// summary and answers 3103 straight away.
+	forceLock   bool
+	forgetTasks bool
+	newVM       []byte // the last create body
+	made        bool
 }
 
 func (f *fakeVS) handler() http.Handler {
@@ -87,25 +92,33 @@ func (f *fakeVS) handler() http.Handler {
 		case p == "/qvs/vms/21/snapshots" && r.Method == http.MethodGet:
 			ok(w, f.snaps)
 		case p == "/qvs/vms/21/snapshots" && r.Method == http.MethodPost:
-			// As VS 4.2 does for a running VM: queued as a task, and the
-			// snapshot comes out locked.
+			// As VS 4.2 does: it reads only these keys, locks unless
+			// told "unlock", and queues the work as a task.
 			json.Unmarshal(body, &f.created)
+			lock, _ := f.created["lockSnapshot"].(string)
+			if lock != "unlock" || f.forceLock {
+				lock = "lock"
+			}
+			by, _ := f.created["createdBy"].(string)
+			f.unlocked = lock == "unlock"
 			f.snaps = append(f.snaps, map[string]any{"id": 1794103287, "vm_id": 21, "name": f.created["name"],
 				"description": f.created["description"], "creation_time": "2026-11-08T02:01:27",
-				"lock_snapshot": "lock", "created_by": "user"})
+				"lock_snapshot": lock, "created_by": by})
 			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{
 				"id": 3, "user": "qts_vmobj", "state": "waiting", "type": "create_snapshot", "failed": false}})
 		case p == "/qvs/tasks/3":
 			f.polls++
 			switch {
 			case f.failTask:
-				ok(w, map[string]any{"id": 3, "state": "finished", "failed": true})
+				ok(w, map[string]any{"finished": true, "failed": true, "success": false, "error_message": "Task failed: unknown error"})
 			case f.polls < 2:
 				ok(w, map[string]any{"id": 3, "state": "waiting", "failed": false})
 			case f.polls < 3:
 				ok(w, map[string]any{"id": 3, "state": "running", "failed": false})
+			case f.polls < 4 && !f.forgetTasks:
+				ok(w, map[string]any{"finished": true, "failed": false, "success": true})
 			default:
-				ok(w, map[string]any{"id": 3, "state": "finished", "failed": false})
+				json.NewEncoder(w).Encode(map[string]any{"status": 3103}) // forgotten
 			}
 		case p == "/qvs/vms/21/snapshots/1794103287/lock" && r.Method == http.MethodPost:
 			var in map[string]any
@@ -144,7 +157,7 @@ func login(t *testing.T, f *fakeVS, password string) (*Client, error) {
 }
 
 func TestLoginAndSnapshotLifecycle(t *testing.T) {
-	f := &fakeVS{password: "p@ss w0rd+/="}
+	f := &fakeVS{password: "p@ss w0rd+/=", forceLock: true}
 	c, err := login(t, f, "p@ss w0rd+/=")
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +180,7 @@ func TestLoginAndSnapshotLifecycle(t *testing.T) {
 	if f.polls < 3 {
 		t.Fatalf("didn't wait for the queued task (%d polls)", f.polls)
 	}
-	if f.created["lock_snapshot"] != "unlock" || f.created["description"] != "for a backup" {
+	if f.created["lockSnapshot"] != "unlock" || f.created["createdBy"] != "user" || f.created["description"] != "for a backup" {
 		t.Fatalf("created with %v", f.created)
 	}
 	f.polls = 0
@@ -348,5 +361,30 @@ func TestCreateVM(t *testing.T) {
 		if _, err := c.CreateVM(ctx, bad); err == nil {
 			t.Errorf("accepted %+v", bad)
 		}
+	}
+}
+
+// A snapshot asked for unlocked comes out unlocked, and a task VS has
+// already forgotten (status 3103) counts as done: the snapshot list is
+// what confirms it.
+func TestUnlockedSnapshotAndForgottenTask(t *testing.T) {
+	f := &fakeVS{password: "p", forgetTasks: true}
+	c, err := login(t, f, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s, err := c.CreateSnapshot(ctx, 21, "vmobj-20261109T010000Z", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Locked {
+		t.Fatalf("asked for unlocked, got %+v", s)
+	}
+	if err := c.DeleteSnapshot(ctx, 21, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.snaps) != 0 {
+		t.Fatalf("left %v", f.snaps)
 	}
 }

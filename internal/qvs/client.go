@@ -420,7 +420,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, vm ID, name, description st
 	if name == "" || strings.ContainsAny(name, "\x00\r\n") {
 		return nil, fmt.Errorf("qvs: snapshot name %q", name)
 	}
-	in := snapshotCreate{Name: name, Description: description, LockSnapshot: "unlock"}
+	in := snapshotCreate{Name: name, Description: description, LockSnapshot: "unlock", CreatedBy: "user"}
 	if err := c.call(ctx, http.MethodPost, routeSnapshots(vm), in, nil); err != nil {
 		return nil, err
 	}
@@ -484,7 +484,9 @@ func (c *Client) waitTask(ctx context.Context, id ID) error {
 		var t task
 		if err := c.call(ctx, http.MethodGet, routeTask(id), nil, &t); err != nil {
 			var ae *APIError
-			if errors.As(err, &ae) && ae.HTTP == http.StatusNotFound {
+			if errors.As(err, &ae) && (ae.Status == statusTaskNotFound || ae.HTTP == http.StatusNotFound) {
+				// Gone: it finished and VS forgot it. Callers confirm
+				// the change against the resource itself.
 				return true, nil
 			}
 			return false, err
@@ -492,8 +494,12 @@ func (c *Client) waitTask(ctx context.Context, id ID) error {
 		s := strings.ToLower(t.State)
 		switch {
 		case t.Failed, strings.Contains(s, "fail"), strings.Contains(s, "error"), strings.Contains(s, "abort"), strings.Contains(s, "cancel"):
-			return false, fmt.Errorf("%w (task %d: %s)", ErrTaskFailed, id, clean(t.State))
-		case strings.Contains(s, "finish"), strings.Contains(s, "done"), strings.Contains(s, "success"), strings.Contains(s, "complete"):
+			why := t.Error
+			if why == "" {
+				why = t.State
+			}
+			return false, fmt.Errorf("%w (task %d: %s)", ErrTaskFailed, id, clean(why))
+		case t.Finished, t.Success, strings.Contains(s, "finish"), strings.Contains(s, "done"), strings.Contains(s, "success"), strings.Contains(s, "complete"):
 			return true, nil
 		}
 		return false, nil // waiting, running...
