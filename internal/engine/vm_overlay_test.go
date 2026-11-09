@@ -36,10 +36,12 @@ type fakeVS struct {
 	deleted    []string
 	failCreate bool
 	noOverlay  bool // a broken platform: reports a snapshot but changes nothing
+	failAfter  bool // takes the snapshot, then reports a failure
+	listed     []platform.SnapshotInfo
 }
 
 func (f *fakeVS) ListSnapshots(context.Context, *platform.VM) ([]platform.SnapshotInfo, error) {
-	return nil, nil
+	return f.listed, nil
 }
 func (f *fakeVS) RevertSnapshot(context.Context, *platform.VM, string) error { return nil }
 
@@ -49,6 +51,10 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 	}
 	f.created = append(f.created, s.Name)
 	s.ID = "7"
+	if f.failAfter {
+		f.listed = append(f.listed, s)
+		return s, errors.New("unexpected reply")
+	}
 	if f.noOverlay {
 		return s, nil
 	}
@@ -68,6 +74,7 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 
 func (f *fakeVS) DeleteSnapshot(_ context.Context, _ *platform.VM, id string) error {
 	f.deleted = append(f.deleted, id)
+	f.listed = nil
 	return nil
 }
 
@@ -152,5 +159,20 @@ func TestBackupRunningVMWithoutManagerIsRefused(t *testing.T) {
 	o.Platform = f.Libvirt
 	if _, err := BackupVM(v.ctx, o); !errors.Is(err, ErrLiveQCOW2) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// A snapshot step that reports failure but took the snapshot anyway (as
+// QNAP once did) leaves nothing behind: vmobj finds it by name and deletes it.
+func TestBackupRunningVMCleansUpAFailedSnapshotStep(t *testing.T) {
+	v, f, _ := newFakeVS(t)
+	f.failAfter = true
+	o := v.opts(manifest.Full)
+	o.Platform = f
+	if _, err := BackupVM(v.ctx, o); err == nil {
+		t.Fatal("reported success")
+	}
+	if len(f.deleted) != 1 || f.deleted[0] != "7" || len(f.listed) != 0 {
+		t.Fatalf("the stray snapshot wasn't removed: deleted %v, still listed %v", f.deleted, f.listed)
 	}
 }

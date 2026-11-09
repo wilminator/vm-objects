@@ -270,6 +270,18 @@ func (c *Client) call(ctx context.Context, method, route string, in, out any) er
 	if status == statusNotAuthenticated || httpStatus == http.StatusUnauthorized || httpStatus == http.StatusForbidden {
 		return fmt.Errorf("%w (qvs %s %s)", ErrNotLoggedIn, method, route)
 	}
+	if status == statusQueued && httpStatus < 300 {
+		// A write VS runs in the background: data is the task. Wait for
+		// it here, so every caller sees a finished change.
+		var t task
+		if err := json.Unmarshal(env.Data, &t); err != nil || t.ID == 0 {
+			return &APIError{Method: method, Route: route, HTTP: httpStatus, Status: status, Detail: "queued, but the reply names no task"}
+		}
+		if err := c.waitTask(ctx, t.ID); err != nil {
+			return fmt.Errorf("qvs %s %s: %w", method, route, err)
+		}
+		return nil
+	}
 	if httpStatus >= 300 || (status != statusOK && status != -1) || (jerr != nil && len(bytes.TrimSpace(b)) > 0) {
 		detail := env.Detail
 		if detail == "" {
@@ -356,17 +368,13 @@ func NormalState(s string) string {
 	return s
 }
 
-// Act runs one of the allowlisted power actions and waits for the task it
-// names, if any.
+// Act runs one of the allowlisted power actions, waiting for it when VS
+// queues it.
 func (c *Client) Act(ctx context.Context, id ID, a Action) error {
 	if !a.valid() {
 		return fmt.Errorf("qvs: %q is not an action vmobj sends", a)
 	}
-	var reply taskReply
-	if err := c.call(ctx, http.MethodPost, routeVMAction(id, a), map[string]any{}, &reply); err != nil {
-		return err
-	}
-	return c.waitTask(ctx, reply)
+	return c.call(ctx, http.MethodPost, routeVMAction(id, a), map[string]any{}, nil)
 }
 
 // Snapshot is Virtualization Station's view of a snapshot.
@@ -412,13 +420,9 @@ func (c *Client) CreateSnapshot(ctx context.Context, vm ID, name, description st
 	if name == "" || strings.ContainsAny(name, "\x00\r\n") {
 		return nil, fmt.Errorf("qvs: snapshot name %q", name)
 	}
-	var reply taskReply
-	in := map[string]any{"name": name, "description": description, "lock_snapshot": "unlock"}
-	if err := c.call(ctx, http.MethodPost, routeSnapshots(vm), in, &reply); err != nil {
+	in := snapshotCreate{Name: name, Description: description, LockSnapshot: "unlock"}
+	if err := c.call(ctx, http.MethodPost, routeSnapshots(vm), in, nil); err != nil {
 		return nil, err
-	}
-	if err := c.waitTask(ctx, reply); err != nil {
-		return nil, fmt.Errorf("snapshot %q: %w", name, err)
 	}
 	var got *Snapshot
 	err := c.until(ctx, func() (bool, error) {
@@ -437,13 +441,21 @@ func (c *Client) CreateSnapshot(ctx context.Context, vm ID, name, description st
 	return got, nil
 }
 
-// DeleteSnapshot deletes a snapshot and waits until it's gone from the list.
+// DeleteSnapshot deletes a snapshot, unlocking it first if it's locked,
+// and waits until it's gone from the list.
 func (c *Client) DeleteSnapshot(ctx context.Context, vm, snap ID) error {
-	var reply taskReply
-	if err := c.call(ctx, http.MethodDelete, routeSnapshot(vm, snap), nil, &reply); err != nil {
+	snaps, err := c.ListSnapshots(ctx, vm)
+	if err != nil {
 		return err
 	}
-	if err := c.waitTask(ctx, reply); err != nil {
+	for _, s := range snaps {
+		if s.ID == snap && s.Locked {
+			if err := c.call(ctx, http.MethodPost, routeSnapshotLock(vm, snap), snapshotUnlock{LockStatus: "unlock"}, nil); err != nil {
+				return fmt.Errorf("unlocking snapshot %d: %w", snap, err)
+			}
+		}
+	}
+	if err := c.call(ctx, http.MethodDelete, routeSnapshot(vm, snap), nil, nil); err != nil {
 		return err
 	}
 	return c.until(ctx, func() (bool, error) {
@@ -459,46 +471,32 @@ func (c *Client) DeleteSnapshot(ctx context.Context, vm, snap ID) error {
 
 // RevertSnapshot reverts a VM to a snapshot and waits for it.
 func (c *Client) RevertSnapshot(ctx context.Context, vm, snap ID) error {
-	var reply taskReply
-	if err := c.call(ctx, http.MethodPost, routeSnapshotRevert(vm, snap), map[string]any{}, &reply); err != nil {
-		return err
-	}
-	return c.waitTask(ctx, reply)
-}
-
-// taskReply is what an action may reply with: a background task's id.
-// Anything else in the reply is ignored.
-type taskReply struct {
-	TaskID *ID `json:"task_id"`
+	return c.call(ctx, http.MethodPost, routeSnapshotRevert(vm, snap), map[string]any{}, nil)
 }
 
 // ErrTaskFailed means Virtualization Station reported a task failed.
 var ErrTaskFailed = errors.New("qvs: the task failed")
 
-// waitTask waits for a reply's task, if it named one.
-func (c *Client) waitTask(ctx context.Context, r taskReply) error {
-	if r.TaskID == nil {
-		return nil
-	}
-	id := *r.TaskID
+// waitTask polls a background task until it finishes. A task VS has
+// already cleaned up (404) counts as finished.
+func (c *Client) waitTask(ctx context.Context, id ID) error {
 	return c.until(ctx, func() (bool, error) {
-		var t struct {
-			Status string `json:"status"`
-		}
+		var t task
 		if err := c.call(ctx, http.MethodGet, routeTask(id), nil, &t); err != nil {
 			var ae *APIError
 			if errors.As(err, &ae) && ae.HTTP == http.StatusNotFound {
-				return true, nil // finished tasks are cleaned up
+				return true, nil
 			}
 			return false, err
 		}
-		switch s := strings.ToLower(t.Status); {
-		case strings.Contains(s, "fail"), strings.Contains(s, "error"), strings.Contains(s, "abort"), strings.Contains(s, "cancel"):
-			return false, fmt.Errorf("%w (task %d: %s)", ErrTaskFailed, id, clean(s))
-		case s == "", strings.Contains(s, "done"), strings.Contains(s, "success"), strings.Contains(s, "finish"), strings.Contains(s, "complete"):
+		s := strings.ToLower(t.State)
+		switch {
+		case t.Failed, strings.Contains(s, "fail"), strings.Contains(s, "error"), strings.Contains(s, "abort"), strings.Contains(s, "cancel"):
+			return false, fmt.Errorf("%w (task %d: %s)", ErrTaskFailed, id, clean(t.State))
+		case strings.Contains(s, "finish"), strings.Contains(s, "done"), strings.Contains(s, "success"), strings.Contains(s, "complete"):
 			return true, nil
 		}
-		return false, nil
+		return false, nil // waiting, running...
 	})
 }
 

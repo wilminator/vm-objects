@@ -359,6 +359,17 @@ func snapshotOverlays(ctx context.Context, o BackupVMOptions, plat platform.Plat
 		return sm.CreateSnapshot(ctx, dom, info)
 	}()
 	if err != nil {
+		// The platform may have taken it anyway (QNAP did, once, behind a
+		// reply vmobj didn't expect): look, and remove it if it's there.
+		if snaps, lerr := sm.ListSnapshots(context.WithoutCancel(ctx), dom); lerr == nil {
+			for _, s := range snaps {
+				if s.Name == info.Name {
+					if derr := sm.DeleteSnapshot(context.WithoutCancel(ctx), dom, s.ID); derr != nil {
+						err = fmt.Errorf("%w; it was taken anyway and deleting it failed too (%v): delete %s in the platform's UI", err, derr, info.Name)
+					}
+				}
+			}
+		}
 		return nil, nil, fmt.Errorf("taking the platform snapshot %s: %w", info.Name, err)
 	}
 	release = func() {
