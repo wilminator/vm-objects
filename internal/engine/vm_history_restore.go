@@ -21,6 +21,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/atomicfile"
 	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
+	"github.com/wilminator/vm-objects/internal/platform"
 	"github.com/wilminator/vm-objects/internal/vmdef"
 )
 
@@ -296,4 +297,61 @@ func sameFile(a, b string) bool {
 	}
 	fb, err := os.Stat(b)
 	return err == nil && os.SameFile(fa, fb)
+}
+
+// createRestoredVM defines the restored VM through the platform's API, on
+// the restored disks, and registers its snapshot history. It never
+// starts it.
+func createRestoredVM(ctx context.Context, o RestoreVMOptions, rec *manifest.VMRecord, def []byte, name string, st *RestoreVMStats) error {
+	hw, err := vmdef.ParseHardware(def)
+	if err != nil {
+		return err
+	}
+	dom, err := vmdef.ParseNoUUID(def) // a new name drops the UUID
+	if err != nil {
+		return err
+	}
+	spec := platform.VMSpec{Name: name, OSType: o.OSType, Machine: hw.Machine, Memory: hw.Memory, VCPUs: hw.VCPUs,
+		UEFI: hw.UEFI, TPM: dom.TPM, Networks: o.Bridges, Definition: def, DefinitionType: "libvirt"}
+	for _, d := range rec.Disks {
+		spec.Disks = append(spec.Disks, platform.DiskSpec{Target: d.Target, Path: st.Disks[d.Target], Format: "qcow2", Bus: hw.Buses[d.Target]})
+	}
+	vm, err := o.Manager.Create(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("creating the VM: %w (the disks are restored in %s; RESTORE.txt says how to create it by hand)", err, filepath.Dir(st.Definition))
+	}
+	st.Created = vm
+	if st.HistoryPlan == "" {
+		return nil
+	}
+	plan, err := ReadQNAPPlan(st.HistoryPlan)
+	if err != nil {
+		return err
+	}
+	if err := libvirt.CheckDomain(vm.UUID); err != nil {
+		return err
+	}
+	// Virtualization Station writes the new VM's definition into
+	// .<uuid>.meta beside its disk; the records go next to it.
+	defPath := filepath.Join(filepath.Dir(plan.Tops[rec.Disks[0].Target]), "."+vm.UUID+".meta", vm.UUID+".xml")
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		if _, err := os.Stat(defPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the VM was created, but its definition %s didn't appear; register the snapshots with vmobj qnap-snapshots", defPath)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	paths, err := RegisterQNAPSnapshots(ctx, plan, defPath, nil, true)
+	if err != nil {
+		return fmt.Errorf("the VM was created, but registering its snapshots failed: %w", err)
+	}
+	st.Registered = len(paths)
+	return nil
 }

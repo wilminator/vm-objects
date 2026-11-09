@@ -54,6 +54,10 @@ type Domain struct {
 // Parse reads a domain definition.
 func Parse(data []byte) (*Domain, error) { return parse(data, true) }
 
+// ParseNoUUID reads a definition that may have no UUID, such as one
+// rewritten for a new name (Changes.DropUUID).
+func ParseNoUUID(data []byte) (*Domain, error) { return parse(data, false) }
+
 func parse(data []byte, needUUID bool) (*Domain, error) {
 	var raw struct {
 		Name string `xml:"name"`

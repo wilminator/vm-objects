@@ -36,6 +36,8 @@ type fakeVS struct {
 	created  map[string]any
 	polls    int
 	unlocked bool
+	newVM    []byte // the last create body
+	made     bool
 }
 
 func (f *fakeVS) handler() http.Handler {
@@ -68,11 +70,18 @@ func (f *fakeVS) handler() http.Handler {
 		case p == "/qvs/auth/check", p == "/qvs/auth/logout":
 			ok(w, nil)
 		case p == "/qvs/vms" && r.Method == http.MethodGet:
-			ok(w, []map[string]any{
+			vms := []map[string]any{
 				{"id": 20, "name": "WinGames", "uuid": "7240004c", "power_state": "stop"},
 				{"id": 21, "name": "WinGames-xhost", "uuid": "42497a00", "power_state": "running",
 					"graphics": []map[string]any{{"enable_password": "hunter2"}}},
-			})
+			}
+			if f.made {
+				vms = append(vms, map[string]any{"id": 22, "name": "WinGames-restored", "uuid": "aaaa", "power_state": "stop"})
+			}
+			ok(w, vms)
+		case p == "/qvs/v2/vms" && r.Method == http.MethodPost:
+			f.newVM, f.made = body, true
+			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{"id": 3, "state": "waiting"}})
 		case p == "/qvs/vms/21" && r.Method == http.MethodGet:
 			ok(w, map[string]any{"id": 21, "power_state": "running"})
 		case p == "/qvs/vms/21/snapshots" && r.Method == http.MethodGet:
@@ -285,5 +294,59 @@ func TestLoadConfig(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "remote"), []byte("[qvs]\nurl = http://192.168.0.200:8080\nusername = u\npassword = p\n"), 0o600)
 	if _, err := LoadConfig(filepath.Join(dir, "remote")); err == nil {
 		t.Fatal("plain http to another machine was accepted")
+	}
+}
+
+func TestSharedPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/share/VMs/m9/WinGames-vda.qcow2":                "shared://VMs/m9/WinGames-vda.qcow2",
+		"/share/CACHEDEV1_DATA/VMs/m9/WinGames-vda.qcow2": "shared://VMs/m9/WinGames-vda.qcow2",
+	} {
+		if got, err := SharedPath(in); err != nil || got != want {
+			t.Errorf("%s -> %s, %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"/share/VMs", "/share/VMs/../etc/x", "/etc/passwd", "share/VMs/x", "/share/VMs/a$(id)", "/share/VMs/a\nb", "/share/.qpkg/x", "/share/VMs//x"} {
+		if _, err := SharedPath(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// The create payload uses existing images by shared:// path, never
+// sends a display password, and the VM is waited for.
+func TestCreateVM(t *testing.T) {
+	f := &fakeVS{password: "p"}
+	c, err := login(t, f, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	spec := CreateSpec{Name: "WinGames-restored", OSType: "win11", UEFI: true, Machine: "q35", Cores: 4, Memory: 16 << 30,
+		Disks: []CreateDisk{{Path: "/share/VMs/m9/WinGames-vda.qcow2", Bus: "virtio"}}}
+	vm, err := c.CreateVM(ctx, spec)
+	if err != nil || vm.ID != 22 {
+		t.Fatalf("%+v %v", vm, err)
+	}
+	var sent map[string]any
+	json.Unmarshal(f.newVM, &sent)
+	disk := sent["disks"].([]any)[0].(map[string]any)
+	g := sent["graphics"].([]any)[0].(map[string]any)
+	if sent["bios"] != "ovmf" || disk["creating_image"] != false || disk["path"] != "shared://VMs/m9/WinGames-vda.qcow2" ||
+		g["enable_password"] != false || g["localhost_only"] != true || strings.Contains(string(f.newVM), `"password"`) {
+		t.Fatalf("sent %s", f.newVM)
+	}
+	if _, err := c.CreateVM(ctx, spec); err == nil {
+		t.Fatal("created a second VM with the same name")
+	}
+	for _, bad := range []CreateSpec{
+		{Name: "-x", OSType: "win11", Cores: 1, Memory: 1 << 30, Disks: spec.Disks},
+		{Name: "ok", OSType: "win11; rm", Cores: 1, Memory: 1 << 30, Disks: spec.Disks},
+		{Name: "ok", OSType: "win11", Cores: 1, Memory: 1 << 30, Disks: []CreateDisk{{Path: "/etc/shadow"}}},
+		{Name: "ok", OSType: "win11", Cores: 1, Memory: 1 << 30, Disks: spec.Disks, Bridges: []string{"br0&x=1"}},
+	} {
+		if _, err := c.CreateVM(ctx, bad); err == nil {
+			t.Errorf("accepted %+v", bad)
+		}
 	}
 }

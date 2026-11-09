@@ -126,6 +126,8 @@ func domainXML(disks string, nvram string) string {
 	}
 	return fmt.Sprintf(`<domain type='kvm'>
   <name>win11</name>
+  <memory unit='KiB'>2097152</memory>
+  <vcpu placement='static'>2</vcpu>
   <uuid>%s</uuid>
   <os><type>hvm</type>%s</os>
   <devices>
