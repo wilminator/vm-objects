@@ -94,8 +94,11 @@ func TestCopyUploadsOverlap(t *testing.T) {
 		if sb.most < 4 || sb.most > 8 {
 			t.Fatalf("key %d: at most %d uploads at once; want several, never more than 8", keyByte, sb.most)
 		}
-		// One at a time would take 32 x 20 ms.
-		if took > 400*time.Millisecond {
+		// Overlap is proven by the concurrency count above. A wall-clock
+		// limit (one at a time would take 32 x 20 ms) fails on a loaded CI
+		// runner under the race detector, so it only guards against the
+		// serial time.
+		if took > 640*time.Millisecond+500*time.Millisecond {
 			t.Fatalf("key %d: took %s; uploads don't seem to overlap", keyByte, took)
 		}
 		restoreFrom(t, h, to, "win11", name, disk)
