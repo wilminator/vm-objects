@@ -272,24 +272,99 @@ type Layer struct {
 }
 
 // QCOW2Chain lists a qcow2 image's backing chain, the image itself first
-// and the bottom-most file last. Each file is opened (read-only) to read
-// its header; none is kept open.
+// and the bottom-most file last. Only each file's header is read, and the
+// dirty flag is ignored: this is how vmobj finds the layer a snapshot froze
+// under the live top of a running VM, and that top is dirty for as long as
+// the VM runs. Reading data (Open, OpenQCOW2) still refuses a dirty image.
 func QCOW2Chain(path string) ([]Layer, error) {
-	q, err := OpenQCOW2(path)
-	if err != nil {
-		return nil, err
-	}
-	defer q.Close()
 	chain := []Layer{{Path: path, Format: "qcow2"}}
-	for cur := q; cur.backing != nil; {
-		chain = append(chain, Layer{Path: cur.backingPath, Format: cur.backingFmt})
-		next, ok := cur.backing.(*QCOW2)
-		if !ok {
-			break // a raw file ends the chain
+	for cur := path; ; {
+		if len(chain) > maxBackingDepth {
+			return nil, fmt.Errorf("%s: backing chain is longer than %d images", path, maxBackingDepth)
 		}
-		cur = next
+		bpath, bfmt, err := readBackingInfo(cur)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", cur, err)
+		}
+		if bpath == "" {
+			return chain, nil
+		}
+		if _, err := os.Stat(bpath); err != nil {
+			return nil, fmt.Errorf("%s: backing file: %w", cur, err)
+		}
+		chain = append(chain, Layer{Path: bpath, Format: bfmt})
+		switch {
+		case bfmt == "raw":
+			return chain, nil // a raw file ends the chain
+		case bfmt == "" && !hasExt(bpath, ".qcow2", ".qcow"):
+			is, err := IsQCOW2(bpath)
+			if err != nil {
+				return nil, err
+			}
+			if is {
+				return nil, fmt.Errorf("%s: backing file %s has no recorded format: %w", cur, bpath, ErrAmbiguousFormat)
+			}
+			return chain, nil
+		}
+		cur = bpath
 	}
-	return chain, nil
+}
+
+// readBackingInfo reads one qcow2 image's header: its backing file (made
+// absolute) and that file's recorded format, both "" when there is none.
+func readBackingInfo(path string) (backing, format string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	h := make([]byte, 112)
+	n, rerr := f.ReadAt(h, 0)
+	if n < 72 {
+		if rerr == nil || errors.Is(rerr, io.EOF) {
+			return "", "", ErrNotQCOW2
+		}
+		return "", "", rerr
+	}
+	be := binary.BigEndian
+	if be.Uint32(h[0:]) != qcowMagic {
+		return "", "", ErrNotQCOW2
+	}
+	version := be.Uint32(h[4:])
+	if version != 2 && version != 3 {
+		return "", "", fmt.Errorf("qcow2 version %d is not supported", version)
+	}
+	headerLen := uint32(72)
+	if version == 3 {
+		if n < 104 {
+			return "", "", errors.New("version 3 header is truncated")
+		}
+		headerLen = be.Uint32(h[100:])
+	}
+	bits := uint(be.Uint32(h[20:]))
+	if bits < 9 || bits > 21 {
+		return "", "", fmt.Errorf("cluster size 2^%d is out of range", bits)
+	}
+	boff, blen := be.Uint64(h[8:]), be.Uint32(h[16:])
+	if boff == 0 || blen == 0 {
+		return "", "", nil
+	}
+	if blen > 1023 {
+		return "", "", errors.New("backing file name is too long")
+	}
+	name := make([]byte, blen)
+	if _, err := f.ReadAt(name, int64(boff)); err != nil {
+		return "", "", fmt.Errorf("reading backing file name: %w", err)
+	}
+	backing = string(name)
+	if !filepath.IsAbs(backing) {
+		backing = filepath.Join(filepath.Dir(path), backing)
+	}
+	q := &QCOW2{f: f, path: path, clusterBits: bits}
+	if format, err = q.backingFormat(int64(headerLen)); err != nil {
+		return "", "", err
+	}
+	return backing, format, nil
 }
 
 // Close closes the image and its backing chain.
