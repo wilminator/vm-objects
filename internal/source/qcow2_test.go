@@ -281,3 +281,44 @@ func TestQCOW2TruncatedCompressedFailsLoudly(t *testing.T) {
 		}
 	}
 }
+
+// The top of a running VM is marked dirty. Reading its data is refused, but
+// listing the chain only reads headers, so vmobj can find the layer a
+// snapshot froze under it.
+func TestQCOW2ChainOfDirtyTop(t *testing.T) {
+	needQemu(t)
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.qcow2")
+	run(t, "qemu-img", "create", "-q", "-f", "qcow2", base, "2M")
+	mid := filepath.Join(dir, "mid.qcow2")
+	run(t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", "base.qcow2", mid)
+	top := filepath.Join(dir, "top.qcow2")
+	run(t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", "mid.qcow2", top)
+
+	f, err := os.OpenFile(top, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [8]byte
+	f.ReadAt(b[:], 72)
+	b[7] |= 1 // incompatible feature bit 0: dirty
+	f.WriteAt(b[:], 72)
+	f.Close()
+
+	if _, err := Open(top, "qcow2"); err == nil || !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("reading a dirty image should be refused, got %v", err)
+	}
+	chain, err := QCOW2Chain(top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) != 3 || chain[1].Path != mid || chain[2].Path != base {
+		t.Fatalf("chain %+v", chain)
+	}
+	// The frozen layer under it opens fine.
+	if s, err := Open(chain[1].Path, "qcow2"); err != nil {
+		t.Fatal(err)
+	} else {
+		s.Close()
+	}
+}

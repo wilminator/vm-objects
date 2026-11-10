@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -62,6 +63,7 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 		return s, nil
 	}
 	ov := f.top + ".1794103287"
+	setDirty(f.v.t, f.top, false) // the old top goes read-only, and QEMU leaves it clean
 	q, err := vtarget.CreateQCOW2(ov, f.size, vtarget.QCOW2Options{Backing: f.top, BackingFormat: "qcow2"})
 	if err != nil {
 		return s, err
@@ -70,9 +72,36 @@ func (f *fakeVS) CreateSnapshot(_ context.Context, _ *platform.VM, s platform.Sn
 	if err := q.Close(); err != nil {
 		return s, err
 	}
+	// QEMU holds the live top open with its dirty flag set, which is why
+	// the frozen layer under it is the one to read; vmobj may still read
+	// the top's header to find that layer.
+	setDirty(f.v.t, ov, true)
 	f.top = ov
 	f.v.virsh.xml = domainXML(qcow2Disk("vda", ov), "")
 	return s, nil
+}
+
+// setDirty sets or clears a qcow2 v3 image's dirty bit (incompatible
+// feature bit 0).
+func setDirty(t *testing.T, path string, dirty bool) {
+	t.Helper()
+	fh, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+	var b [8]byte
+	if _, err := fh.ReadAt(b[:], 72); err != nil {
+		t.Fatal(err)
+	}
+	if dirty {
+		b[7] |= 1
+	} else {
+		b[7] &^= 1
+	}
+	if _, err := fh.WriteAt(b[:], 72); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *fakeVS) DeleteSnapshot(_ context.Context, _ *platform.VM, id string) error {
