@@ -282,3 +282,32 @@ func ReadVMFiles(nvram, tpmDir string) ([]manifest.VMFile, error) {
 	}
 	return files, nil
 }
+
+// ParseVirshVersion reads `virsh version`: the libvirt library in use and
+// the running hypervisor (QEMU). A line it doesn't find leaves its field
+// empty.
+func ParseVirshVersion(out string) (libvirtVer, qemuVer string) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "Using library: libvirt "); ok {
+			libvirtVer = strings.TrimSpace(v)
+		}
+		if v, ok := strings.CutPrefix(line, "Running hypervisor: QEMU "); ok {
+			qemuVer = strings.TrimSpace(v)
+		}
+	}
+	return
+}
+
+// HostInfo reports the libvirt and QEMU versions this host runs. The
+// versions of swtpm and libtpms, and the platform's own, are added by the
+// appliance modules that can read them.
+func (l *Libvirt) HostInfo(ctx context.Context) (*manifest.HostInfo, error) {
+	out, err := l.Virsh.Run(ctx, "version")
+	if err != nil {
+		return nil, fmt.Errorf("virsh version: %w", err)
+	}
+	h := &manifest.HostInfo{Platform: l.Name()}
+	h.Libvirt, h.QEMU = ParseVirshVersion(out)
+	return h, nil
+}
