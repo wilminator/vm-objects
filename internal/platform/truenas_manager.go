@@ -186,6 +186,8 @@ func (m *TrueNASManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration
 // trueNASName is what TrueNAS accepts as a VM's name.
 var trueNASName = regexp.MustCompile(`^[A-Za-z0-9_]{1,63}$`)
 
+var uuidRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 // createKeys are the vm.create settings carried over from the original's
 // record. Left out on purpose: id and uuid (the copy is a new VM), devices
 // (made one by one), autostart (a restored VM never starts by itself) and
@@ -239,6 +241,21 @@ func (m *TrueNASManaged) Create(ctx context.Context, spec VMSpec) (*VM, error) {
 		}
 	}
 	payload["name"] = spec.Name
+	if u, _ := base["uuid"].(string); spec.ReuseUUID {
+		if !uuidRE.MatchString(u) {
+			return nil, errors.New("truenas: --reuse-uuid, but the backup's settings hold no valid UUID")
+		}
+		filter, _ := json.Marshal([][]any{{"uuid", "=", u}})
+		out, err := m.T.Midclt.Call(ctx, "vm.query", string(filter))
+		if err != nil {
+			return nil, err
+		}
+		var same []json.RawMessage
+		if json.Unmarshal(out, &same) != nil || len(same) > 0 {
+			return nil, fmt.Errorf("truenas: a VM with UUID %s exists already; restore without --reuse-uuid, or remove that VM first", u)
+		}
+		payload["uuid"] = u
+	}
 	payload["autostart"] = false
 	if spec.Memory > 0 {
 		payload["memory"] = spec.Memory >> 20 // TrueNAS counts MiB

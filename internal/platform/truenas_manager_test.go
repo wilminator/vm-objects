@@ -20,15 +20,16 @@ import (
 // follows vm.start and vm.stop, and which records what vm.create and
 // vm.device.create were asked.
 type stateMidclt struct {
-	state    string
-	calls    []string
-	jobs     []string
-	created  map[string]any
-	devices  []map[string]any
-	deleted  []string
-	failDev  string // a device type whose creation fails
-	stopStay bool   // vm.stop leaves the VM running (a guest that ignores it)
-	exists   bool   // a VM named "Copy" already exists
+	state     string
+	calls     []string
+	jobs      []string
+	created   map[string]any
+	devices   []map[string]any
+	deleted   []string
+	failDev   string // a device type whose creation fails
+	stopStay  bool   // vm.stop leaves the VM running (a guest that ignores it)
+	exists    bool   // a VM named "Copy" already exists
+	uuidTaken string // a VM with this UUID exists
 }
 
 func (f *stateMidclt) Call(ctx context.Context, method string, args ...string) ([]byte, error) {
@@ -38,6 +39,9 @@ func (f *stateMidclt) Call(ctx context.Context, method string, args ...string) (
 		var filter [][]any
 		json.Unmarshal([]byte(args[0]), &filter)
 		f0 := filter[0]
+		if f0[0] == "uuid" && f.uuidTaken != "" && f0[2] == f.uuidTaken {
+			return []byte(`[{"id":4,"name":"Other","uuid":"` + f.uuidTaken + `"}]`), nil
+		}
 		if f0[0] == "name" && f0[2] == "Games" || f0[0] == "id" && f0[2] == float64(3) {
 			return []byte(fmt.Sprintf(`[{"id":3,"name":"Games","uuid":"u-3","status":{"state":%q}}]`, f.state)), nil
 		}
@@ -208,5 +212,37 @@ func TestTrueNASManagedRefusesOtherMethods(t *testing.T) {
 		if _, err := m.call(context.Background(), bad, 1); err == nil {
 			t.Errorf("%s was allowed", bad)
 		}
+	}
+}
+
+// A restore makes a new UUID by default; --reuse-uuid keeps the original's
+// (the guest's SMBIOS UUID), unless another VM already holds it.
+func TestTrueNASManagedReuseUUID(t *testing.T) {
+	const orig = "0a1b2c3d-1111-4222-8333-444455556666"
+	var rec map[string]any
+	cfg, _ := trueNASConfig(json.RawMessage(tnVMQuery[1 : len(tnVMQuery)-1]))
+	json.Unmarshal(cfg, &rec)
+	rec["uuid"] = orig
+	cfg, _ = json.Marshal(rec)
+	spec := VMSpec{Name: "Copy", Memory: 4096 << 20, UEFI: true,
+		Disks: []DiskSpec{{Target: "vda", Path: "/dev/zvol/tank/vms/copy"}}, Definition: cfg, DefinitionType: "truenas"}
+
+	f := &stateMidclt{state: "STOPPED"}
+	if _, err := newManaged(f).Create(context.Background(), spec); err != nil || f.created["uuid"] != nil {
+		t.Fatalf("default: %v, uuid %v", err, f.created["uuid"])
+	}
+	spec.ReuseUUID = true
+	f = &stateMidclt{state: "STOPPED"}
+	if _, err := newManaged(f).Create(context.Background(), spec); err != nil || f.created["uuid"] != orig {
+		t.Fatalf("reuse: %v, uuid %v", err, f.created["uuid"])
+	}
+	f = &stateMidclt{state: "STOPPED", uuidTaken: orig}
+	if _, err := newManaged(f).Create(context.Background(), spec); err == nil || f.created != nil {
+		t.Fatalf("a taken UUID was reused: %v", err)
+	}
+	spec.Definition = nil
+	f = &stateMidclt{state: "STOPPED"}
+	if _, err := newManaged(f).Create(context.Background(), spec); err == nil {
+		t.Fatal("reuse without a saved UUID was allowed")
 	}
 }
