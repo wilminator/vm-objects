@@ -267,8 +267,21 @@ func RegisterQNAPSnapshots(ctx context.Context, plan *QNAPPlan, definition strin
 		return nil, err
 	}
 	domain := stripXMLDecl(data)
+	// Virtualization Station decides which snapshot owns a layer from the
+	// disk its record's embedded definition names: the layer the snapshot
+	// FROZE, not the live top. With the top in every record, VS saw every
+	// history layer as unowned and merged them all into the base the first
+	// time it deleted a snapshot (nas-ops #7, Nov 11).
+	frozen, err := frozenLayers(plan, dom)
+	if err != nil {
+		return nil, err
+	}
 	for i, r := range plan.Records {
-		rec, err := r.Marshal(domain)
+		recDomain, err := vmdef.Rewrite(domain, vmdef.Changes{Disks: frozen[i]})
+		if err != nil {
+			return paths[:i], fmt.Errorf("snapshot %d: %w", r.Epoch, err)
+		}
+		rec, err := r.Marshal(recDomain)
 		if err != nil {
 			return paths[:i], err
 		}
@@ -277,6 +290,42 @@ func RegisterQNAPSnapshots(ctx context.Context, plan *QNAPPlan, definition strin
 		}
 	}
 	return paths, nil
+}
+
+// frozenLayers gives, for each record, each disk's change to the embedded
+// definition: its source is the layer that snapshot froze (the previous
+// snapshot's overlay, or the base image for the first), with the chain
+// below it. The disk's layers are read from the top layer's headers, and
+// each record's overlay must be where the chain says.
+func frozenLayers(plan *QNAPPlan, dom *vmdef.Domain) ([]map[string]vmdef.DiskChange, error) {
+	out := make([]map[string]vmdef.DiskChange, len(plan.Records))
+	for i := range out {
+		out[i] = map[string]vmdef.DiskChange{}
+	}
+	for target, top := range plan.Tops {
+		chain, err := source.QCOW2Chain(top) // top first, base last
+		if err != nil {
+			return nil, fmt.Errorf("disk %s: reading the layers under %s: %w", target, top, err)
+		}
+		if len(chain) != len(plan.Records)+1 {
+			return nil, fmt.Errorf("disk %s: %d layers under the top, but %d snapshot records", target, len(chain)-1, len(plan.Records))
+		}
+		up := make([]source.Layer, len(chain)) // base first
+		for i, l := range chain {
+			up[len(chain)-1-i] = l
+		}
+		for k, r := range plan.Records {
+			if ov, ok := r.Overlays[target]; ok && !sameFile(ov, up[k+1].Path) {
+				return nil, fmt.Errorf("disk %s: snapshot %d starts %s, but the chain has %s there", target, r.Epoch, ov, up[k+1].Path)
+			}
+			var below []vmdef.BackingLayer
+			for j := k - 1; j >= 0; j-- {
+				below = append(below, vmdef.BackingLayer{Path: up[j].Path, Format: up[j].Format})
+			}
+			out[k][target] = vmdef.DiskChange{Path: up[k].Path, Format: up[k].Format, SetBacking: true, Backing: below}
+		}
+	}
+	return out, nil
 }
 
 func stripXMLDecl(b []byte) []byte {
