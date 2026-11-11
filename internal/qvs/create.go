@@ -8,6 +8,7 @@ package qvs
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net/http"
 	"path"
@@ -32,6 +33,10 @@ type CreateSpec struct {
 	Memory  int64 // bytes
 	Disks   []CreateDisk
 	Bridges []string // one NIC per bridge
+	// Folder is the VM's own folder, a plain path under a share. VS (on
+	// QTS) keeps the VM's meta folder inside it and answers HTTP 500
+	// "'meta_path'" without it. Empty: the folder of the first disk.
+	Folder string
 }
 
 // CreateDisk is an existing image to attach.
@@ -46,6 +51,8 @@ type CreateDisk struct {
 // create without them was refused field by field.
 type createVM struct {
 	Name           string          `json:"name"`
+	UUID           string          `json:"uuid"`      // fresh; VS names the meta folder after it
+	MetaPath       string          `json:"meta_path"` // the VM's folder, a plain /share/... path
 	OSType         string          `json:"os_type"`
 	BIOS           string          `json:"bios"`
 	Machine        string          `json:"machine,omitempty"` // empty: VS picks one its QEMU supports
@@ -89,6 +96,31 @@ type createGraphic struct {
 	EnablePassword bool   `json:"enable_password"`
 }
 
+// newUUID returns a random (version 4) UUID.
+func newUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
+}
+
+// FolderPath checks a plain folder path under a share (/share/VMs/x, or
+// its /share/CACHEDEV1_DATA/VMs/x form) and returns it as /share/VMs/x,
+// the form VS keeps for a VM's meta folder.
+func FolderPath(p string) (string, error) {
+	sp, err := SharedPath(p + "/x") // same checks as a file inside the folder
+	if err != nil {
+		return "", err
+	}
+	if strings.Count(sp, "/") < 4 { // shared://VMs/x/x: a folder inside a share, not the share itself
+		return "", fmt.Errorf("qvs: %q is a share, not a VM folder inside one", p)
+	}
+	return "/share/" + strings.TrimSuffix(strings.TrimPrefix(sp, "shared://"), "/x"), nil
+}
+
 var vmNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$`)
 var shareDataRE = regexp.MustCompile(`^/share/CACHEDEV[0-9]+_DATA/`)
 var busRE = regexp.MustCompile(`^(virtio|sata|ide|scsi)$`)
@@ -127,7 +159,19 @@ func (c *Client) CreateVM(ctx context.Context, s CreateSpec) (*VM, error) {
 	if s.Cores < 1 || s.Cores > 256 || s.Memory < 256<<20 || len(s.Disks) == 0 {
 		return nil, fmt.Errorf("qvs: a VM needs cores, at least 256 MiB of memory and a disk")
 	}
-	in := createVM{Name: s.Name, OSType: s.OSType, BIOS: "seabios", Machine: s.Machine, Cores: s.Cores, Memory: s.Memory,
+	folder := s.Folder
+	if folder == "" {
+		folder = path.Dir(s.Disks[0].Path)
+	}
+	meta, err := FolderPath(folder)
+	if err != nil {
+		return nil, err
+	}
+	uuid, err := newUUID()
+	if err != nil {
+		return nil, err
+	}
+	in := createVM{Name: s.Name, UUID: uuid, MetaPath: meta, OSType: s.OSType, BIOS: "seabios", Machine: s.Machine, Cores: s.Cores, Memory: s.Memory,
 		AutoStart: "off", AutoStartDelay: 0, Ballooning: 0, BalloonRsvd: 268435456, CPUModel: "host",
 		HotPlugCPU: false, Keymap: "en-us", MemorySharing: true, USB: "3", VideoType: "qxl", IsAgentEnabled: true,
 		Adapters: []createAdapter{}, CDROMs: []struct{}{},
