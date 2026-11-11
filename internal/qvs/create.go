@@ -40,17 +40,33 @@ type CreateDisk struct {
 	Bus  string // virtio, sata, ide, scsi
 }
 
+// createVM holds every field VS 4.2's CreateVMSerializer requires, with
+// the values VS itself stores for a VM made in its UI (read from the
+// serializer's code and from a real VM's record, nas-ops #7). The first
+// create without them was refused field by field.
 type createVM struct {
-	Name     string          `json:"name"`
-	OSType   string          `json:"os_type"`
-	BIOS     string          `json:"bios"`
-	Machine  string          `json:"machine,omitempty"`
-	Cores    int             `json:"cores"`
-	Memory   int64           `json:"memory"`
-	Disks    []createDisk    `json:"disks"`
-	Adapters []createAdapter `json:"adapters"`
-	Graphics []createGraphic `json:"graphics"`
-	CDROMs   []struct{}      `json:"cdroms"`
+	Name           string          `json:"name"`
+	OSType         string          `json:"os_type"`
+	BIOS           string          `json:"bios"`
+	Machine        string          `json:"machine,omitempty"` // empty: VS picks one its QEMU supports
+	Cores          int             `json:"cores"`
+	Memory         int64           `json:"memory"`
+	AutoStart      string          `json:"auto_start"` // off: a restored VM never starts by itself
+	AutoStartDelay int             `json:"auto_start_delay"`
+	Ballooning     int             `json:"ballooning"`      // 0: off
+	BalloonRsvd    int64           `json:"ballooning_rsvd"` // VS's default
+	CPUModel       string          `json:"cpu_model"`
+	HotPlugCPU     bool            `json:"hot_plug_cpu"`
+	Keymap         string          `json:"keymap"`
+	MemorySharing  bool            `json:"memory_sharing"`
+	USB            string          `json:"usb"`
+	VideoType      string          `json:"video_type"`
+	IsAgentEnabled bool            `json:"is_agent_enabled"`
+	Sound          *string         `json:"sound"` // required, but null for none
+	Disks          []createDisk    `json:"disks"`
+	Adapters       []createAdapter `json:"adapters"`
+	Graphics       []createGraphic `json:"graphics"`
+	CDROMs         []struct{}      `json:"cdroms"`
 }
 
 type createDisk struct {
@@ -112,6 +128,8 @@ func (c *Client) CreateVM(ctx context.Context, s CreateSpec) (*VM, error) {
 		return nil, fmt.Errorf("qvs: a VM needs cores, at least 256 MiB of memory and a disk")
 	}
 	in := createVM{Name: s.Name, OSType: s.OSType, BIOS: "seabios", Machine: s.Machine, Cores: s.Cores, Memory: s.Memory,
+		AutoStart: "off", AutoStartDelay: 0, Ballooning: 0, BalloonRsvd: 268435456, CPUModel: "host",
+		HotPlugCPU: false, Keymap: "en-us", MemorySharing: true, USB: "3", VideoType: "qxl", IsAgentEnabled: true,
 		Adapters: []createAdapter{}, CDROMs: []struct{}{},
 		Graphics: []createGraphic{{Type: "vnc", LocalhostOnly: true, EnablePassword: false}}}
 	if s.UEFI {

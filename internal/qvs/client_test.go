@@ -95,6 +95,19 @@ func (f *fakeVS) handler() http.Handler {
 			}
 			ok(w, vms)
 		case p == "/qvs/v2/vms" && r.Method == http.MethodPost:
+			var got map[string]any
+			json.Unmarshal(body, &got)
+			missing := map[string][]string{}
+			for _, k := range []string{"auto_start", "auto_start_delay", "ballooning", "ballooning_rsvd", "bios", "cores", "cpu_model",
+				"hot_plug_cpu", "keymap", "memory", "memory_sharing", "name", "usb", "video_type", "os_type", "is_agent_enabled", "sound"} {
+				if _, ok := got[k]; !ok {
+					missing[k] = []string{"This field is required."}
+				}
+			}
+			if len(missing) > 0 {
+				json.NewEncoder(w).Encode(map[string]any{"status": 1, "detail": missing})
+				return
+			}
 			f.newVM, f.made = body, true
 			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{"id": 3, "state": "waiting"}})
 		case p == "/qvs/vms/21" && r.Method == http.MethodGet:
@@ -426,5 +439,46 @@ func TestSessionExpiryLogsInAgain(t *testing.T) {
 	}
 	if f.logins != 3 {
 		t.Fatalf("%d logins: it should log in once more, not loop", f.logins)
+	}
+}
+
+// The create payload carries every field VS requires, with VS's own values,
+// "sound" as an explicit null, no machine type (VS picks one its QEMU
+// knows) and nothing that starts the VM or sets a password.
+func TestCreateVMPayloadHasTheRequiredFields(t *testing.T) {
+	f := &fakeVS{password: "p"}
+	c, err := login(t, f, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.CreateVM(context.Background(), CreateSpec{Name: "WinGames-restored", OSType: "win11", UEFI: true,
+		Cores: 4, Memory: 8 << 30,
+		Disks: []CreateDisk{{Path: "/share/VMs/x/WinGames-m9-vda.qcow2", Bus: "virtio"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(f.newVM, &got); err != nil {
+		t.Fatalf("the fake VS refused the payload (%v): %s", err, f.newVM)
+	}
+	if v, ok := got["sound"]; !ok || v != nil {
+		t.Errorf("sound must be an explicit null: %v", got["sound"])
+	}
+	if got["auto_start"] != "off" || got["keymap"] != "en-us" || got["cpu_model"] != "host" || got["bios"] != "ovmf" {
+		t.Errorf("payload %v", got)
+	}
+	if _, ok := got["machine"]; ok {
+		t.Errorf("machine %v was sent; VS should pick its own", got["machine"])
+	}
+	if strings.Contains(string(f.newVM), "password\":\"") {
+		t.Errorf("a password was sent: %s", f.newVM)
+	}
+}
+
+// Field errors come back as an object; every field name is in the error.
+func TestCreateRefusalNamesEveryField(t *testing.T) {
+	e := envelope{Detail: json.RawMessage(`{"auto_start":["This field is required."],"keymap":["This field is required."],"zzz_last":["x"]}`)}
+	if got := clean(e.text()); !strings.Contains(got, "auto_start") || !strings.Contains(got, "zzz_last") {
+		t.Fatalf("%s", got)
 	}
 }
