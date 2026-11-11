@@ -146,7 +146,7 @@ func (m *TrueNASManaged) Start(ctx context.Context, vm *VM) error {
 	if st, err := normalState(s.Status.State); err == nil && st == StateRunning {
 		return nil
 	}
-	_, err = m.call(ctx, mVMStart, s.ID)
+	_, err = m.call(ctx, mVMStart, s.ID, map[string]any{"overcommit": false})
 	return err
 }
 
