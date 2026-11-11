@@ -178,6 +178,30 @@ type DiskChange struct {
 	// AsFile turns a block disk into a file disk (a zvol restored to an
 	// image file).
 	AsFile bool
+	// SetBacking, instead of dropping the old backing chain, replaces it
+	// with Backing (the layers below the disk's source, nearest first; none
+	// for a standalone image). Snapshot records need it: Virtualization
+	// Station decides which snapshot owns a layer from the disk the
+	// record's embedded definition names.
+	SetBacking bool
+	Backing    []BackingLayer
+}
+
+// BackingLayer is one image below a disk's source.
+type BackingLayer struct {
+	Path   string
+	Format string // qcow2 or raw
+}
+
+// backingXML writes the nested <backingStore> elements for layers.
+func backingXML(layers []BackingLayer, indent string) string {
+	if len(layers) == 0 {
+		return "<backingStore/>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "<backingStore type='file'>\n%s  <format type='%s'/>\n%s  <source file='%s'/>\n%s  %s\n%s</backingStore>",
+		indent, escape(layers[0].Format), indent, escape(layers[0].Path), indent, backingXML(layers[1:], indent+"  "), indent)
+	return b.String()
 }
 
 // edit replaces data[start:end] with text.
@@ -343,7 +367,16 @@ func diskEdits(data []byte, disk, driver, source, backing tagSpan, c DiskChange)
 	// (qcow2 layers that the restore has already flattened) must go: left
 	// in, it describes files the new disk does not use. The line it sat
 	// on goes with it.
-	if backing.ok() {
+	if c.SetBacking {
+		// Disk elements are indented four spaces under <devices>; the
+		// backing chain sits one level inside them.
+		text := backingXML(c.Backing, "      ")
+		if backing.ok() {
+			edits = append(edits, edit{backing.start, backing.end, text})
+		} else {
+			edits = append(edits, edit{source.end, source.end, "\n      " + text})
+		}
+	} else if backing.ok() {
 		start := backing.start
 		for start > 0 && (data[start-1] == ' ' || data[start-1] == '\t') {
 			start--

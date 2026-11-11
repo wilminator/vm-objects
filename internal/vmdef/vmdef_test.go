@@ -215,3 +215,49 @@ func TestRewriteDropsBackingChain(t *testing.T) {
 		t.Fatalf("hdb's empty <backingStore/> not removed cleanly:\n%s", s)
 	}
 }
+
+// A snapshot record's embedded definition names the layer the snapshot
+// froze, with the chain below it; the live top and its chain are replaced.
+func TestRewriteSetsTheBackingChain(t *testing.T) {
+	const in = `<domain type='kvm'>
+  <name>W</name>
+  <uuid>7240004c-9f00-4aca-8577-8987c8073490</uuid>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/v/W-vda.qcow2'/>
+      <backingStore type='file'>
+        <format type='qcow2'/>
+        <source file='/v/W-vda.2'/>
+        <backingStore type='file'>
+          <format type='qcow2'/>
+          <source file='/v/W-vda.1'/>
+          <backingStore type='file'>
+            <format type='raw'/>
+            <source file='/v/W-vda.img'/>
+            <backingStore/>
+          </backingStore>
+        </backingStore>
+      </backingStore>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>`
+	out, err := Rewrite([]byte(in), Changes{Disks: map[string]DiskChange{"vda": {
+		Path: "/v/W-vda.1", Format: "qcow2", SetBacking: true,
+		Backing: []BackingLayer{{Path: "/v/W-vda.img", Format: "raw"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "W-vda.qcow2") || strings.Contains(s, "W-vda.2") || !strings.Contains(s, "<source file='/v/W-vda.1'/>") ||
+		strings.Count(s, "<backingStore") != 2 || !strings.Contains(s, "<format type='raw'/>") || !strings.Contains(s, "<backingStore/>") {
+		t.Fatalf("chain:\n%s", s)
+	}
+	// A base image: no layers below.
+	base, err := Rewrite([]byte(in), Changes{Disks: map[string]DiskChange{"vda": {Path: "/v/W-vda.img", Format: "raw", SetBacking: true}}})
+	if err != nil || strings.Count(string(base), "backingStore") != 1 || !strings.Contains(string(base), "<backingStore/>") ||
+		!strings.Contains(string(base), "type='raw'") {
+		t.Fatalf("base: %v\n%s", err, base)
+	}
+}

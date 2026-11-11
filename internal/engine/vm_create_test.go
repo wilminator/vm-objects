@@ -13,6 +13,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +92,24 @@ func TestRestoreVMCreatesTheVM(t *testing.T) {
 	recs, _ := filepath.Glob(filepath.Join(dir, ".11111111-2222-3333-4444-555555555555.meta", "snapshot", "*.xml"))
 	if len(recs) != 2 {
 		t.Fatalf("records %v", recs)
+	}
+	// Each record's embedded definition names the layer that snapshot
+	// FROZE (VS owns a layer by that), not the live top: the first the
+	// base image, the next the first snapshot's overlay.
+	sort.Strings(recs)
+	var overlay, frozen []string
+	for _, rp := range recs {
+		b, _ := os.ReadFile(rp)
+		x := string(b)
+		disks, domain, _ := strings.Cut(x, "</disks>")
+		overlay = append(overlay, regexp.MustCompile(`<source file='([^']+)'`).FindStringSubmatch(disks)[1])
+		frozen = append(frozen, regexp.MustCompile(`(?s)<disk[^>]*device='disk'.*?<source file='([^']+)'`).FindStringSubmatch(domain)[1])
+		if strings.Contains(domain, "-vda.qcow2'") && !strings.Contains(domain, "<backingStore") {
+			t.Fatalf("record %s embeds the live top with no chain:\n%s", rp, domain)
+		}
+	}
+	if !strings.HasSuffix(frozen[0], ".img") || frozen[1] != overlay[0] {
+		t.Fatalf("frozen layers %v, overlays %v", frozen, overlay)
 	}
 	notes, _ := os.ReadFile(filepath.Join(dir, "RESTORE.txt"))
 	if !strings.HasPrefix(string(notes), "vmobj created this VM") {
