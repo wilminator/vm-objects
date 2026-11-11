@@ -1160,7 +1160,9 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	restoreQVS := fs.String("qvs-credentials", "", "with --create: Virtualization Station's credentials file ([qvs] url, username, password; mode 600)")
 	osType := fs.String("os-type", "", "with --create: Virtualization Station's OS type, such as win11 (its list: GET /qvs/os_types)")
 	var bridges repeated
-	fs.Var(&bridges, "bridge", "with --create: add a NIC on this bridge (repeatable; the QNAP's own bridge names)")
+	fs.Var(&bridges, "bridge", "with --create: add a NIC on this bridge (repeatable; the QNAP's own bridge names; on TrueNAS, its NIC choices such as br0 or enp6s0: without one the NIC the original had is kept)")
+	pool := fs.String("pool", "", "with --platform truenas --create: the dataset the new zvols go under, such as fast/vms (each disk becomes POOL/<name>-<disk>)")
+	reuseUUID := fs.Bool("reuse-uuid", false, "with --platform truenas --create: keep the original VM's UUID (the guest's SMBIOS UUID) instead of making a new one; for a real restore, when the original is gone")
 	request := fs.Bool("request-restore", false, "ask S3 to restore archived objects this restore needs")
 	tierFlag := fs.String("tier", "bulk", "retrieval speed for --request-restore: bulk, standard or expedited")
 	days := fs.Int("days", 7, "days the restored copies stay readable")
@@ -1190,7 +1192,18 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	start := time.Now()
 	report, stopReport := restoreProgress(pc, *to, "")
 	ro := engine.RestoreVMOptions{Target: target, Repo: r, VM: *vm, Record: *record, Dir: *to, NewName: *newName, Progress: report, History: *history}
-	if *create {
+	if *create && target == "truenas" {
+		p, err := platform.New("truenas", platform.LibvirtConfig{})
+		if err != nil {
+			return err
+		}
+		tn := p.(*platform.TrueNAS)
+		ro.Create, ro.Manager, ro.Bridges = true, platform.NewTrueNASManaged(tn), bridges
+		ro.Pool, ro.ReuseUUID = *pool, *reuseUUID
+		if h, err := tn.HostInfo(ctx); err == nil {
+			ro.TargetHost = h
+		}
+	} else if *create {
 		if *restoreQVS == "" {
 			return errors.New("restore-vm: --create needs --qvs-credentials")
 		}
@@ -1219,6 +1232,13 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 		fmt.Println("  Resumed:   continued an interrupted restore into this folder; finished disks were checked, not fetched again")
 	}
 	fmt.Printf("Definition: %s\n", st.Definition)
+	if st.Created != nil {
+		fmt.Printf("Created the VM %q (UUID %s) and did not start it. Read RESTORE.txt in that folder for what is left.\n", st.Created.Name, st.Created.UUID)
+		if st.Registered > 0 {
+			fmt.Printf("  Registered %d snapshots.\n", st.Registered)
+		}
+		return nil
+	}
 	fmt.Println("Nothing was registered with libvirt. Read RESTORE.txt in that folder for the next steps.")
 	return nil
 }

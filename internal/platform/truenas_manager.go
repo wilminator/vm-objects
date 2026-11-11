@@ -183,6 +183,23 @@ func (m *TrueNASManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration
 	}
 }
 
+// CheckTrueNASName reports whether TrueNAS accepts name for a VM.
+func CheckTrueNASName(name string) error {
+	if !trueNASName.MatchString(name) {
+		return fmt.Errorf("truenas: %q can't be a TrueNAS VM name (letters, digits and '_', up to 63); pick another with --new-name", name)
+	}
+	return nil
+}
+
+// NameFree reports an error if a VM with this name exists already, so a
+// restore can refuse before it writes anything.
+func (m *TrueNASManaged) NameFree(ctx context.Context, name string) error {
+	if _, _, err := m.T.lookup(ctx, name); err == nil {
+		return fmt.Errorf("truenas: a VM named %q already exists; pick another with --new-name", name)
+	}
+	return nil
+}
+
 // trueNASName is what TrueNAS accepts as a VM's name.
 var trueNASName = regexp.MustCompile(`^[A-Za-z0-9_]{1,63}$`)
 
@@ -340,5 +357,5 @@ func (m *TrueNASManaged) Create(ctx context.Context, spec VMSpec) (*VM, error) {
 			return fail(fmt.Errorf("truenas: adding the %v device: %w", a["dtype"], err))
 		}
 	}
-	return &VM{Name: spec.Name, UUID: made.UUID, Skipped: skipped}, nil
+	return &VM{Name: spec.Name, UUID: made.UUID, Domain: fmt.Sprintf("%d_%s", made.ID, spec.Name), Skipped: skipped}, nil
 }
