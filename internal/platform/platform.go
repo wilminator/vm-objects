@@ -28,8 +28,11 @@ import (
 
 // VM is a platform's description of one VM, taken at one moment.
 type VM struct {
-	Name    string // the platform's name for it
-	UUID    string
+	Name string // the platform's name for it
+	UUID string
+	// Domain is the VM's name in libvirt when that differs from Name
+	// (TrueNAS's is "<id>_<name>"). Empty: the same as Name.
+	Domain  string
 	Running bool
 	// Definition is what restoring needs to recreate the VM on this
 	// platform. It is stored as is; only the same platform's module

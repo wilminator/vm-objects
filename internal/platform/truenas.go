@@ -216,3 +216,20 @@ func withoutPasswords(v any) any {
 	}
 	return v
 }
+
+// HostInfo reports TrueNAS's version and the libvirt and QEMU it runs. The
+// swtpm and libtpms versions are added when their commands are known
+// (nas-ops #7); until then they are left empty, and a restore says it
+// couldn't compare TPM state.
+func (t *TrueNAS) HostInfo(ctx context.Context) (*manifest.HostInfo, error) {
+	h := &manifest.HostInfo{Platform: "truenas"}
+	if out, err := t.Midclt.Call(ctx, "system.version"); err == nil {
+		h.PlatformVersion = strings.Trim(strings.TrimSpace(string(out)), `"`)
+	}
+	if out, err := t.Virsh.Run(ctx, "version"); err == nil {
+		h.Libvirt, h.QEMU = ParseVirshVersion(out)
+	} else if h.PlatformVersion == "" {
+		return nil, fmt.Errorf("reading TrueNAS's version: %w", err)
+	}
+	return h, nil
+}

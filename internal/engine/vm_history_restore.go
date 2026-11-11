@@ -305,6 +305,9 @@ func sameFile(a, b string) bool {
 // the restored disks, and registers its snapshot history. It never
 // starts it.
 func createRestoredVM(ctx context.Context, o RestoreVMOptions, rec *manifest.VMRecord, def []byte, name string, st *RestoreVMStats) error {
+	if o.Target == "truenas" {
+		return createTrueNASVM(ctx, o, rec, name, st)
+	}
 	hw, err := vmdef.ParseHardware(def)
 	if err != nil {
 		return err
@@ -377,7 +380,7 @@ func createOnly(ctx context.Context, o RestoreVMOptions, rec *manifest.VMRecord,
 	if o.NewName != "" {
 		name = o.NewName
 	}
-	st := &RestoreVMStats{Disks: map[string]string{}, Record: rec, Resumed: true,
+	st := &RestoreVMStats{Disks: map[string]string{}, Record: rec,
 		Definition: filepath.Join(dir, name+".xml")}
 	def, err := os.ReadFile(st.Definition)
 	if err != nil {

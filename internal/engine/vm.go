@@ -542,6 +542,20 @@ type RestoreVMOptions struct {
 	Manager    platform.Manager
 	OSType     string
 	Bridges    []string
+
+	// TrueNAS (--platform truenas with Create): the disks are restored onto
+	// new zvols named Pool/<name>-<disk> (Pool is a dataset such as
+	// "fast/vms"), and the VM is made from the backup's TrueNAS settings.
+	// ReuseUUID keeps the original's UUID instead of making a new one.
+	Pool      string
+	ReuseUUID bool
+	// ZFS runs zfs (nil: the real one); ZvolDir is where zvols appear as
+	// devices (default /dev/zvol); NVRAMDir and SwtpmDir are where TrueNAS
+	// keeps each VM's UEFI variables and TPM state (default: its own).
+	ZFS      source.ZFSRunner
+	ZvolDir  string
+	NVRAMDir string
+	SwtpmDir string
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -643,16 +657,27 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	if o.Target == "qnap" {
 		ext = ".img"
 	}
+	var zvols map[string]string // TrueNAS: each disk's new zvol (dataset name)
 	if o.Create {
 		switch {
-		case o.Target != "qnap":
-			return nil, errors.New("restore-vm --create works with Virtualization Station (--platform qnap) for now")
-		case o.Manager == nil:
+		case o.Target != "qnap" && o.Target != "truenas":
+			return nil, errors.New("restore-vm --create works with Virtualization Station (--platform qnap) or TrueNAS (--platform truenas)")
+		case o.Manager == nil && o.Target == "qnap":
 			return nil, errors.New("restore-vm --create needs the platform's API (--qvs-credentials)")
-		case o.OSType == "":
+		case o.Manager == nil:
+			return nil, errors.New("restore-vm --create needs TrueNAS's middleware (midclt)")
+		case o.Target == "qnap" && o.OSType == "":
 			return nil, errors.New("restore-vm --create needs --os-type (Virtualization Station's OS type, such as win11)")
-		case resuming:
+		case o.Target == "qnap" && resuming:
 			return nil, fmt.Errorf("%s holds an unfinished restore; to create the VM, restore into a new folder", dir)
+		}
+		if o.Target == "truenas" {
+			if o.History {
+				return nil, errors.New("restore-vm --history isn't available with --platform truenas yet; restore-history rebuilds one disk's snapshots on a zvol")
+			}
+			if zvols, err = checkTrueNASRestore(ctx, o, rec, name, resuming); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if o.History {
@@ -670,6 +695,15 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 	for _, d := range rec.Disks {
 		if o.History {
 			break
+		}
+		if o.Create && o.Target == "truenas" {
+			path, err := restoreTrueNASDisk(ctx, o, d, zvols[d.Target], resuming, st)
+			if err != nil {
+				return nil, fmt.Errorf("disk %s: %w\nRun the same restore-vm again to continue it", d.Target, err)
+			}
+			st.Disks[d.Target] = path
+			changes.Disks[d.Target] = vmdef.DiskChange{Path: path, Format: "raw", AsFile: false}
+			continue
 		}
 		if o.Create {
 			// The platform takes qcow2 images (QNAP's does).
@@ -749,7 +783,9 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 		}
 	}
 	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles, o.TargetHost)
-	if st.Created != nil {
+	if o.Create && o.Target == "truenas" {
+		notes = trueNASCreatedNotes(o, rec, st, dir, tpmFiles)
+	} else if st.Created != nil {
 		head := fmt.Sprintf("vmobj created this VM in Virtualization Station as %q (UUID %s), on the\nrestored disks, and did not start it.", st.Created.Name, st.Created.UUID)
 		if st.Registered > 0 {
 			head += fmt.Sprintf(" Its %d snapshots are registered.", st.Registered)
