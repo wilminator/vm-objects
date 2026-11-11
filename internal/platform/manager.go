@@ -73,6 +73,10 @@ type VMSpec struct {
 	TPM      bool
 	Disks    []DiskSpec
 	Networks []string // bridge or network names, one per NIC
+	// ReuseUUID keeps the original's UUID (the guest sees it as its SMBIOS
+	// UUID, and licensing can be tied to it). Off, the platform makes a new
+	// one. Only for a real restore: two VMs with one UUID clash.
+	ReuseUUID bool
 	// Definition is the original's definition, for settings a platform
 	// can carry over beyond the fields above.
 	Definition     []byte
