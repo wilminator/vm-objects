@@ -250,6 +250,21 @@ type envelope struct {
 
 // call sends JSON to a route and decodes the reply's data into out.
 func (c *Client) call(ctx context.Context, method, route string, in, out any) error {
+	err := c.callOnce(ctx, method, route, in, out)
+	if err == nil || !errors.Is(err, ErrNotLoggedIn) || c.sid == "" || route == routeCheck {
+		return err
+	}
+	// VS ends a session after a while, such as during a restore that takes
+	// hours. A request refused for want of a login did nothing, so it is
+	// safe to log in again and repeat it, once. A second refusal stands.
+	if lerr := c.Login(ctx); lerr != nil {
+		return fmt.Errorf("%w (and logging in again failed: %v)", err, lerr)
+	}
+	return c.callOnce(ctx, method, route, in, out)
+}
+
+// callOnce is one request, without the login retry.
+func (c *Client) callOnce(ctx context.Context, method, route string, in, out any) error {
 	var body []byte
 	if in != nil {
 		var err error

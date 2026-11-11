@@ -9,6 +9,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 // the new VM's definition into .<uuid>.meta beside its first disk.
 type fakeManager struct {
 	specs []platform.VMSpec
+	fail  error // Create fails with this, until it is cleared
 }
 
 func (m *fakeManager) State(context.Context, *platform.VM) (string, error) {
@@ -35,6 +37,9 @@ func (m *fakeManager) Stop(context.Context, *platform.VM, time.Duration, bool) e
 	return nil
 }
 func (m *fakeManager) Create(_ context.Context, spec platform.VMSpec) (*platform.VM, error) {
+	if m.fail != nil {
+		return nil, m.fail
+	}
 	m.specs = append(m.specs, spec)
 	uuid := "11111111-2222-3333-4444-555555555555"
 	meta := filepath.Join(filepath.Dir(spec.Disks[0].Path), "."+uuid+".meta")
@@ -135,5 +140,74 @@ func TestRestoreVMCreateWithoutHistory(t *testing.T) {
 		if _, err := RestoreVM(v.ctx, bad); err == nil {
 			t.Errorf("accepted %+v", bad)
 		}
+	}
+}
+
+// A long restore can finish its disks and then fail to create the VM (the
+// platform logged vmobj out meanwhile). --create-only then creates the VM
+// and registers the snapshots from the folder, without restoring again.
+func TestRestoreVMCreateOnly(t *testing.T) {
+	v := newVMHarness(t)
+	var log []string
+	z := &fakeZFS{devDir: filepath.Join(v.dir, "dev"), vols: map[string][]byte{}, snaps: map[string][]byte{}, log: &log}
+	disk := make([]byte, 512<<10)
+	rng := rand.New(rand.NewSource(72))
+	rng.Read(disk[:256<<10])
+	z.vols["tank/vms/win11-a"] = disk
+	v.virsh.xml = domainXML(zvolDisk("vda", "tank/vms/win11-a"), "")
+	v.virsh.state = "running"
+	for i, n := range []string{"installed", "updated"} {
+		rng.Read(disk[(i*100)<<10 : (i*100+6)<<10])
+		z.userSnapshot("tank/vms/win11-a@" + n)
+	}
+	o := v.opts(manifest.Full)
+	o.ZFS, o.ZFSDevDir, o.History = z, z.devDir, true
+	bst, err := BackupVM(v.ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(v.dir, "qnap")
+	ro := RestoreVMOptions{Repo: v.repo, VM: "win11", Record: bst.Record, Dir: dir, Target: "qnap",
+		History: true, Create: true, OSType: "win11", NewName: "win11-restored"}
+
+	// Nothing to create from yet.
+	ro.CreateOnly, ro.Manager = true, &fakeManager{}
+	if _, err := RestoreVM(v.ctx, ro); err == nil {
+		t.Fatal("--create-only worked on a folder with no restore")
+	}
+
+	// The restore writes everything, then the create fails.
+	broken := &fakeManager{fail: errors.New("qvs: not logged in")}
+	ro.CreateOnly, ro.Manager = false, broken
+	if _, err := RestoreVM(v.ctx, ro); err == nil || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, RestoreVMMarker)); err != nil {
+		t.Fatal("the folder should still be marked unfinished")
+	}
+	// Running it again without --create-only is still refused: no half-redo.
+	if _, err := RestoreVM(v.ctx, ro); err == nil {
+		t.Fatal("restarted a history restore in a used folder")
+	}
+
+	m := &fakeManager{}
+	ro.CreateOnly, ro.Manager = true, m
+	st, err := RestoreVM(v.ctx, ro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.specs) != 1 || st.Created == nil || st.Registered != 2 {
+		t.Fatalf("specs %d, created %+v, registered %d", len(m.specs), st.Created, st.Registered)
+	}
+	if _, err := os.Stat(filepath.Join(dir, RestoreVMMarker)); !os.IsNotExist(err) {
+		t.Fatal("the marker should be gone once the VM exists")
+	}
+	notes, _ := os.ReadFile(filepath.Join(dir, "RESTORE.txt"))
+	if !strings.HasPrefix(string(notes), "vmobj created this VM") {
+		t.Fatalf("RESTORE.txt:\n%s", notes)
+	}
+	// And it cannot be done twice.
+	if _, err := RestoreVM(v.ctx, ro); err == nil {
+		t.Fatal("created the VM a second time")
 	}
 }
