@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -106,6 +107,12 @@ func (f *fakeVS) handler() http.Handler {
 			}
 			if len(missing) > 0 {
 				json.NewEncoder(w).Encode(map[string]any{"status": 1, "detail": missing})
+				return
+			}
+			// As VS on QTS does: no meta_path is a KeyError, HTTP 500.
+			if mp, _ := got["meta_path"].(string); mp == "" {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]any{"status": 2, "detail": "'meta_path'"})
 				return
 			}
 			f.newVM, f.made = body, true
@@ -472,6 +479,29 @@ func TestCreateVMPayloadHasTheRequiredFields(t *testing.T) {
 	}
 	if strings.Contains(string(f.newVM), "password\":\"") {
 		t.Errorf("a password was sent: %s", f.newVM)
+	}
+	// The VM's folder, as a plain path, and a fresh UUID.
+	if got["meta_path"] != "/share/VMs/x" {
+		t.Errorf("meta_path %v", got["meta_path"])
+	}
+	if u, _ := got["uuid"].(string); !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(u) {
+		t.Errorf("uuid %v", got["uuid"])
+	}
+}
+
+func TestFolderPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/share/VMs/x":                  "/share/VMs/x",
+		"/share/CACHEDEV1_DATA/VMs/x/y": "/share/VMs/x/y",
+	} {
+		if got, err := FolderPath(in); err != nil || got != want {
+			t.Errorf("%s: %q %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"/share/VMs", "/etc/x", "/share/VMs/../x", "share/VMs/x", "/share/VMs/$x"} {
+		if got, err := FolderPath(bad); err == nil {
+			t.Errorf("%s accepted as %q", bad, got)
+		}
 	}
 }
 
