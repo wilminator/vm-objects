@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -95,6 +96,25 @@ func (f *fakeVS) handler() http.Handler {
 			}
 			ok(w, vms)
 		case p == "/qvs/v2/vms" && r.Method == http.MethodPost:
+			var got map[string]any
+			json.Unmarshal(body, &got)
+			missing := map[string][]string{}
+			for _, k := range []string{"auto_start", "auto_start_delay", "ballooning", "ballooning_rsvd", "bios", "cores", "cpu_model",
+				"hot_plug_cpu", "keymap", "memory", "memory_sharing", "name", "usb", "video_type", "os_type", "is_agent_enabled", "sound"} {
+				if _, ok := got[k]; !ok {
+					missing[k] = []string{"This field is required."}
+				}
+			}
+			if len(missing) > 0 {
+				json.NewEncoder(w).Encode(map[string]any{"status": 1, "detail": missing})
+				return
+			}
+			// As VS on QTS does: no meta_path is a KeyError, HTTP 500.
+			if mp, _ := got["meta_path"].(string); mp == "" {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]any{"status": 2, "detail": "'meta_path'"})
+				return
+			}
 			f.newVM, f.made = body, true
 			json.NewEncoder(w).Encode(map[string]any{"status": 8, "data": map[string]any{"id": 3, "state": "waiting"}})
 		case p == "/qvs/vms/21" && r.Method == http.MethodGet:
@@ -426,5 +446,69 @@ func TestSessionExpiryLogsInAgain(t *testing.T) {
 	}
 	if f.logins != 3 {
 		t.Fatalf("%d logins: it should log in once more, not loop", f.logins)
+	}
+}
+
+// The create payload carries every field VS requires, with VS's own values,
+// "sound" as an explicit null, no machine type (VS picks one its QEMU
+// knows) and nothing that starts the VM or sets a password.
+func TestCreateVMPayloadHasTheRequiredFields(t *testing.T) {
+	f := &fakeVS{password: "p"}
+	c, err := login(t, f, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.CreateVM(context.Background(), CreateSpec{Name: "WinGames-restored", OSType: "win11", UEFI: true,
+		Cores: 4, Memory: 8 << 30,
+		Disks: []CreateDisk{{Path: "/share/VMs/x/WinGames-m9-vda.qcow2", Bus: "virtio"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(f.newVM, &got); err != nil {
+		t.Fatalf("the fake VS refused the payload (%v): %s", err, f.newVM)
+	}
+	if v, ok := got["sound"]; !ok || v != nil {
+		t.Errorf("sound must be an explicit null: %v", got["sound"])
+	}
+	if got["auto_start"] != "off" || got["keymap"] != "en-us" || got["cpu_model"] != "host" || got["bios"] != "ovmf" {
+		t.Errorf("payload %v", got)
+	}
+	if _, ok := got["machine"]; ok {
+		t.Errorf("machine %v was sent; VS should pick its own", got["machine"])
+	}
+	if strings.Contains(string(f.newVM), "password\":\"") {
+		t.Errorf("a password was sent: %s", f.newVM)
+	}
+	// The VM's folder, as a plain path, and a fresh UUID.
+	if got["meta_path"] != "/share/VMs/x" {
+		t.Errorf("meta_path %v", got["meta_path"])
+	}
+	if u, _ := got["uuid"].(string); !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(u) {
+		t.Errorf("uuid %v", got["uuid"])
+	}
+}
+
+func TestFolderPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/share/VMs/x":                  "/share/VMs/x",
+		"/share/CACHEDEV1_DATA/VMs/x/y": "/share/VMs/x/y",
+	} {
+		if got, err := FolderPath(in); err != nil || got != want {
+			t.Errorf("%s: %q %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"/share/VMs", "/etc/x", "/share/VMs/../x", "share/VMs/x", "/share/VMs/$x"} {
+		if got, err := FolderPath(bad); err == nil {
+			t.Errorf("%s accepted as %q", bad, got)
+		}
+	}
+}
+
+// Field errors come back as an object; every field name is in the error.
+func TestCreateRefusalNamesEveryField(t *testing.T) {
+	e := envelope{Detail: json.RawMessage(`{"auto_start":["This field is required."],"keymap":["This field is required."],"zzz_last":["x"]}`)}
+	if got := clean(e.text()); !strings.Contains(got, "auto_start") || !strings.Contains(got, "zzz_last") {
+		t.Fatalf("%s", got)
 	}
 }

@@ -150,7 +150,7 @@ func (q *QNAPManaged) Stop(ctx context.Context, vm *VM, timeout time.Duration, f
 // Create defines a VM through Virtualization Station on existing qcow2
 // images under a share. It is never started.
 func (q *QNAPManaged) Create(ctx context.Context, spec VMSpec) (*VM, error) {
-	cs := qvs.CreateSpec{Name: spec.Name, OSType: spec.OSType, UEFI: spec.UEFI, Machine: spec.Machine,
+	cs := qvs.CreateSpec{Name: spec.Name, OSType: spec.OSType, UEFI: spec.UEFI, Machine: "", // the original's machine type may be newer than VS's QEMU; VS picks its own
 		Cores: spec.VCPUs, Memory: spec.Memory, Bridges: spec.Networks}
 	for _, d := range spec.Disks {
 		if d.Format != "" && d.Format != "qcow2" {

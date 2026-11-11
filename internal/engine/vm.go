@@ -231,6 +231,13 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (st *BackupVMStats, err er
 		Definition: dom.Definition, DefinitionType: dom.DefinitionType,
 		Consistency: stats.Consistency, Files: files, Skipped: stats.Skipped,
 	}
+	// Record what ran the VM, so a restore elsewhere can compare versions.
+	// A host that can't say leaves it out; the backup doesn't depend on it.
+	if hi, ok := plat.(platform.HostInfoer); ok {
+		if h, err := hi.HostInfo(ctx); err == nil {
+			rec.Host = h
+		}
+	}
 	for _, d := range disks {
 		var src source.Source
 		if layer, ok := frozen[d.Target]; ok {
@@ -497,10 +504,14 @@ func uniqueRecordName(ctx context.Context, r *repo.Repo, vm string, now time.Tim
 
 // RestoreVMOptions describe a whole-VM restore into a folder.
 type RestoreVMOptions struct {
-	Repo   *repo.Repo
-	VM     string
-	Record string
-	Dir    string // created; must be empty if it exists
+	// TargetHost is what the restore target runs, to compare with the
+	// backup's own (manifest.VMRecord.Host). Nil: not known, and the
+	// notes say what couldn't be checked.
+	TargetHost *manifest.HostInfo
+	Repo       *repo.Repo
+	VM         string
+	Record     string
+	Dir        string // created; must be empty if it exists
 	// NewName gives the restored VM a new name and drops its UUID, so it
 	// can be defined next to the original. Without it, defining the result
 	// replaces the original VM's definition on a host that still has it.
@@ -737,7 +748,7 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 			return st, err
 		}
 	}
-	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
+	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles, o.TargetHost)
 	if st.Created != nil {
 		head := fmt.Sprintf("vmobj created this VM in Virtualization Station as %q (UUID %s), on the\nrestored disks, and did not start it.", st.Created.Name, st.Created.UUID)
 		if st.Registered > 0 {
@@ -774,7 +785,11 @@ func (rd *Readiness) merge(o *Readiness) {
 }
 
 // restoreNotesFor writes RESTORE.txt for the platform the VM will run on.
-func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, name string, renamed, tpm bool) string {
+//
+// host is what the target runs (nil when unknown). Saved TPM state moves
+// forward only, so when the target's libtpms is older than the one that
+// wrote it, the notes don't ask for it to be copied: it can't load there.
+func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, name string, renamed, tpm bool, host *manifest.HostInfo) string {
 	var b strings.Builder
 	from := rec.Platform
 	if from == "" {
@@ -782,6 +797,19 @@ func restoreNotesFor(target string, rec *manifest.VMRecord, st *RestoreVMStats, 
 	}
 	fmt.Fprintf(&b, "Restored %s from backup %s (%s, taken %s, %s, made on %s).\n\n",
 		rec.DomainName, rec.Name, rec.Kind, rec.Created.Local().Format("2006-01-02 15:04"), rec.Consistency, from)
+	if tpm {
+		switch manifest.TPMState(rec.Host, host) {
+		case "skip":
+			fmt.Fprintf(&b, "TPM STATE IS NOT USED: it was written by libtpms %s (%s), and this host's\n", rec.Host.Libtpms, from)
+			fmt.Fprintf(&b, "libtpms %s is older and can't read it (QEMU would quit with \"TPM result for\n", host.Libtpms)
+			b.WriteString("CMD_INIT: 0x101\"). The VM gets a fresh TPM when it first starts: Windows asks\n")
+			b.WriteString("for the BitLocker recovery key, and Windows Hello PINs must be set up again.\n")
+			b.WriteString("The saved state stays in the restored folder in case it is needed later.\n\n")
+			tpm = false
+		case "load":
+			fmt.Fprintf(&b, "TPM state: written by libtpms %s, this host has %s, so it loads.\n\n", rec.Host.Libtpms, host.Libtpms)
+		}
+	}
 	dir := filepath.Dir(st.Definition)
 	var disks []string
 	for t := range st.Disks {

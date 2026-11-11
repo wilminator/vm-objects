@@ -49,6 +49,14 @@ type Platform interface {
 	Describe(ctx context.Context, vm string) (*VM, error)
 }
 
+// HostInfoer reports what the platform runs on: its name and the versions
+// of the parts whose saved state only moves forward. A backup records it
+// and a restore asks the target for the same, to compare (nas-ops #7). A
+// version the platform can't read is left empty.
+type HostInfoer interface {
+	HostInfo(ctx context.Context) (*manifest.HostInfo, error)
+}
+
 // Quiescer freezes a running guest's filesystems (through a guest agent)
 // so a snapshot taken meanwhile is consistent, and thaws them again.
 type Quiescer interface {

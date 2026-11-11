@@ -236,8 +236,8 @@ func clean(s string) string {
 		}
 	}
 	out := strings.TrimSpace(b.String())
-	if len([]rune(out)) > 300 {
-		out = string([]rune(out)[:300]) + "…"
+	if len([]rune(out)) > 2000 {
+		out = string([]rune(out)[:2000]) + "…"
 	}
 	return out
 }
@@ -245,7 +245,16 @@ func clean(s string) string {
 type envelope struct {
 	Status *int            `json:"status"`
 	Data   json.RawMessage `json:"data"`
-	Detail string          `json:"detail"`
+	Detail json.RawMessage `json:"detail"` // text, or an object of field errors
+}
+
+// text is the detail as readable text.
+func (e envelope) text() string {
+	var s string
+	if json.Unmarshal(e.Detail, &s) == nil {
+		return s
+	}
+	return string(e.Detail)
 }
 
 // call sends JSON to a route and decodes the reply's data into out.
@@ -298,7 +307,7 @@ func (c *Client) callOnce(ctx context.Context, method, route string, in, out any
 		return nil
 	}
 	if httpStatus >= 300 || (status != statusOK && status != -1) || (jerr != nil && len(bytes.TrimSpace(b)) > 0) {
-		detail := env.Detail
+		detail := env.text()
 		if detail == "" {
 			detail = string(b)
 		}
