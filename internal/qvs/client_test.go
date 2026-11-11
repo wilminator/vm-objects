@@ -43,6 +43,10 @@ type fakeVS struct {
 	forgetTasks bool
 	newVM       []byte // the last create body
 	made        bool
+	// expireNext refuses the next authenticated request as a session that
+	// has run out would; denyAll refuses every one. logins counts QTS logins.
+	expireNext, denyAll bool
+	logins              int
 }
 
 func (f *fakeVS) handler() http.Handler {
@@ -62,9 +66,15 @@ func (f *fakeVS) handler() http.Handler {
 				fmt.Fprint(w, `<QDocRoot><authPassed><![CDATA[0]]></authPassed></QDocRoot>`)
 				return
 			}
+			f.logins++
 			fmt.Fprint(w, `<QDocRoot><authPassed><![CDATA[1]]></authPassed><authSid><![CDATA[sid123]]></authSid></QDocRoot>`)
 			return
 		case "/cgi-bin/authLogout.cgi":
+			return
+		}
+		if f.denyAll || (f.expireNext && r.URL.Path != "/qvs/auth/check") {
+			f.expireNext = false
+			json.NewEncoder(w).Encode(map[string]any{"status": 5, "detail": "Authentication credentials were not provided."})
 			return
 		}
 		if ck, err := r.Cookie("NAS_SID"); err != nil || ck.Value != "sid123" {
@@ -386,5 +396,35 @@ func TestUnlockedSnapshotAndForgottenTask(t *testing.T) {
 	}
 	if len(f.snaps) != 0 {
 		t.Fatalf("left %v", f.snaps)
+	}
+}
+
+// A session that ran out (a restore that took hours) is replaced with one
+// new login and the request repeated; a second refusal is not retried.
+func TestSessionExpiryLogsInAgain(t *testing.T) {
+	f := &fakeVS{password: "p"}
+	c, err := login(t, f, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	f.mu.Lock()
+	f.expireNext = true
+	f.mu.Unlock()
+	vm, err := c.FindVM(ctx, "42497A00", "")
+	if err != nil || vm.ID != 21 {
+		t.Fatalf("%+v %v", vm, err)
+	}
+	if f.logins != 2 {
+		t.Fatalf("%d logins, want 2", f.logins)
+	}
+	f.mu.Lock()
+	f.denyAll = true
+	f.mu.Unlock()
+	if _, err := c.FindVM(ctx, "42497A00", ""); !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("got %v", err)
+	}
+	if f.logins != 3 {
+		t.Fatalf("%d logins: it should log in once more, not loop", f.logins)
 	}
 }

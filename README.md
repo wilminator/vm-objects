@@ -146,8 +146,19 @@ and the description carries `[vmobj-backup]`; they never show up in
 - `--keep-snapshots` keeps the older ones too.
 - `--no-snapshots` refuses to back up a running VM at all.
 
-A running VM's snapshot also saves its memory, a file the size of its RAM
-that is removed when the snapshot is deleted.
+**What a running-VM backup costs on QNAP.** Virtualization Station has no
+disk-only snapshot: every snapshot of a running VM also saves its memory.
+- **Space:** a `.state` file about the size of the VM's RAM (5 to 17 GB in
+  our tests) stays on the share for as long as the standing snapshot does,
+  so one VM's backup holds roughly its RAM size in extra space between runs.
+  A run briefly holds two, the old and the new.
+- **A pause:** libvirt pauses the guest while it saves memory, so expect it
+  to be unreachable for about as long as the snapshot takes to create: around
+  a minute for a VM with 17 GB of RAM in our tests (the pause itself was not
+  measured). Schedule such backups for quiet hours, or use `--no-snapshots`
+  and back up with the VM shut down.
+- **Time:** creating the snapshot and deleting the old one each take
+  minutes on a large VM, and are waited for.
 
 ## Several targets
 

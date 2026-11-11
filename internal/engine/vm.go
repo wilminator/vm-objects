@@ -521,10 +521,16 @@ type RestoreVMOptions struct {
 	// Station). The disks are written as qcow2. With History, the
 	// snapshots are registered too. OSType and Bridges fill in what the
 	// original's definition can't say for another platform.
-	Create  bool
-	Manager platform.Manager
-	OSType  string
-	Bridges []string
+	Create bool
+	// CreateOnly runs just the Create step (and the snapshot records)
+	// against a folder where an earlier restore-vm --create finished
+	// writing the disks and then failed to create the VM, such as when the
+	// platform logged vmobj out during a long restore. Nothing is read from
+	// the repository but the backup's record.
+	CreateOnly bool
+	Manager    platform.Manager
+	OSType     string
+	Bridges    []string
 }
 
 // RestoreVMStats summarise a whole-VM restore.
@@ -580,6 +586,9 @@ func RestoreVM(ctx context.Context, o RestoreVMOptions) (*RestoreVMStats, error)
 			return nil, fmt.Errorf("%s holds an unfinished restore of another backup (%s); pick another folder", dir, strings.ReplaceAll(strings.TrimSpace(string(got)), "\n", ", "))
 		}
 		resuming = true
+	}
+	if o.CreateOnly {
+		return createOnly(ctx, o, rec, dir, marker, want, resuming)
 	}
 
 	// Every disk must be complete and readable before anything is written,

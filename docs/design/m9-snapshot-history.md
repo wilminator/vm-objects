@@ -193,6 +193,14 @@ So, for the QNAP module:
   `qnap-snapshots` would. Without `--history` it creates the VM on a
   plain `NAME-vda.qcow2`. RESTORE.txt says which of these happened.
 
+  A restore of a large history takes hours (about six for 250 GiB and eleven
+  snapshots), and the platform may end vmobj's login meanwhile. The API client
+  logs in again when a request is refused for want of a login (once per
+  request; the refused request did nothing), and if the create step still
+  fails, `restore-vm --create --create-only` with the same arguments and the
+  same `--to` creates the VM and registers the snapshots from the finished
+  folder without restoring anything again.
+
 ## Build order
 
 1. **Part A, ZFS and TrueNAS** (no QNAP needed): snapshot fields in the

@@ -1156,6 +1156,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 	targetFlag := fs.String("platform", "auto", "where the VM will run next, for RESTORE.txt: auto (this host), libvirt, qnap or truenas")
 	history := fs.Bool("history", false, "with --platform qnap: restore each disk's snapshot history as Virtualization Station's overlay chain (see RESTORE.txt, then vmobj qnap-snapshots)")
 	create := fs.Bool("create", false, "with --platform qnap and --qvs-credentials: also create the VM in Virtualization Station on the restored disks (qcow2), never starting it; with --history, register its snapshots too")
+	createOnly := fs.Bool("create-only", false, "with --create: the disks are already restored in --to (an earlier run wrote them, then failed to create the VM); only create the VM and register its snapshots")
 	restoreQVS := fs.String("qvs-credentials", "", "with --create: Virtualization Station's credentials file ([qvs] url, username, password; mode 600)")
 	osType := fs.String("os-type", "", "with --create: Virtualization Station's OS type, such as win11 (its list: GET /qvs/os_types)")
 	var bridges repeated
@@ -1202,7 +1203,7 @@ func cmdRestoreVM(ctx context.Context, args []string) error {
 			return fmt.Errorf("restore-vm: Virtualization Station: %w", err)
 		}
 		defer qm.Close(context.WithoutCancel(ctx))
-		ro.Create, ro.Manager, ro.OSType, ro.Bridges = true, qm, *osType, bridges
+		ro.Create, ro.CreateOnly, ro.Manager, ro.OSType, ro.Bridges = true, *createOnly, qm, *osType, bridges
 	}
 	st, err := engine.RestoreVM(ctx, ro)
 	stopReport()

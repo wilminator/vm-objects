@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/wilminator/vm-objects/internal/libvirt"
 	"github.com/wilminator/vm-objects/internal/manifest"
 	"github.com/wilminator/vm-objects/internal/platform"
+	"github.com/wilminator/vm-objects/internal/source"
 	"github.com/wilminator/vm-objects/internal/vmdef"
 )
 
@@ -354,4 +356,77 @@ func createRestoredVM(ctx context.Context, o RestoreVMOptions, rec *manifest.VMR
 	}
 	st.Registered = len(paths)
 	return nil
+}
+
+// createOnly is restore-vm --create-only: the disks are already in dir, so
+// only the platform's create step (and the snapshot records) is left.
+func createOnly(ctx context.Context, o RestoreVMOptions, rec *manifest.VMRecord, dir, marker, want string, resuming bool) (*RestoreVMStats, error) {
+	switch {
+	case !o.Create:
+		return nil, errors.New("restore-vm --create-only needs --create")
+	case o.Target != "qnap":
+		return nil, errors.New("restore-vm --create works with Virtualization Station (--platform qnap) for now")
+	case o.Manager == nil:
+		return nil, errors.New("restore-vm --create needs the platform's API (--qvs-credentials)")
+	case o.OSType == "":
+		return nil, errors.New("restore-vm --create needs --os-type (Virtualization Station's OS type, such as win11)")
+	case !resuming:
+		return nil, fmt.Errorf("%s holds no restore of this backup to create the VM from; run restore-vm --create (without --create-only) first", dir)
+	}
+	name := rec.DomainName
+	if o.NewName != "" {
+		name = o.NewName
+	}
+	st := &RestoreVMStats{Disks: map[string]string{}, Record: rec, Resumed: true,
+		Definition: filepath.Join(dir, name+".xml")}
+	def, err := os.ReadFile(st.Definition)
+	if err != nil {
+		return nil, fmt.Errorf("%s: the earlier restore didn't get as far as writing the definition; run it again: %w", dir, err)
+	}
+	if o.History {
+		st.HistoryPlan = filepath.Join(dir, QNAPPlanFile)
+		plan, err := ReadQNAPPlan(st.HistoryPlan)
+		if err != nil {
+			return nil, fmt.Errorf("%s: the earlier history restore didn't finish writing its layers; restore into a new folder: %w", dir, err)
+		}
+		for _, d := range rec.Disks {
+			top := plan.Tops[d.Target]
+			if top == "" {
+				return nil, fmt.Errorf("%s: no layers for disk %s", st.HistoryPlan, d.Target)
+			}
+			st.Disks[d.Target] = top
+		}
+	} else {
+		for _, d := range rec.Disks {
+			st.Disks[d.Target] = filepath.Join(dir, name+"-"+d.Target+".qcow2")
+		}
+	}
+	// Every layer the VM will use must be there and read as a chain.
+	for t, top := range st.Disks {
+		if _, err := source.QCOW2Chain(top); err != nil {
+			return nil, fmt.Errorf("disk %s: the restored layers aren't all there: %w", t, err)
+		}
+	}
+	if err := createRestoredVM(ctx, o, rec, def, name, st); err != nil {
+		return st, err
+	}
+	var tpmFiles bool
+	for _, f := range rec.Files {
+		tpmFiles = tpmFiles || f.Role == "tpm"
+	}
+	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
+	if st.Created != nil {
+		head := fmt.Sprintf("vmobj created this VM in Virtualization Station as %q (UUID %s), on the\nrestored disks, and did not start it.", st.Created.Name, st.Created.UUID)
+		if st.Registered > 0 {
+			head += fmt.Sprintf(" Its %d snapshots are registered.", st.Registered)
+		}
+		notes = head + "\nThe steps below that create the VM or register snapshots are done; the\nrest (TPM state, NVRAM) still apply.\n\n" + notes
+	}
+	if err := atomicfile.Write(filepath.Join(dir, "RESTORE.txt"), []byte(notes), 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.Remove(marker); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
