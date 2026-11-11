@@ -32,6 +32,8 @@ type fakeVirsh struct {
 	state  string
 	calls  []string
 	failOn string
+	// version is what `virsh version` prints; empty prints nothing.
+	version string
 }
 
 func (f *fakeVirsh) Run(_ context.Context, args ...string) (string, error) {
@@ -44,6 +46,8 @@ func (f *fakeVirsh) Run(_ context.Context, args ...string) (string, error) {
 		return f.xml, nil
 	case "domstate":
 		return f.state + "\n", nil
+	case "version":
+		return f.version, nil
 	}
 	return "", nil
 }

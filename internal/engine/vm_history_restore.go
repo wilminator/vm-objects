@@ -414,7 +414,7 @@ func createOnly(ctx context.Context, o RestoreVMOptions, rec *manifest.VMRecord,
 	for _, f := range rec.Files {
 		tpmFiles = tpmFiles || f.Role == "tpm"
 	}
-	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles)
+	notes := restoreNotesFor(o.Target, rec, st, name, o.NewName != "", tpmFiles, o.TargetHost)
 	if st.Created != nil {
 		head := fmt.Sprintf("vmobj created this VM in Virtualization Station as %q (UUID %s), on the\nrestored disks, and did not start it.", st.Created.Name, st.Created.UUID)
 		if st.Registered > 0 {
