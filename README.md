@@ -200,6 +200,24 @@ again:
   another backup's unfinished restore is refused.
 - **in-place and staged restores** were already safe to rerun: they
   compare before writing.
+- **backup-vm of a running VM on ZFS** takes a snapshot of each zvol, and a
+  clone to read it through, and removes both when it finishes or fails. If
+  the run is killed (`kill -9`, a power cut) they stay behind. Nothing
+  breaks, but a leftover clone stops TrueNAS from deleting the snapshot it
+  came from. List them, then remove them:
+
+  ```
+  vmobj zfs-cleanup --dataset fast/vms
+  vmobj zfs-cleanup --dataset fast/vms --apply
+  ```
+
+  The first only lists. It touches nothing but the snapshots (`@vmobj-...`)
+  and clones (`-vmobj-...`) that vmobj itself names, never your own
+  snapshots, and nothing newer than `--older-than` (24 hours by default,
+  never less than 1 hour), so it can't remove what a backup running right
+  now is using. It destroys clones first, then snapshots, one plain
+  `zfs destroy` each (never `-r`). A snapshot you kept on purpose with
+  `--keep-snapshot` has the same name, so it is listed too.
 
 ## Repositories in S3
 
