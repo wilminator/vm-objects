@@ -51,6 +51,11 @@ type BackupVMOptions struct {
 	// Quiesce freezes the guest's filesystems (through the QEMU guest
 	// agent) while a running VM's disks are snapshotted.
 	Quiesce bool
+	// QuiesceIfPossible freezes the guest when the guest agent answers and
+	// otherwise takes the snapshot anyway (crash-consistent, like pulling
+	// the power), with a warning in BackupVMStats. Quiesce, which requires
+	// the freeze, wins when both are set.
+	QuiesceIfPossible bool
 	// SwtpmDir holds emulated TPM state, one folder per VM UUID.
 	SwtpmDir string // default /var/lib/libvirt/swtpm
 	// Progress, when set, wraps each disk source (for progress output).
@@ -93,6 +98,9 @@ type BackupVMStats struct {
 	TPMFiles    int
 	ConfigFiles []string // names of platform settings files, such as truenas-vm.json
 	Skipped     []string
+	// Warnings are things the run did that a person should know about,
+	// such as a snapshot that couldn't be quiesced.
+	Warnings []string
 	// History is what --history did, by disk target.
 	History map[string][]HistoryStep
 }
@@ -207,11 +215,16 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (st *BackupVMStats, err er
 		}
 	} else if live {
 		stats.Consistency = "snapshot"
-		if snaps, err = snapshotVM(ctx, o, plat, zvols, started); err != nil {
+		var quiesced bool
+		var warn string
+		if snaps, quiesced, warn, err = snapshotVM(ctx, o, plat, zvols, started); err != nil {
 			return nil, err
 		}
-		if o.Quiesce {
+		if quiesced {
 			stats.Consistency = "quiesced snapshot"
+		}
+		if warn != "" {
+			stats.Warnings = append(stats.Warnings, warn)
 		}
 	}
 	// Snapshots not yet handed to a source must still be removed if a
@@ -329,19 +342,36 @@ func (s *State) sizeOrZero() int64 {
 
 // snapshotVM snapshots a running VM's zvols in one atomic command, inside
 // a filesystem freeze when asked. The thaw always runs.
-func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, zvols []string, now time.Time) (snaps map[string]string, err error) {
-	if q, ok := plat.(platform.Quiescer); o.Quiesce && ok {
-		if err := q.Freeze(ctx, o.Domain); err != nil {
-			return nil, fmt.Errorf("freezing the guest's filesystems (is the QEMU guest agent running?): %w", err)
-		}
-		defer func() {
-			// Thaw even if the snapshot failed or ctx was cancelled.
-			if terr := q.Thaw(context.WithoutCancel(ctx), o.Domain); terr != nil && err == nil {
-				err = fmt.Errorf("thawing the guest's filesystems: %w", terr)
+//
+// With o.Quiesce the freeze is required: if it fails, so does the backup.
+// With o.QuiesceIfPossible a failed freeze isn't fatal: the snapshot is
+// taken anyway, quiesced is false, and warn says so in plain words.
+func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, zvols []string, now time.Time) (snaps map[string]string, quiesced bool, warn string, err error) {
+	q, canFreeze := plat.(platform.Quiescer)
+	if canFreeze && (o.Quiesce || o.QuiesceIfPossible) {
+		if ferr := q.Freeze(ctx, o.Domain); ferr != nil {
+			if o.Quiesce {
+				return nil, false, "", fmt.Errorf("freezing the guest's filesystems (is the QEMU guest agent running?): %w", ferr)
 			}
-		}()
+			// A freeze that failed may still have frozen some filesystems:
+			// thawing one that isn't frozen is harmless.
+			q.Thaw(context.WithoutCancel(ctx), o.Domain)
+			warn = fmt.Sprintf("the guest's filesystems were not frozen (%v), so the snapshot is crash-consistent, as if the power had been cut: "+
+				"NTFS and journaling filesystems recover from that, but databases may need to. Install and start the QEMU guest agent in the guest (and enable it in the VM's settings) for a consistent snapshot", ferr)
+		} else {
+			quiesced = true
+			defer func() {
+				// Thaw even if the snapshot failed or ctx was cancelled.
+				if terr := q.Thaw(context.WithoutCancel(ctx), o.Domain); terr != nil && err == nil {
+					err = fmt.Errorf("thawing the guest's filesystems: %w", terr)
+				}
+			}()
+		}
+	} else if o.QuiesceIfPossible {
+		warn = fmt.Sprintf("the %s platform module can't freeze a guest, so the snapshot is crash-consistent", plat.Name())
 	}
-	return source.SnapshotZvols(ctx, o.zfs(), now, zvols...)
+	snaps, err = source.SnapshotZvols(ctx, o.zfs(), now, zvols...)
+	return snaps, quiesced && err == nil, warn, err
 }
 
 // destroyLeftover destroys the snapshots a failed backup took and returns

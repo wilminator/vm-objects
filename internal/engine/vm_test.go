@@ -595,3 +595,68 @@ func TestBackupVMLiveZvolsNamesASnapshotItCouldNotRemove(t *testing.T) {
 		t.Fatalf("the error doesn't name the snapshot left behind: %v", err)
 	}
 }
+
+// With QuiesceIfPossible, a guest whose agent doesn't answer is still
+// backed up: crash-consistent, recorded as such, and with a warning. With
+// Quiesce, the same guest fails the backup, as before.
+func TestBackupVMLiveZvolsQuiesceIfPossible(t *testing.T) {
+	setup := func(t *testing.T) (*vmHarness, *fakeZFS, *[]string) {
+		v := newVMHarness(t)
+		log := &[]string{}
+		z := &fakeZFS{devDir: filepath.Join(v.dir, "dev"), vols: map[string][]byte{}, snaps: map[string][]byte{}, log: log}
+		z.vols["tank/vms/win11-a"] = bytes.Repeat([]byte{3}, 128<<10)
+		v.virsh.xml = domainXML(zvolDisk("vda", "tank/vms/win11-a"), "")
+		v.virsh.state = "running"
+		return v, z, log
+	}
+
+	t.Run("agent answers: quiesced, no warning", func(t *testing.T) {
+		v, z, log := setup(t)
+		o := v.opts(manifest.Full)
+		o.Virsh, o.ZFS, o.ZFSDevDir, o.QuiesceIfPossible = &loggingVirsh{inner: v.virsh, log: log}, z, z.devDir, true
+		st, err := BackupVM(v.ctx, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Consistency != "quiesced snapshot" || len(st.Warnings) != 0 {
+			t.Fatalf("consistency %q, warnings %v", st.Consistency, st.Warnings)
+		}
+	})
+
+	t.Run("no agent: crash-consistent, warned, guest thawed", func(t *testing.T) {
+		v, z, log := setup(t)
+		v.virsh.failOn = "domfsfreeze"
+		o := v.opts(manifest.Full)
+		o.Virsh, o.ZFS, o.ZFSDevDir, o.QuiesceIfPossible = &loggingVirsh{inner: v.virsh, log: log}, z, z.devDir, true
+		st, err := BackupVM(v.ctx, o)
+		if err != nil {
+			t.Fatalf("a missing guest agent failed the backup: %v", err)
+		}
+		if st.Consistency != "snapshot" {
+			t.Fatalf("consistency %q, want a plain snapshot", st.Consistency)
+		}
+		if len(st.Warnings) != 1 || !strings.Contains(st.Warnings[0], "crash-consistent") || !strings.Contains(st.Warnings[0], "guest agent") {
+			t.Fatalf("warnings %v", st.Warnings)
+		}
+		if !slices.Contains(*log, "virsh domfsthaw") {
+			t.Fatalf("no thaw after a failed freeze: %v", *log)
+		}
+		if len(z.snaps) != 0 {
+			t.Fatalf("snapshots left behind: %v", z.snaps)
+		}
+	})
+
+	t.Run("Quiesce still requires the agent", func(t *testing.T) {
+		v, z, log := setup(t)
+		v.virsh.failOn = "domfsfreeze"
+		o := v.opts(manifest.Full)
+		o.Virsh, o.ZFS, o.ZFSDevDir = &loggingVirsh{inner: v.virsh, log: log}, z, z.devDir
+		o.Quiesce, o.QuiesceIfPossible = true, true
+		if _, err := BackupVM(v.ctx, o); err == nil || !strings.Contains(err.Error(), "guest agent") {
+			t.Fatalf("expected a guest agent error, got %v", err)
+		}
+		if slices.Contains(*log, "zfs snapshot") {
+			t.Fatal("took a snapshot although the required freeze failed")
+		}
+	})
+}
