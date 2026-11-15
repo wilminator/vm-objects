@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -220,8 +221,9 @@ func BackupVM(ctx context.Context, o BackupVMOptions) (st *BackupVMStats, err er
 		pending[k] = v
 	}
 	defer func() {
-		for _, snap := range pending {
-			o.zfs().Run(context.WithoutCancel(ctx), "destroy", snap)
+		if left := destroyLeftover(context.WithoutCancel(ctx), o.zfs(), pending); len(left) > 0 {
+			err = errors.Join(err, fmt.Errorf("these snapshots could not be removed and are still there: %s; remove each with: zfs destroy <name>",
+				strings.Join(left, ", ")))
 		}
 	}()
 
@@ -340,6 +342,24 @@ func snapshotVM(ctx context.Context, o BackupVMOptions, plat platform.Platform, 
 		}()
 	}
 	return source.SnapshotZvols(ctx, o.zfs(), now, zvols...)
+}
+
+// destroyLeftover destroys the snapshots a failed backup took and returns
+// the names of any that are still there afterwards, sorted. A snapshot
+// that a source's own cleanup already removed isn't reported: a failed
+// destroy only counts if a look afterwards still finds the snapshot.
+func destroyLeftover(ctx context.Context, z source.ZFSRunner, snaps map[string]string) []string {
+	var left []string
+	for _, snap := range snaps {
+		if _, err := z.Run(ctx, "destroy", snap); err == nil {
+			continue
+		}
+		if _, err := z.Run(ctx, "list", "-H", "-o", "name", "-t", "snapshot", snap); err == nil {
+			left = append(left, snap)
+		}
+	}
+	slices.Sort(left)
+	return left
 }
 
 // SnapshotNamePrefix starts the name of every platform snapshot vmobj
