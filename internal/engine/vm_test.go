@@ -61,7 +61,10 @@ type fakeZFS struct {
 	snaps  map[string][]byte
 	log    *[]string
 	failOn string
-	order  []string // user snapshots, oldest first (see userSnapshot)
+	// failArg, when set, limits failOn to commands that mention it (a
+	// dataset name), so one disk of several can be made to fail.
+	failArg string
+	order   []string // user snapshots, oldest first (see userSnapshot)
 }
 
 // userSnapshot takes one of the zvol's own named snapshots, as a person
@@ -74,7 +77,7 @@ func (f *fakeZFS) userSnapshot(full string) {
 
 func (f *fakeZFS) Run(_ context.Context, args ...string) (string, error) {
 	*f.log = append(*f.log, "zfs "+args[0])
-	if args[0] == f.failOn {
+	if args[0] == f.failOn && (f.failArg == "" || slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, f.failArg) })) {
 		return "", errors.New("simulated zfs failure")
 	}
 	switch args[0] {
@@ -115,6 +118,10 @@ func (f *fakeZFS) Run(_ context.Context, args ...string) (string, error) {
 		}
 	case "destroy":
 		if strings.Contains(args[1], "@") {
+			// Real zfs refuses to destroy what isn't there.
+			if _, ok := f.snaps[args[1]]; !ok {
+				return "", errors.New("could not find any snapshots to destroy")
+			}
 			delete(f.snaps, args[1])
 		} else {
 			os.Remove(filepath.Join(f.devDir, args[1]))
@@ -533,5 +540,58 @@ func TestBackupVMHistoryNeedsZvolsOrASnapshotter(t *testing.T) {
 	}
 	if names, _ := v.repo.ListManifests(v.ctx, "win11.vda"); len(names) != 0 {
 		t.Fatalf("wrote %v before failing", names)
+	}
+}
+
+// If the second of two disks can't be read, nothing is left on the host:
+// no snapshot and no clone, and no false alarm about the snapshot that the
+// failing disk's own cleanup had already removed.
+func TestBackupVMLiveZvolsLaterDiskFailsLeavesNothing(t *testing.T) {
+	v := newVMHarness(t)
+	var log []string
+	z := &fakeZFS{devDir: filepath.Join(v.dir, "dev"), vols: map[string][]byte{}, snaps: map[string][]byte{}, log: &log}
+	z.vols["tank/vms/win11-a"] = bytes.Repeat([]byte{7}, 128<<10)
+	z.vols["tank/vms/win11-b"] = bytes.Repeat([]byte{9}, 128<<10)
+	v.virsh.xml = domainXML(zvolDisk("vda", "tank/vms/win11-a")+"\n"+zvolDisk("vdb", "tank/vms/win11-b"), "")
+	v.virsh.state = "running"
+	z.failOn, z.failArg = "clone", "win11-b"
+
+	o := v.opts(manifest.Full)
+	o.ZFS, o.ZFSDevDir = z, z.devDir
+	_, err := BackupVM(v.ctx, o)
+	if err == nil {
+		t.Fatal("backup succeeded although a disk's clone failed")
+	}
+	if strings.Contains(err.Error(), "still there") {
+		t.Fatalf("false alarm about a snapshot that was removed: %v", err)
+	}
+	if len(z.snaps) != 0 {
+		t.Fatalf("snapshots left behind: %v", z.snaps)
+	}
+	if left, _ := os.ReadDir(filepath.Join(z.devDir, "tank/vms")); len(left) != 0 {
+		t.Fatalf("clones left behind: %v", left)
+	}
+}
+
+// When a snapshot truly can't be destroyed, the error names it, so the
+// person can remove it by hand.
+func TestBackupVMLiveZvolsNamesASnapshotItCouldNotRemove(t *testing.T) {
+	v := newVMHarness(t)
+	var log []string
+	z := &fakeZFS{devDir: filepath.Join(v.dir, "dev"), vols: map[string][]byte{}, snaps: map[string][]byte{}, log: &log}
+	z.vols["tank/vms/win11-a"] = bytes.Repeat([]byte{7}, 128<<10)
+	z.vols["tank/vms/win11-b"] = bytes.Repeat([]byte{9}, 128<<10)
+	v.virsh.xml = domainXML(zvolDisk("vda", "tank/vms/win11-a")+"\n"+zvolDisk("vdb", "tank/vms/win11-b"), "")
+	v.virsh.state = "running"
+	z.failOn = "destroy" // every destroy fails
+
+	o := v.opts(manifest.Full)
+	o.ZFS, o.ZFSDevDir = z, z.devDir
+	_, err := BackupVM(v.ctx, o)
+	if err == nil {
+		t.Fatal("backup succeeded although nothing could be destroyed")
+	}
+	if !strings.Contains(err.Error(), "still there") || !strings.Contains(err.Error(), "tank/vms/win11-b@vmobj-") {
+		t.Fatalf("the error doesn't name the snapshot left behind: %v", err)
 	}
 }
