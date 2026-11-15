@@ -115,8 +115,12 @@ vmobj backup-vm --repo /mnt/backup/vmobj --key-file /root/vmobj.key --domain win
 
 - A **shut-off** VM is read directly.
 - A **running** VM's zvol disks are snapshotted together, atomically.
-  `--quiesce` first freezes the guest's filesystems through the QEMU guest
-  agent, and the thaw always runs.
+  The guest's filesystems are frozen first through the QEMU guest agent, and
+  the thaw always runs. If the agent doesn't answer, vmobj still takes the
+  snapshot, records it as `snapshot` (crash-consistent, as if the power had
+  been cut, rather than `quiesced snapshot`) and prints a warning.
+  `--quiesce` makes the freeze required (the backup fails without it);
+  `--no-quiesce` skips it.
 - A running VM with disk *image files* is refused: snapshotting those live
   means changing the VM's disk chain, which vmobj won't do. Shut it down
   for the backup.

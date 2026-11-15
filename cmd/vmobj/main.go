@@ -53,7 +53,7 @@ Usage:
                     [--check [--check-written]] [--expect-sha256 HEX] [--base NAME]
                     [--request-restore [--tier bulk|standard|expedited] [--days N]]
   vmobj backup-vm   --repo REPO --key-file PATH --domain NAME --type full|incremental|differential
-                    [--vm NAME] [--profile NAME] [--quiesce] [--platform NAME] [--virsh PATH] [--connect URI]
+                    [--vm NAME] [--profile NAME] [--quiesce|--no-quiesce] [--platform NAME] [--virsh PATH] [--connect URI]
                     [--libvirt-socket PATH] [--swtpm-dir DIR] [--definition FILE]
                     [--copy-to REPO ...]
   vmobj vms         --repo REPO --key-file PATH [--vm NAME]
@@ -92,7 +92,8 @@ overrides that. vmobj never decides the format from a disk's contents.
 
 backup-vm backs up a whole libvirt VM: every disk, its definition, its UEFI
 NVRAM and its TPM state. A running VM's zvol disks are snapshotted together
-(--quiesce freezes the guest's filesystems through the guest agent first);
+(the guest's filesystems are frozen first through the guest agent when it answers,
+and the run warns when it doesn't; --quiesce requires the freeze, --no-quiesce skips it);
 a running VM with disk image files is refused, so shut it down first.
 restore-vm writes the disks, an adjusted definition and the NVRAM/TPM files
 into a folder, with instructions; it never changes libvirt itself.
@@ -931,7 +932,8 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	classFlag := fs.String("class", "", "storage class for this run's data, overriding the profile")
 	stateDir := fs.String("state-dir", "", "where this host keeps per-disk state")
 	workers := fs.Int("workers", 0, "blocks hashed at once (default: one per CPU)")
-	quiesce := fs.Bool("quiesce", false, "freeze the guest's filesystems (QEMU guest agent) while a running VM is snapshotted")
+	quiesce := fs.Bool("quiesce", false, "require freezing the guest's filesystems (QEMU guest agent) while a running VM is snapshotted: fail if it can't")
+	noQuiesce := fs.Bool("no-quiesce", false, "don't try to freeze the guest at all (by default vmobj freezes it when the guest agent answers, and warns when it doesn't)")
 	platformName := fs.String("platform", "auto", "what runs the VM: auto (detect), libvirt, qnap or truenas")
 	swtpmDir := fs.String("swtpm-dir", "", "where libvirt keeps TPM state (default: the platform's; see vmobj platforms)")
 	virshPath := fs.String("virsh", "", "virsh program (default: the platform's; see vmobj platforms)")
@@ -953,6 +955,9 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	pc, perr := pf.config()
 	if perr != nil {
 		return perr
+	}
+	if *quiesce && *noQuiesce {
+		return errors.New("backup-vm: --quiesce and --no-quiesce contradict each other")
 	}
 	if err := require(fs, "repo", "key-file", "type"); err != nil {
 		return err
@@ -1010,7 +1015,7 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 	start := time.Now()
 	st, err := engine.BackupVM(ctx, engine.BackupVMOptions{
 		Repo: r, Domain: *domain, VM: *vm, Kind: k, Profile: &prof, Class: class, Workers: *workers,
-		StateDir: *stateDir, Quiesce: *quiesce, Platform: plat, History: *history, Hash: *hash,
+		StateDir: *stateDir, Quiesce: *quiesce, QuiesceIfPossible: !*noQuiesce, Platform: plat, History: *history, Hash: *hash,
 		KeepSnapshots: *keepSnaps, NoSnapshots: *noSnaps,
 		HistoryStep: func(target string, i, n int, sn manifest.Snapshot, skipped bool) {
 			what := "backing up"
@@ -1028,6 +1033,9 @@ func cmdBackupVM(ctx context.Context, args []string) error {
 		return rerunHint(err)
 	}
 	fmt.Printf("VM record: %s (%s)\n", st.Record, st.Consistency)
+	for _, w := range st.Warnings {
+		fmt.Fprintf(os.Stderr, "WARNING: %s\n", w)
+	}
 	var newHistory [][2]string // stream, manifest
 	for t, steps := range st.History {
 		added := 0
