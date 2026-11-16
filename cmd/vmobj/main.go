@@ -64,6 +64,7 @@ Usage:
                     [--verify every|end] [--list]
   vmobj qvs-check   --qvs-credentials FILE [--vm NAME|UUID]
   vmobj qvs-cleanup --qvs-credentials FILE --vm NAME|UUID [--apply]
+  vmobj zfs-cleanup --dataset POOL/PARENT [--older-than 24h] [--apply]
   vmobj qnap-snapshots --plan DIR/qnap-snapshots.json --definition .UUID.meta/UUID.xml [--apply]
   vmobj copy        --from REPO --to REPO --key-file PATH [--to-key-file PATH] [--vm NAME]
                     [--manifest NAME | --record NAME] [--profile NAME] [--class CLASS]
@@ -168,6 +169,8 @@ func main() {
 		err = cmdQNAPSnapshots(ctx, args)
 	case "qvs-check":
 		err = cmdQVSCheck(ctx, args)
+	case "zfs-cleanup":
+		err = cmdZFSCleanup(ctx, args)
 	case "qvs-cleanup":
 		err = cmdQVSCleanup(ctx, args)
 	case "vms":
